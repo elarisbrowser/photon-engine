@@ -44,11 +44,6 @@ static_assert(offsetof(Compositing::RustFFI::NodeSlotId, index) == 0);
 static_assert(sizeof(RustFFI::NodeKind) == sizeof(u8));
 static_assert(sizeof(RustFFI::NodeFlag) == sizeof(u32));
 
-enum class LayoutUpdatePropagation : u8 {
-    ThroughAncestors,
-    BoundarySelfOnly,
-};
-
 enum class BindToPreparedArenaSlot {
     Yes,
 };
@@ -63,7 +58,6 @@ public:
 
     static Compositing::RustFFI::NodeSlotId slot_id(Node const*);
     RustFFI::NodeKind kind() const { return m_kind; }
-    u32 arena_slot_index() const { return m_slot.index; }
     NodeArena& node_arena() const { return *m_arena; }
     RustFFI::DocumentHost* document_host() const;
     // The read this node was reached in, which it lends the calls the host makes about its document: a layout node is
@@ -153,6 +147,7 @@ public:
 
     bool is_anonymous() const { return has_identity_flag<RustFFI::NodeFlag::Anonymous>(); }
     bool is_document_element() const { return has_identity_flag<RustFFI::NodeFlag::IsDocumentElement>(); }
+    bool is_body() const { return has_identity_flag<RustFFI::NodeFlag::IsBody>(); }
     DOM::Node const* dom_node() const;
     DOM::Node* dom_node();
     // The identity of the DOM node this row belongs to, which names nothing for an anonymous row
@@ -172,10 +167,7 @@ public:
     bool needs_compositor_background_color_frame() const { return has_compositor_animation_frame(RustFFI::CompositorAnimationFrameKind::BackgroundColor); }
     void set_needs_compositor_background_color_frame(bool value) { set_needs_compositor_animation_frame(RustFFI::CompositorAnimationFrameKind::BackgroundColor, value); }
 
-    // Set when a style change altered geometry-determining properties of this node itself, so
-    // a partial relayout must re-resolve its own size and position instead of reusing them.
-    void set_needs_own_geometry_update() { set_flag(RustFFI::NodeFlag::NeedsOwnGeometryUpdate, true); }
-    void set_needs_layout_update(DOM::SetNeedsLayoutReason, LayoutUpdatePropagation = LayoutUpdatePropagation::ThroughAncestors);
+    void set_needs_layout_update(DOM::SetNeedsLayoutReason);
 
     bool is_generated_for_pseudo_element() const { return generated_for() != 0; }
     Optional<CSS::PseudoElement> generated_for_pseudo_element() const
@@ -202,10 +194,6 @@ public:
 
     void prepare_subtree_for_detach_from_layout_tree();
     void pin_style_record_for_detachment();
-
-    // Returns the direct viewport child above this node (the node itself or its outermost
-    // anonymous table-fixup wrapper), or null when the node is not placed as a top layer box.
-    Node* topmost_layout_node_of_top_layer_placement();
 
     DOM::Document& document();
     DOM::Document const& document() const;

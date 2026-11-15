@@ -23,11 +23,12 @@ class SharedResourceRequest final : public JS::Cell {
     GC_DECLARE_ALLOCATOR(SharedResourceRequest);
 
 public:
-    // NB: Only requests with the same CORS mode, credentials mode, integrity metadata and referrer policy share a
+    // NB: Only requests with the same mode, credentials mode, integrity metadata and referrer policy share a
     //     resource. The origin is the same for every request of a document.
     struct Key {
         URL::URL url;
-        CORSSettingAttribute cors_setting { CORSSettingAttribute::NoCORS };
+        Fetch::Infrastructure::Request::Mode mode;
+        Fetch::Infrastructure::Request::CredentialsMode credentials_mode;
         Utf16String integrity_metadata;
         ReferrerPolicy::ReferrerPolicy referrer_policy { ReferrerPolicy::ReferrerPolicy::EmptyString };
 
@@ -62,7 +63,7 @@ public:
     // Records a user that waits for the fetch without callbacks, so that the fetch delays the load event for it.
     void wait_without_callbacks();
 
-    void add_callbacks(Function<void()> on_finish, Function<void()> on_fail, Function<void()> on_stop = {});
+    void add_callbacks(GC::Ptr<GC::Function<void()>> on_finish, GC::Ptr<GC::Function<void()>> on_fail, GC::Ptr<GC::Function<void()>> on_stop = {});
 
     enum class DelaysLoadEvent : u8 {
         No,
@@ -70,7 +71,7 @@ public:
     };
 
     // Returns an ID for remove_callbacks(), or nothing if the callbacks already ran.
-    Optional<u64> add_removable_callbacks(Function<void()> on_finish, Function<void()> on_fail, Function<void()> on_stop = {}, DelaysLoadEvent = DelaysLoadEvent::Yes);
+    Optional<u64> add_removable_callbacks(GC::Ptr<GC::Function<void()>> on_finish, GC::Ptr<GC::Function<void()>> on_fail, GC::Ptr<GC::Function<void()>> on_stop = {}, DelaysLoadEvent = DelaysLoadEvent::Yes);
     void remove_callbacks(u64 id);
 
     bool is_fetching() const;
@@ -141,7 +142,8 @@ template<>
 struct Traits<Web::HTML::SharedResourceRequest::Key> : public DefaultTraits<Web::HTML::SharedResourceRequest::Key> {
     static unsigned hash(Web::HTML::SharedResourceRequest::Key const& key)
     {
-        auto hash = pair_int_hash(Traits<URL::URL>::hash(key.url), to_underlying(key.cors_setting));
+        auto hash = pair_int_hash(Traits<URL::URL>::hash(key.url), to_underlying(key.mode));
+        hash = pair_int_hash(hash, to_underlying(key.credentials_mode));
         hash = pair_int_hash(hash, key.integrity_metadata.hash());
         return pair_int_hash(hash, to_underlying(key.referrer_policy));
     }

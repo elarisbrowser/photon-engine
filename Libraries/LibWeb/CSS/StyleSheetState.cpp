@@ -35,9 +35,9 @@
 
 namespace Web::CSS {
 
-NonnullRefPtr<StyleSheetState> StyleSheetState::create(RustRuleList rules, GC::Ptr<DOM::Document> document, RustMediaList media, Optional<::URL::URL> location, Optional<ReferrerPolicy::ReferrerPolicy> fetched_referrer_policy)
+NonnullRefPtr<StyleSheetState> StyleSheetState::create(RustRuleList rules, GC::Ptr<DOM::Document> document, RustMediaList media, Optional<::URL::URL> location, Optional<ReferrerPolicy::ReferrerPolicy> fetched_referrer_policy, StyleSheetImport const* import)
 {
-    return adopt_ref(*new StyleSheetState(move(rules), document, move(media), move(location), fetched_referrer_policy));
+    return adopt_ref(*new StyleSheetState(move(rules), document, move(media), move(location), fetched_referrer_policy, import));
 }
 
 WebIDL::ExceptionOr<NonnullRefPtr<StyleSheetState>> StyleSheetState::create_constructed(DOM::Document const& associated_document, CSSStyleSheetOptions const& options)
@@ -101,12 +101,17 @@ WebIDL::ExceptionOr<NonnullRefPtr<StyleSheetState>> StyleSheetState::create_cons
     return sheet;
 }
 
-StyleSheetState::StyleSheetState(RustRuleList rules, GC::Ptr<DOM::Document> document, RustMediaList media, Optional<::URL::URL> location, Optional<ReferrerPolicy::ReferrerPolicy> fetched_referrer_policy)
+StyleSheetState::StyleSheetState(RustRuleList rules, GC::Ptr<DOM::Document> document, RustMediaList media, Optional<::URL::URL> location, Optional<ReferrerPolicy::ReferrerPolicy> fetched_referrer_policy, StyleSheetImport const* import)
     : m_native_sheet(move(rules), move(media))
     , m_style_engine_occurrence_id(m_native_sheet.identity())
+    , m_parent_style_sheet(import ? import->parent_style_sheet() : nullptr)
     , m_fetched_referrer_policy(fetched_referrer_policy)
     , m_parsing_document(document)
 {
+    // The sheet takes its import's requested URL, but not the import itself: It would report its loading state to the
+    // import while its own imports are still being attached.
+    if (import)
+        m_requested_url = import->requested_url();
     if (location.has_value())
         set_location(move(location));
 
@@ -251,7 +256,6 @@ size_t StyleSheetState::external_memory_size() const
     size = JS::saturating_add_external_memory_size(size, JS::hash_map_external_memory_size(m_imports));
     size = JS::saturating_add_external_memory_size(size, JS::hash_table_external_memory_size(m_owning_documents_or_shadow_roots));
     size = JS::saturating_add_external_memory_size(size, JS::vector_external_memory_size(m_critical_subresources));
-    size = JS::saturating_add_external_memory_size(size, JS::vector_external_memory_size(m_pending_image_values));
     return size;
 }
 
@@ -317,7 +321,7 @@ GC::Ref<WebIDL::Promise> StyleSheetState::replace(Utf16String text)
     auto& realm = HTML::relevant_realm(*constructor_document());
     auto promise = WebIDL::create_promise_for(*constructor_document());
     set_disallow_modification(true);
-    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(realm.heap(), [sheet = GC::Ref { cssom_sheet() }, &realm, text = move(text), promise = GC::Root(promise)] {
+    Platform::EventLoopPlugin::the().deferred_invoke(GC::create_function(realm.heap(), GC::captures(GC::Ref { cssom_sheet() }, realm, move(text), GC::Root(promise)), [](auto& sheet, auto& realm, auto& text, auto& promise) {
         HTML::TemporaryExecutionContext execution_context { realm, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes };
         auto& state = sheet->state();
 
@@ -325,7 +329,6 @@ GC::Ref<WebIDL::Promise> StyleSheetState::replace(Utf16String text)
         auto rules = CSS::Parser::Parser { state.make_parsing_params() }.parse_as_stylesheet_contents(text);
         rules.remove_imports();
         state.set_rules(move(rules));
-        state.invalidate_image_resource_registration();
         record_stylesheet_rules_replaced(state);
         state.invalidate_owners();
         state.synchronize_fonts_after_rule_change();
@@ -348,7 +351,6 @@ void StyleSheetState::replace_rules(Utf16View text)
 
     // 4. Set sheet’s CSS rules to rules.
     set_rules(move(rules));
-    invalidate_image_resource_registration();
 
     record_stylesheet_rules_replaced(*this);
     invalidate_owners();
@@ -445,7 +447,6 @@ void StyleSheetState::set_disabled(bool disabled)
         if (document) {
             if (has_document_owner())
                 document->font_computer().load_fonts_from_sheet(*this);
-            load_pending_image_resources(*document);
         }
     } else if (document && has_document_owner()) {
         document->font_computer().unload_fonts_from_sheet(*this);
@@ -563,42 +564,6 @@ Optional<::URL::URL> StyleSheetState::style_resource_base_url() const
     return {};
 }
 
-void StyleSheetState::load_pending_image_resources(DOM::Document& document)
-{
-    if (disabled())
-        return;
-
-    // Keep image-bearing values alive only until the pending requests below have been started.
-    // Their parsed data stays in the native rules; CSSOM wrappers do not own resource bindings.
-    // NB: The process interns equal values, so a sheet repeating one image across its rules names
-    //     one value many times. Each is registered once, rather than with a wrapper per use.
-    struct Context {
-        StyleSheetState& sheet;
-        HashTable<void const*> seen;
-        Vector<NonnullRefPtr<StyleValue const>> images;
-    } context { *this, {}, {} };
-    // A constructed sheet can be adopted by many shadow roots in the same document. Discover
-    // its images once, unless a rule-list mutation gives it new resources to register.
-    if (exchange(m_needs_image_resource_registration, false)) {
-        Parser::ValueParserFFI::rust_rule_list_visit_images(m_native_sheet.rules().handle(), &context, [](void* data, void const* value) {
-            auto& context = *static_cast<Context*>(data);
-            if (context.seen.set(value) != HashSetResult::InsertedNewEntry)
-                return;
-            auto image = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(static_cast<StyleValueFFI::StyleValueData const*>(value)));
-            const_cast<StyleValue&>(*image).set_style_sheet(&context.sheet);
-            context.images.append(move(image));
-        });
-    }
-
-    auto pending = move(m_pending_image_values);
-    for (auto const& weak_image_value : pending) {
-        if (auto* image_value = weak_image_value.ptr()) {
-            image_value->update_style_sheet_resource_context(*this);
-            image_value->load_any_resources(document);
-        }
-    }
-}
-
 // A sheet whose media stopped matching contributes nothing, so its declarations have to be taken
 // back wherever they were winning, and given back when it matches again. Publishing the activation
 // is separate from noticing the transition, because the two routes into a media change notice it in
@@ -697,7 +662,6 @@ void StyleSheetState::remove_css_connected_font_face(u64 rule_identity)
 
 void StyleSheetState::recalculate_rule_caches()
 {
-    invalidate_image_resource_registration();
     m_rule_cache = nullptr;
 
     m_import_rules.clear();
@@ -824,21 +788,6 @@ Parser::ParsingParams StyleSheetState::make_parsing_params() const
 
     parsing_params.declared_namespaces = declared_namespaces();
     return parsing_params;
-}
-
-StringView StyleSheetState::loading_state_name(LoadingState loading_state)
-{
-    switch (loading_state) {
-    case LoadingState::Unloaded:
-        return "Unloaded"sv;
-    case LoadingState::Loading:
-        return "Loading"sv;
-    case LoadingState::Loaded:
-        return "Loaded"sv;
-    case LoadingState::Error:
-        return "Error"sv;
-    }
-    VERIFY_NOT_REACHED();
 }
 
 CSSStyleSheet& StyleSheetState::cssom_sheet() const

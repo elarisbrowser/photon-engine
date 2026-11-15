@@ -20,6 +20,7 @@
 #include <LibGC/Ptr.h>
 #include <LibHTTP/HeaderList.h>
 #include <LibJS/Heap/Cell.h>
+#include <LibWeb/Fetch/Infrastructure/NetworkObservation.h>
 #include <LibWeb/Forward.h>
 #include <LibWebCommon/HTML/CrossProcessId.h>
 #include <LibWebCommon/WebDriver/Response.h>
@@ -44,7 +45,7 @@ class NetworkContinuation final : public JS::Cell {
     GC_DECLARE_ALLOCATOR(NetworkContinuation);
 
 public:
-    using Callback = Function<void(NetworkContinuationAction, RefPtr<Fetch::Infrastructure::Response>)>;
+    using Callback = GC::Ref<GC::Function<void(NetworkContinuationAction, RefPtr<Fetch::Infrastructure::Response>)>>;
     static GC::Ref<NetworkContinuation> create(GC::Heap&, Callback);
     void invoke(NetworkContinuationAction, RefPtr<Fetch::Infrastructure::Response>);
     void clear_blocked_state();
@@ -61,12 +62,12 @@ private:
     explicit NetworkContinuation(Callback);
     virtual void finalize() override;
     virtual void visit_edges(JS::Cell::Visitor&) override;
-    Callback m_callback;
+    GC::Ptr<GC::Function<void(NetworkContinuationAction, RefPtr<Fetch::Infrastructure::Response>)>> m_callback;
 };
 
 // https://w3c.github.io/webdriver-bidi/#request-id
 // NB: Fetch's internal request clones and redirects share this identity.
-class NetworkRequest final : public RefCounted<NetworkRequest> {
+class NetworkRequest final : public Fetch::Infrastructure::NetworkObserverState {
     AK_ALLOC_WITH_KMALLOC;
 
 public:
@@ -89,20 +90,23 @@ private:
 };
 
 // NB: Fetch checks this cached flag before doing any network instrumentation.
-WEB_API extern bool g_network_events_enabled;
-WEB_API extern bool g_network_configuration_enabled;
+// NB: A session reaches only the window agent, so these are false on the thread of a worker.
+WEB_API bool network_events_enabled();
+WEB_API bool network_configuration_enabled();
 
 void network_session_state_changed();
 void cancel_network_interception(Fetch::Infrastructure::FetchParams const&);
-void apply_network_cache_behavior(Fetch::Infrastructure::Request&);
-void apply_network_extra_headers(Fetch::Infrastructure::Request&);
-void apply_network_request_header_overrides(Fetch::Infrastructure::Request&);
+void apply_network_cache_behavior(Fetch::Infrastructure::FetchParams const&);
+void apply_network_extra_headers(Fetch::Infrastructure::FetchParams const&);
+void apply_network_request_header_overrides(Fetch::Infrastructure::FetchParams const&);
+void remove_network_request_content_length_override(Fetch::Infrastructure::FetchParams const&);
 JsonArray get_network_intercepts(Fetch::Infrastructure::FetchParams const&, StringView phase);
 void block_network_request(Fetch::Infrastructure::FetchParams const&, RefPtr<Fetch::Infrastructure::Response>, String phase, JsonArray intercepts, GC::Ref<NetworkContinuation>, RefPtr<Fetch::Infrastructure::Request> original_request = nullptr);
 WEB_API Response continue_network_request(StringView method, JsonObject const&);
 
-void initialize_network_request(Fetch::Infrastructure::Request&, GC::Ptr<HTML::Navigable> = nullptr, Optional<Utf16String> const& navigation = {});
-void synchronize_network_request(Fetch::Infrastructure::Request& original, Fetch::Infrastructure::Request& prepared);
+void initialize_network_request(Fetch::Infrastructure::Request&, GC::Ptr<HTML::Navigable>, Optional<Utf16String> const& navigation);
+void initialize_network_request(Fetch::Infrastructure::FetchParams const&, GC::Ptr<HTML::Navigable> = nullptr);
+void initialize_network_request_with_its_navigable(Fetch::Infrastructure::FetchParams const&);
 void network_before_request_sent(Fetch::Infrastructure::FetchParams const&);
 void network_response_started(Fetch::Infrastructure::FetchParams const&, Fetch::Infrastructure::Response&);
 void network_auth_required(Fetch::Infrastructure::FetchParams const&, Fetch::Infrastructure::Response const&);

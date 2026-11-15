@@ -49,6 +49,8 @@ unsafe extern "C" {
     pub(crate) fn web_bindings_realm_is_window(realm: *mut c_void) -> bool;
     pub(crate) fn web_bindings_realm_is_secure_context(realm: *mut c_void) -> bool;
 
+    pub(crate) fn web_bindings_report_an_exception(realm: *mut c_void, exception: u64);
+
     /// Runs the steps with the context while an execution context of the realm is on the stack, as an
     /// HTML::TemporaryExecutionContext puts it there, with callbacks enabled if `callbacks_enabled`.
     pub(crate) fn web_bindings_with_temporary_execution_context(
@@ -71,19 +73,20 @@ unsafe extern "C" {
         on_origin: unsafe extern "C" fn(*mut c_void, *const liburl_rust::FfiOrigin),
     ) -> bool;
 
+    /// HTML::perform_a_security_check() of the value, with the identifier, which is ASCII, and the
+    /// HTML::SecurityCheckType.
+    pub(crate) fn web_bindings_perform_a_security_check(
+        realm: *mut c_void,
+        platform_object: u64,
+        identifier: ak::Span<'_, u8>,
+        check_type: u8,
+    ) -> libjs_rust::api::RawNativeFunctionResult;
+
     /// The wrapper in the realm of a new DOMException with the name, which is ASCII, and the message, a borrowed
     /// AK::Utf16String.
     pub(crate) fn web_bindings_create_dom_exception(
         realm: *mut c_void,
         name: ak::Span<'_, u8>,
         message: usize,
-    ) -> *mut c_void;
-
-    /// A promise rejected with the reason, in the realm of the this value of an operation that ran in the current
-    /// realm: the realm of the object, or the current realm for a value that is not an object.
-    pub(crate) fn web_bindings_rejected_promise(
-        current_realm: *mut c_void,
-        this_value: u64,
-        reason: u64,
     ) -> *mut c_void;
 }

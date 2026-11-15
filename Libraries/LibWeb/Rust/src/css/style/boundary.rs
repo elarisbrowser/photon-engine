@@ -16,11 +16,12 @@ use super::ReplacedContentInput;
 use super::StyleEngine;
 use super::animations::HeldAppliedAnimationDefinition;
 use super::bridge::{ElementBoxKind, FfiAppliedAnimationDefinition, borrow};
+use super::bridge::{FfiFrameSetBorder, FfiFrameSetDimension};
 use super::engine_calls::EngineWrite;
 use super::engine_calls::with_engine;
 use super::index::StyleAtomID;
 use super::pipeline::rule_store::{CascadeLayerID, SheetID};
-use super::tree::{StyleNodeID, TableSpans, TreeScopeID};
+use super::tree::{FrameSetLayout, StyleNodeID, TableSpans, TreeScopeID};
 use crate::abort_on_panic;
 use crate::css::css_string::CssString;
 use crate::render_state::{ArenaChange, BegunRead, DocumentHost};
@@ -89,6 +90,10 @@ carried! {
         |span| unsafe { borrow(span.data, span.size) }.iter().map(|&raw| unsafe { CssString::from_borrowed_raw(raw) }).collect();
     Box<[u32]>: FfiSpan<u32> as "ReadonlySpan<u32>" = |span| unsafe { borrow(span.data, span.size) }.into();
     Box<[u64]>: FfiSpan<u64> as "ReadonlySpan<u64>" = |span| unsafe { borrow(span.data, span.size) }.into();
+    Box<[FfiFrameSetDimension]>: FfiSpan<FfiFrameSetDimension> as "ReadonlySpan<FfiFrameSetDimension>" =
+        |span| unsafe { borrow(span.data, span.size) }.into();
+    Box<[FfiFrameSetBorder]>: FfiSpan<FfiFrameSetBorder> as "ReadonlySpan<FfiFrameSetBorder>" =
+        |span| unsafe { borrow(span.data, span.size) }.into();
     Box<[StyleAtomID]>: FfiSpan<u32> as "ReadonlySpan<StyleAtomID>" =
         |span| unsafe { borrow(span.data, span.size) }.iter().copied().map(StyleAtomID).collect();
     Box<[StyleNodeID]>: FfiSpan<u32> as "ReadonlySpan<StyleNodeID>" =
@@ -352,9 +357,21 @@ style_boundary! {
                 column_span: u16::try_from(column_span).expect("a column span is clamped to 1000"),
                 row_span: u16::try_from(row_span).expect("a row span is clamped to 65534"),
             });
+        set_element_frameset_layout => SetElementFrameSetLayout {
+            node: StyleNodeID,
+            columns: Box<[FfiFrameSetDimension]>,
+            rows: Box<[FfiFrameSetDimension]>,
+            borders: Box<[FfiFrameSetBorder]>,
+            border_thickness: u32
+        } =>
+            {
+                let (column_borders, row_borders) = borders.split_at(columns.len());
+                let (column_borders, row_borders) = (column_borders.into(), row_borders.into());
+                engine.set_element_frameset_layout(node, FrameSetLayout { columns, rows, column_borders, row_borders, border_thickness });
+            };
         set_element_id_name => SetElementIdName { node: StyleNodeID, name: StyleAtomID };
         record_environment_change => RecordEnvironmentChange { changes: u8 };
-        record_custom_property_registration_change => RecordCustomPropertyRegistrationChange { name: StyleAtomID };
+        record_custom_property_registration_change => RecordCustomPropertyRegistrationChange => engine.record_custom_property_registration_change();
         flush => Flush => engine.flush_without_document_root();
         finish_sheet_rules_replacement => FinishSheetRulesReplacement { sheet: SheetID, declaration_block: u32 };
         attach_sheet => AttachSheet { sheet: SheetID, tree_scope: TreeScopeID, before_sheet: Option<SheetID> } =>
@@ -490,29 +507,24 @@ style_boundary! {
         defer_pending_transaction_for_geometry_read() -> ();
         begin_deferred_geometry_transaction_flush() -> bool;
         has_deferred_geometry_transaction() -> bool;
-        cold_pass(root: Option<StyleNodeID>, verify: bool, threads: u32) -> u64 => root.map_or(0, |root| engine.run_cold_pass(root, verify, threads));
-        cold_pass_report(index: u32) -> u64 => engine.cold_pass_report(index);
-        live_report(root: Option<StyleNodeID>, verify: bool, index: u32) -> u64 =>
-            root.map_or(0, |root| engine.retained.live_report(root, verify, index));
-        style_counter(index: u32) -> u64 => engine.retained.live_counters.get(index);
-        reset_style_counters() -> bool => {
-            engine.retained.live_counters.reset();
+        begin_style_trace() -> bool => {
+            engine.retained.live_counters.begin_trace();
             true
         };
-        last_pass_is_full() -> bool => engine.retained.live_counters.last_pass_is_full();
-        last_pass_size(root: Option<StyleNodeID>, changed: bool) -> u32 => root.map_or(0, |root| {
+        end_style_trace() -> bool => {
+            engine.retained.live_counters.end_trace();
+            true
+        };
+        style_trace_size(root: Option<StyleNodeID>) -> u32 => root.map_or(0, |root| {
             let retained = &mut engine.retained;
-            retained.live_counters.last_pass_elements(&retained.projection, root, changed).len() as u32
+            retained.live_counters.trace_entries(&retained.projection, root).len() as u32
         });
-        last_pass_element(root: Option<StyleNodeID>, changed: bool, index: u32) -> u32 => root.map_or(0, |root| {
+        style_trace_entry(root: Option<StyleNodeID>, index: u32) -> u64 => root.map_or(0, |root| {
             let retained = &mut engine.retained;
-            let elements = retained.live_counters.last_pass_elements(&retained.projection, root, changed);
-            elements.get(index as usize).map_or(0, |node| node.raw())
+            let entries = retained.live_counters.trace_entries(&retained.projection, root);
+            entries.get(index as usize).copied().unwrap_or(0)
         });
-        animated_style_samples(rebuilt_every_group: bool, reset: bool) -> u64 =>
-            engine.retained.live_counters.animated_samples(rebuilt_every_group, reset);
         layer_index(tree_scope: TreeScopeID, layer: CascadeLayerID) -> u32;
-        size_query_container_scan_visits(reset: bool) -> u64;
         ensure_random_base_value(node: Option<StyleNodeID>, name: FfiSpan<u16>, element_shared: bool) -> u64 => {
             // SAFETY: The host lends the name for the call.
             let name = unsafe { borrow(name.data, name.size) };

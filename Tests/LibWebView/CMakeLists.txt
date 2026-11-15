@@ -2,7 +2,9 @@ if (BUILD_TESTING AND NOT WIN32)
     if (APPLE OR LINUX)
         ladybird_python_test(test-devtools-catch-up-layout.py ARGS $<TARGET_FILE:ladybird>)
         ladybird_python_test(test-devtools-client-follows-the-tab.py ARGS $<TARGET_FILE:ladybird>)
+        ladybird_python_test(test-devtools-network-events.py ARGS $<TARGET_FILE:ladybird>)
         ladybird_python_test(test-iframe-console.py ARGS $<TARGET_FILE:ladybird>)
+        ladybird_python_test(test-console-previews.py ARGS $<TARGET_FILE:ladybird>)
         ladybird_python_test(test-message-port-collection.py ARGS $<TARGET_FILE:WebDriver>)
         ladybird_python_test(test-shared-stylesheet-memory.py ARGS $<TARGET_FILE:WebDriver> TIMEOUT 180)
         ladybird_python_test(test-user-agent-preset-reaches-child-frames.py ARGS $<TARGET_FILE:ladybird>)
@@ -13,7 +15,7 @@ if (BUILD_TESTING AND NOT WIN32)
         ladybird_python_test(test-window-size-reaches-every-page.py ARGS $<TARGET_FILE:ladybird>)
         ladybird_python_test(test-worker-error-console.py ARGS $<TARGET_FILE:ladybird>)
 
-        foreach(helper IN ITEMS Compositor ImageDecoder RequestServer WebWorker)
+        foreach(helper IN ITEMS Compositor ImageDecoder RequestServer)
             ladybird_python_test(test-webdriver-crash-report.py
                 NAME Test${helper}CrashReport
                 ARGS $<TARGET_FILE:WebDriver> --process ${helper}
@@ -24,11 +26,13 @@ if (BUILD_TESTING AND NOT WIN32)
     ladybird_python_test(test-webdriver-bidi.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-content-blockers.py ARGS $<TARGET_FILE:WebDriver> TIMEOUT 180)
     ladybird_python_test(test-webdriver-delete-session.py ARGS $<TARGET_FILE:WebDriver>)
+    ladybird_python_test(test-webdriver-element-screenshot.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-error-keep-alive.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-force-dark.py ARGS $<TARGET_FILE:WebDriver>)
-    ladybird_python_test(test-webdriver-location-policy.py ARGS $<TARGET_FILE:WebDriver>)
-    ladybird_python_test(test-webdriver-notifications-policy.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-permissions-settings.py ARGS $<TARGET_FILE:WebDriver>)
+    if (PDFJS_FOUND)
+        ladybird_python_test(test-webdriver-pdf-viewer-ignores-the-csp-of-its-pdf.py ARGS $<TARGET_FILE:WebDriver>)
+    endif()
     ladybird_python_test(test-webdriver-search-engine-settings.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-set-permission.py ARGS $<TARGET_FILE:WebDriver>)
     ladybird_python_test(test-webdriver-settings-changes.py ARGS $<TARGET_FILE:WebDriver>)
@@ -49,7 +53,7 @@ ladybird_test_suite(LibWebView)
 
 set(TEST_SOURCES
     TestAccessibilityTreeManager.cpp
-    TestAudioServerAudibility.cpp
+    TestAudioServerActivity.cpp
     TestAutocompleteMuxer.cpp
     TestAutocompleteRanker.cpp
     TestBackgroundNetworking.cpp
@@ -71,11 +75,10 @@ set(TEST_SOURCES
     TestOmnibox.cpp
     TestPermissionManager.cpp
     TestPictureInPictureWindow.cpp
+    TestPlatformFeatures.cpp
     TestProfile.cpp
     TestSessionHistory.cpp
-    TestSessionHistorySnapshotStorage.cpp
     TestSessionHistoryTraversalQueue.cpp
-    TestSessionStore.cpp
     TestSiteCompatibilityDataLoading.cpp
     TestStartupSettings.cpp
     TestStorageAreaRegistry.cpp
@@ -84,6 +87,7 @@ set(TEST_SOURCES
     TestTabPerformanceStats.cpp
     TestWebDriverBiDiNetwork.cpp
     TestWebViewURL.cpp
+    TestWebWorkerClient.cpp
 )
 
 if (APPLE OR LINUX)
@@ -104,10 +108,10 @@ if (LINUX)
     list(APPEND TEST_SOURCES TestAudioDaemonSocket.cpp)
 endif()
 
-if (APPLE AND NOT IOS)
+if ((APPLE AND NOT IOS) OR LINUX)
     target_link_libraries(TestLibWebView PRIVATE LibWebSocket OpenSSL::Crypto OpenSSL::SSL)
     target_sources(TestLibWebView PRIVATE
-        TestWebDriverMachBootstrap.cpp
+        TestWebDriverSession.cpp
         "${LADYBIRD_SOURCE_DIR}/Services/WebDriver/BiDiSession.cpp"
         "${LADYBIRD_SOURCE_DIR}/Services/WebDriver/BrowserConnection.cpp"
         "${LADYBIRD_SOURCE_DIR}/Services/WebDriver/Client.cpp"
@@ -118,12 +122,17 @@ if (APPLE AND NOT IOS)
     set_tests_properties(TestLibWebView PROPERTIES TIMEOUT 120)
 endif()
 
+if (APPLE AND NOT IOS)
+    target_sources(TestLibWebView PRIVATE TestWebDriverMachBootstrap.cpp)
+endif()
+
 if (NOT WIN32)
     set(HEADLESS_TEST_SOURCES
         TestApplicationDestruction.cpp
         TestAutocomplete.cpp
         TestBeforeUnload.cpp
         TestBrowserHistoryTraversal.cpp
+        TestCompositorStartup.cpp
         TestCrashOverlay.cpp
         TestCrashReportSubmission.cpp
         TestFavicon.cpp
@@ -141,10 +150,14 @@ if (NOT WIN32)
         TestRendererAttentionClaims.cpp
         TestRendererCookieAccess.cpp
         TestRendererOriginClaims.cpp
+        TestRendererResponseBodyClaims.cpp
         TestRendererViolationReports.cpp
         TestRequestServerClientSessions.cpp
         TestRequestServerDiskCaches.cpp
         TestShadowTreeTooltipsAndLinks.cpp
+        TestSharedWorkerHost.cpp
+        TestSpareWebContentProcess.cpp
+        TestTitleElementChanges.cpp
         TestUserActivation.cpp
         TestViewSource.cpp
         TestWebCompatReport.cpp
@@ -153,7 +166,7 @@ if (NOT WIN32)
 endif()
 
 target_sources(TestLibWebView PRIVATE ${TEST_SOURCES})
-target_link_libraries(TestLibWebView PRIVATE LibAudio LibCompositing LibDatabase LibGC LibGfx LibHTTP LibIPC LibRequests LibThreading LibURL LibWeb LibWebCommon LibWebView)
+target_link_libraries(TestLibWebView PRIVATE LibAudio LibCompositing LibDatabase LibGamepad LibGC LibGfx LibHTTP LibIPC LibRequests LibThreading LibURL LibWeb LibWebCommon LibWebView)
 
 if (APPLE)
     add_dependencies(TestLibWebView ProcessReaper)

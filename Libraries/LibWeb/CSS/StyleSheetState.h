@@ -69,9 +69,8 @@ public:
         Loaded,
         Error,
     };
-    static StringView loading_state_name(LoadingState);
 
-    [[nodiscard]] static NonnullRefPtr<StyleSheetState> create(RustRuleList, GC::Ptr<DOM::Document>, RustMediaList, Optional<::URL::URL> location, Optional<ReferrerPolicy::ReferrerPolicy> fetched_referrer_policy = {});
+    [[nodiscard]] static NonnullRefPtr<StyleSheetState> create(RustRuleList, GC::Ptr<DOM::Document>, RustMediaList, Optional<::URL::URL> location, Optional<ReferrerPolicy::ReferrerPolicy> fetched_referrer_policy = {}, StyleSheetImport const* import = nullptr);
     static WebIDL::ExceptionOr<NonnullRefPtr<StyleSheetState>> create_constructed(DOM::Document const&, CSSStyleSheetOptions const& options = {});
 
     ~StyleSheetState();
@@ -142,15 +141,11 @@ public:
     Optional<::URL::URL> base_url() const { return m_base_url; }
     void set_base_url(Optional<::URL::URL> base_url) { m_base_url = move(base_url); }
 
-    void register_pending_image_value(ImageStyleValue& value) { m_pending_image_values.append(value); }
-    void invalidate_image_resource_registration() { m_needs_image_resource_registration = true; }
-    void load_pending_image_resources(DOM::Document&);
     Optional<::URL::URL> style_resource_base_url() const;
 
     bool constructed() const { return m_native_sheet.flag(RustStyleSheet::Flag::Constructed); }
 
     GC::Ptr<DOM::Document const> constructor_document() const { return m_constructor_document; }
-    GC::Ptr<DOM::Document> parsing_document() const { return m_parsing_document; }
     void set_constructor_document(GC::Ptr<DOM::Document const> constructor_document) { m_constructor_document = constructor_document; }
 
     bool disallow_modification() const { return m_native_sheet.flag(RustStyleSheet::Flag::DisallowModification); }
@@ -183,6 +178,8 @@ public:
     Optional<Utf16String> href_for_bindings() const;
 
     Optional<::URL::URL> location() const { return m_location; }
+    // The URL the import that loaded this sheet requested, before any redirect.
+    Optional<::URL::URL> const& requested_url() const { return m_requested_url; }
     void set_location(Optional<::URL::URL> location) { m_location = move(location); }
 
     // AD-HOC: The referrer policy of the response that this style sheet was fetched from, or none if it was not fetched.
@@ -209,7 +206,7 @@ public:
     void set_parent_css_style_sheet(StyleSheetState*);
 
 private:
-    StyleSheetState(RustRuleList, GC::Ptr<DOM::Document>, RustMediaList, Optional<::URL::URL> location, Optional<ReferrerPolicy::ReferrerPolicy> fetched_referrer_policy);
+    StyleSheetState(RustRuleList, GC::Ptr<DOM::Document>, RustMediaList, Optional<::URL::URL> location, Optional<ReferrerPolicy::ReferrerPolicy> fetched_referrer_policy, StyleSheetImport const* import);
 
     void set_rules(RustRuleList);
     bool has_document_owner() const;
@@ -236,6 +233,7 @@ private:
     GC::Ptr<DOM::Element> m_owner_node;
     WeakPtr<StyleSheetState> m_parent_style_sheet;
     Optional<::URL::URL> m_location;
+    Optional<::URL::URL> m_requested_url;
     Optional<ReferrerPolicy::ReferrerPolicy> m_fetched_referrer_policy;
     Utf16String m_title;
 
@@ -253,9 +251,6 @@ private:
     OwnPtr<StyleRuleCache> m_rule_cache;
 
     Vector<StyleSheetImport&> m_critical_subresources;
-
-    Vector<WeakPtr<ImageStyleValue>> m_pending_image_values;
-    bool m_needs_image_resource_registration { true };
 
     SheetID m_style_engine_sheet_id;
     RefPtr<SharedCompiledStyleSheet> m_shared_compiled_style_sheet;

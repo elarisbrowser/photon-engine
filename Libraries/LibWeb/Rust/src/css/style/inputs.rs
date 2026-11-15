@@ -96,17 +96,45 @@ pub struct TextStyleParentFacts {
 pub struct PublishedBoxFacts {
     pub display: crate::css::display::FfiDisplay,
     pub content_visibility: u8,
-    pub position: u8,
-    pub float_: u8,
-    pub appearance: u8,
 }
 
-/// What a published record says about the content a box is generated from.
-pub struct PublishedContentFacts {
-    pub counters_are_none: bool,
-    pub content_is_keyword: bool,
-    pub content_is_strings_only: bool,
-    pub opens_or_closes_quotes: bool,
+/// See [`RetainedState::element_layout_inputs`].
+#[derive(Clone, Copy)]
+pub(crate) struct ElementLayoutInputs<'a> {
+    /// See `bridge::element_adjustment_fact`.
+    pub(crate) adjustment_facts: u32,
+    /// See `bridge::element_construction_fact`.
+    pub(crate) construction_facts: u32,
+    pub(crate) box_kind: super::bridge::ElementBoxKind,
+    pub(crate) record: Option<PublishedLayoutRecord<'a>>,
+}
+
+/// What [`RetainedState::prefetch_element_layout_inputs`] fetches.
+#[derive(Clone, Copy)]
+pub(crate) enum LayoutInputsPrefetch {
+    /// The element's rows of the tables its inputs are read from.
+    Rows,
+    /// The record the element holds.
+    Record,
+    /// The sets of groups of the record the element holds.
+    Groups,
+}
+
+/// An element's published style record, as a layout tree build reads it.
+#[derive(Clone, Copy)]
+pub(crate) struct PublishedLayoutRecord<'a> {
+    /// The record's identity.
+    pub(crate) raw: u64,
+    pub(crate) payloads: &'a crate::css::computed_values::StyleGroups,
+}
+
+impl PublishedLayoutRecord<'_> {
+    /// What a tree build reads of the record's style.
+    pub(crate) fn summary(&self) -> crate::layout::tree_plan::style_summary::StyleBoxSummary {
+        crate::layout::tree_plan::style_summary::StyleBoxSummary::of(
+            crate::css::computed_value_views::ComputedValuesView::of(self.payloads),
+        )
+    }
 }
 
 /// The custom-property environment one element holds: the store the host holds as the environment,
@@ -170,6 +198,11 @@ impl HeldStyleRecords {
     #[must_use]
     pub(crate) fn get(&self, node: StyleNodeID) -> Option<&std::sync::Arc<super::pipeline::Record>> {
         self.by_element.get(node.element_index()? as usize)?.0.as_ref()
+    }
+
+    /// Where the column keeps the record `node` holds.
+    fn slot_of(&self, node: StyleNodeID) -> Option<*const u8> {
+        Some(std::ptr::from_ref(self.by_element.get(node.element_index()? as usize)?).cast())
     }
 
     #[must_use]
@@ -426,21 +459,6 @@ impl RetainedState {
         &self.tested_attribute_names
     }
 
-    /// Apply an accepted input to the authoritative fact arrangement.
-    ///
-    /// A fact exists in the store exactly because a mutation published it, which is what lets the
-    /// evaluator distinguish "this element has no such class" from "nothing ever told me about this
-    /// element".
-    pub(super) fn apply_to_facts_without_settling(&mut self, key: InputKey, new: InputValue) {
-        match (key, new) {
-            #[cfg(test)]
-            (InputKey::LocalFeature(node, feature), InputValue::Feature(value)) => {
-                self.write_projection_for_test(|writes| writes.apply_feature(node, feature, value));
-            }
-            _ => {}
-        }
-    }
-
     /// Write the projection as a test's host, publishing the writes to it at once and counting them.
     #[cfg(test)]
     pub(super) fn write_projection_for_test<R>(&mut self, write: impl FnOnce(&mut ProjectionWrites<'_>) -> R) -> R {
@@ -586,6 +604,71 @@ impl RetainedState {
             })
     }
 
+    /// What a layout tree build reads of the element in one go: the facts the host published for it, and the record
+    /// [`Self::element_published_style_record`] answers, with its groups. The record is `None` while the element has
+    /// none.
+    #[must_use]
+    pub(crate) fn element_layout_inputs(&self, node: StyleNodeID) -> ElementLayoutInputs<'_> {
+        let host_facts = self.projection.host_facts(node);
+        ElementLayoutInputs {
+            adjustment_facts: host_facts.adjustment_facts,
+            construction_facts: host_facts.construction_facts,
+            box_kind: host_facts.box_kind,
+            record: self.element_published_layout_record(node),
+        }
+    }
+
+    /// Asks the processor to fetch what [`Self::element_layout_inputs`] reads of the element `node` at `stage`,
+    /// without waiting for it. Each stage reads what the stage before fetched, so a walk asks for the stages of an
+    /// element some steps apart, the first one furthest ahead.
+    pub(crate) fn prefetch_element_layout_inputs(&self, node: StyleNodeID, stage: LayoutInputsPrefetch) {
+        use crate::css::declaration_block::prefetch;
+        match stage {
+            LayoutInputsPrefetch::Rows => {
+                if let Some(row) = self.projection.host_facts_row(node) {
+                    prefetch(row);
+                }
+                if let Some(held) = self.held_style_records.slot_of(node) {
+                    prefetch(held);
+                }
+            }
+            LayoutInputsPrefetch::Record => {
+                if let Some(record) = self.held_style_records.get(node) {
+                    let address = std::sync::Arc::as_ptr(record).cast::<u8>();
+                    prefetch(address);
+                    prefetch(address.wrapping_add(64));
+                }
+            }
+            LayoutInputsPrefetch::Groups => {
+                if let Some(record) = self.held_style_records.get(node) {
+                    record.payloads.prefetch_sets();
+                }
+            }
+        }
+    }
+
+    fn element_published_layout_record(&self, node: StyleNodeID) -> Option<PublishedLayoutRecord<'_>> {
+        fn of(raw: u64, record: &super::pipeline::Record) -> PublishedLayoutRecord<'_> {
+            PublishedLayoutRecord {
+                raw,
+                payloads: &record.payloads,
+            }
+        }
+        if !self.tick_shown.is_empty()
+            && let Some(shown) = self.tick_shown.element(node)
+        {
+            return Some(of(shown.raw(), self.computed_group_sets.host_record(shown.raw())?));
+        }
+        if let Some(record) = self.held_style_records.get(node) {
+            let identity = bridge::host_record_identity(record);
+            if identity != 0 {
+                return Some(of(identity, record));
+            }
+        }
+        let assigned = self.computed_group_sets.assigned_style_record(node)?.raw();
+        Some(of(assigned, self.computed_group_sets.host_record(assigned)?))
+    }
+
     /// The style the element published for one pseudo-element kind. `None` while the element
     /// styles no such pseudo-element.
     pub(crate) fn pseudo_published_style_view(
@@ -604,6 +687,12 @@ impl RetainedState {
             .map(computed::FinalStyleRecordID::raw)
     }
 
+    /// Whether the element published a record for no pseudo-element at all, which spares asking for each kind.
+    #[must_use]
+    pub(crate) fn publishes_no_pseudo_element_records(&self, node: StyleNodeID) -> bool {
+        !self.tick_shown.shows_any(node) && self.computed_group_sets.has_no_pseudo_rows(node)
+    }
+
     #[must_use]
     pub fn pseudo_published_custom_highlight_records(&self, node: StyleNodeID) -> SmallVec<[(StyleAtomID, u64); 2]> {
         self.computed_group_sets
@@ -617,26 +706,6 @@ impl RetainedState {
     #[must_use]
     pub fn element_published_box_facts(&self, node: StyleNodeID) -> Option<PublishedBoxFacts> {
         self.published_box_facts(self.published_element_record(node))
-    }
-
-    /// The box facts the element's published record for one pseudo-element kind holds. `None`
-    /// while the element styles no such pseudo-element.
-    #[must_use]
-    pub fn pseudo_published_box_facts(&self, node: StyleNodeID, pseudo_kind: u8) -> Option<PublishedBoxFacts> {
-        self.published_box_facts(self.published_pseudo_record(node, pseudo_kind))
-    }
-
-    /// What the element's published record for one pseudo-element kind says about its generated
-    /// content. `None` while the element styles no such pseudo-element.
-    #[must_use]
-    pub fn pseudo_published_content_facts(&self, node: StyleNodeID, pseudo_kind: u8) -> Option<PublishedContentFacts> {
-        let view = self.published_style_record_view(self.published_pseudo_record(node, pseudo_kind))?;
-        Some(PublishedContentFacts {
-            counters_are_none: view.counter_properties_are_none(),
-            content_is_keyword: view.content_is_keyword(),
-            content_is_strings_only: view.content_is_strings_only(),
-            opens_or_closes_quotes: view.content_opens_or_closes_quotes(),
-        })
     }
 
     /// Whether the element's published style record counts a counter down from its own last item,
@@ -703,9 +772,6 @@ impl RetainedState {
         Some(PublishedBoxFacts {
             display: view.display(),
             content_visibility: view.content_visibility(),
-            position: view.position(),
-            float_: view.float_(),
-            appearance: view.appearance(),
         })
     }
 
@@ -819,6 +885,15 @@ impl RetainedState {
         self.tree.set_dom_paint_facts(node, facts);
     }
 
+    #[must_use]
+    pub fn element_frameset_layout(&self, node: StyleNodeID) -> Option<std::sync::Arc<super::tree::FrameSetLayout>> {
+        self.tree.frameset_layout(node)
+    }
+
+    pub fn set_element_frameset_layout(&mut self, node: StyleNodeID, layout: super::tree::FrameSetLayout) {
+        self.tree.set_frameset_layout(node, layout);
+    }
+
     /// The spans a row built for the element takes from its attributes.
     #[must_use]
     pub fn element_table_spans(&self, node: StyleNodeID) -> super::tree::TableSpans {
@@ -843,13 +918,6 @@ impl RetainedState {
     /// Record which kind of tree the text node arrived in.
     pub fn set_text_is_in_user_agent_shadow_tree(&mut self, node: StyleNodeID, value: bool) {
         self.tree.set_text_is_in_user_agent_shadow_tree(node, value);
-    }
-
-    /// Whether the element's published style record replaces its contents with a single image.
-    #[must_use]
-    pub fn element_content_is_single_image(&self, node: StyleNodeID) -> bool {
-        self.published_style_record_view(self.published_element_record(node))
-            .is_some_and(crate::css::computed_value_views::ComputedValuesView::content_is_single_image)
     }
 
     /// The tree scope a counter style name `node` uses is looked up from: its own, unless its shadow
@@ -1254,18 +1322,11 @@ impl RetainedState {
     ) {
         let style_record = record.as_deref().map_or(0, bridge::host_record_identity);
         let previous = self.held_style_records.set(node, record);
-        // NB: Font-relative size queries can change even when the container's box keeps the same dimensions.
-        let font_group = crate::css::table_group_builder::group_index::FONT;
-        let font_inputs_changed = self.size_container_queries.is_queried_container(node)
-            && previous.is_some_and(|previous| {
-                self.held_style_records.get(node).is_some_and(|current| {
-                    previous.payloads[font_group].as_ptr() != current.payloads[font_group].as_ptr()
-                })
-            });
-        self.set_element_container_query_inputs(node, style_record);
-        if font_inputs_changed {
-            self.size_container_queries.note_font_input_change(node);
+        if let (Some(previous), Some(current)) = (previous, self.held_style_records.get(node)) {
+            self.size_container_queries
+                .note_held_record_change(node, previous, current);
         }
+        self.set_element_container_query_inputs(node, style_record);
         // A `rem` the host resolves reads the font of the record it holds for the document element,
         // which it can install in the middle of a style update.
         if self.projection.adjustment_facts(node) & bridge::element_adjustment_fact::IS_DOCUMENT_ELEMENT != 0 {
@@ -1372,6 +1433,7 @@ impl RetainedState {
                         | ElementBoxKind::Video
                         | ElementBoxKind::Canvas
                         | ElementBoxKind::NavigableContainerViewport
+                        | ElementBoxKind::Frame
                         | ElementBoxKind::TextArea
                         | ElementBoxKind::Image
                         | ElementBoxKind::SvgSvg
@@ -1614,10 +1676,8 @@ impl StyleEngine {
                 html_element_namespace: StyleAtomID::NONE,
                 sibling_positions: crate::fork::ForkReset::default(),
                 containers_counted_by_style_queries: Default::default(),
-                cold_pass_report: [0; pipeline::ReportField::COUNT],
                 live_style: None,
                 live_style_may_start: crate::fork::ForkReset::original(),
-                cold_passes: std::sync::Arc::default(),
                 live_counters: Default::default(),
                 style_layout_pool: None,
                 substituted_font_values: std::sync::Arc::default(),
@@ -1640,6 +1700,7 @@ impl StyleEngine {
             host: HostState {
                 hover_seal: Default::default(),
                 font_resolver: None,
+                settling_composition: None,
                 element_inputs: PendingElementInputs::default(),
                 deferred_element_style_inputs: Default::default(),
                 deferred_element_style_inputs_moved: false,
@@ -2094,50 +2155,6 @@ impl StyleEngine {
         self.retained.projection.arrival_is_pending(node)
     }
 
-    /// Count one input, and note it for the next transaction where the projection holds no row
-    /// that says it: an element's facts and relations are written into the projection, whose
-    /// changes say them.
-    pub(super) fn record(&mut self, key: InputKey, old: InputValue, new: InputValue) {
-        let counters = &self.retained.counters;
-        counters.bump(Counter::RawMutationRecords);
-        if let Some(counter) = key.counter() {
-            counters.bump(counter);
-        }
-        match (key, new) {
-            (InputKey::TreeRelations(_), _) => {}
-            (InputKey::LocalFeature(node, _) | InputKey::State(node, _), _) => {
-                // Every fact of an arriving element is said by its arrival.
-                if self.node_arrival_is_pending(node) {
-                    counters.bump(Counter::ArrivingNodeFactsFolded);
-                }
-            }
-            (InputKey::ElementDeclaration(node, _), _) => {
-                if old != new {
-                    self.host.element_inputs.note_declaration(node);
-                }
-            }
-            #[cfg(test)]
-            (
-                InputKey::ElementStyleInput(node),
-                InputValue::ElementStyleInput {
-                    reaction,
-                    inherited_style_groups,
-                },
-            ) => self.host.element_inputs.note_style_input(
-                node,
-                ElementStyleInput {
-                    reaction,
-                    inherited_style_groups,
-                },
-            ),
-            #[cfg(test)]
-            (InputKey::ElementStyleInput(_), _) => unreachable!("an element style input carries its reaction"),
-            // A registration made through `CSS.registerProperty()` moves how the elements declaring
-            // or reading its name compute, which the transaction taking the registry in finds.
-            (InputKey::CustomPropertyRegistration(_), _) => self.host.program_staging.note_registration_change(),
-        }
-    }
-
     #[cfg(test)]
     pub(super) fn stage_first_child(&mut self, parent: StyleNodeID, child: Option<StyleNodeID>) {
         self.retained
@@ -2280,6 +2297,9 @@ impl StyleEngine {
         version.scope = scope;
         self.replace_rule_version(rule, version);
         self.retained.counters.bump(Counter::StyleRulesCompiled);
+        self.retained
+            .live_counters
+            .note_program_event(super::pipeline::counters::ProgramEvent::StyleRulesCompiled, 1);
         rule
     }
 
@@ -2318,6 +2338,9 @@ impl StyleEngine {
         version.scope = self.scope_of_chain(scope);
         self.replace_rule_version(rule, version);
         self.retained.counters.bump(Counter::StyleRulesCompiled);
+        self.retained
+            .live_counters
+            .note_program_event(super::pipeline::counters::ProgramEvent::StyleRulesCompiled, 1);
     }
 
     /// Report that a rule's declarations moved, without touching anything else about it.
@@ -2348,9 +2371,37 @@ impl StyleEngine {
         }
     }
 
-    pub fn record_input(&mut self, key: InputKey, old: InputValue, new: InputValue) {
-        self.record(key, old, new);
-        self.apply_to_facts_without_settling(key, new);
+    #[cfg(test)]
+    pub fn record_input(&mut self, key: InputKey, new: InputValue) {
+        let counters = &self.retained.counters;
+        counters.bump(Counter::RawMutationRecords);
+        if let Some(counter) = key.counter() {
+            counters.bump(counter);
+        }
+        match (key, new) {
+            (InputKey::LocalFeature(node, feature), InputValue::Feature(value)) => {
+                // Every fact of an arriving element is said by its arrival.
+                if self.node_arrival_is_pending(node) {
+                    self.retained.counters.bump(Counter::ArrivingNodeFactsFolded);
+                }
+                self.retained
+                    .write_projection_for_test(|writes| writes.apply_feature(node, feature, value));
+            }
+            (
+                InputKey::ElementStyleInput(node),
+                InputValue::ElementStyleInput {
+                    reaction,
+                    inherited_style_groups,
+                },
+            ) => self.host.element_inputs.note_style_input(
+                node,
+                ElementStyleInput {
+                    reaction,
+                    inherited_style_groups,
+                },
+            ),
+            _ => {}
+        }
     }
 
     /// Attach a compiled program at the end of a scope's sheet order.
@@ -2434,12 +2485,12 @@ impl StyleEngine {
 
     /// Record a registration made through `CSS.registerProperty()`. Stylesheet registrations are
     /// already represented by their `@property` rule's program input.
-    pub fn record_custom_property_registration_change(&mut self, name: StyleAtomID) {
-        self.record_input(
-            InputKey::CustomPropertyRegistration(name),
-            InputValue::Flag(false),
-            InputValue::Flag(true),
-        );
+    pub fn record_custom_property_registration_change(&mut self) {
+        self.retained.counters.bump(Counter::RawMutationRecords);
+        self.retained.counters.bump(Counter::ProgramDeltas);
+        // A registration made through `CSS.registerProperty()` moves how the elements declaring
+        // or reading its name compute, which the transaction taking the registry in finds.
+        self.host.program_staging.note_registration_change();
     }
 
     /// Record the shadow parts an element exposes, each with the shadow host it is exposed to.
@@ -2533,11 +2584,9 @@ impl RetainedState {
             // Dropped in `forget_departed_elements` when a relation holds a departed element.
             // Scratch of one transaction.
             // Not keyed by style node.
-            cold_pass_report: _,
             // Keyed by style node, and only ever started by a test.
             live_style: _,
             live_style_may_start: _,
-            cold_passes: _,
             // The last pass's elements, which a reader leaves out where they departed.
             live_counters: _,
             style_layout_pool: _,

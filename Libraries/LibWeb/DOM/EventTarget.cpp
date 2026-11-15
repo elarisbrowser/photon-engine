@@ -162,7 +162,7 @@ DOM::EventTarget* current_target_global(WebIDL::CallbackType& callback, DOM::Eve
     auto wrapper = current_target_wrapper(callback_realm, event);
     if (!wrapper)
         return nullptr;
-    return HTML::window_from_global_object(this_value_realm(callback_realm, wrapper).global_object());
+    return HTML::window_from_global_object(wrapper->shape().realm().global_object());
 }
 
 void report_exception_for_callback(WebIDL::CallbackType& callback, JS::Value exception)
@@ -175,7 +175,7 @@ JS::Completion invoke_event_listener(WebIDL::CallbackType& callback, DOM::Event&
 {
     auto& callback_realm = callback.associated_realm();
     auto this_value = current_target_wrapper(callback_realm, event);
-    auto& event_realm = this_value ? this_value_realm(callback_realm, this_value) : callback_realm;
+    auto& event_realm = this_value ? this_value->shape().realm() : callback_realm;
     auto wrapped_event = Bindings::event(event_realm, GC::Ref { event });
 
     static Utf16FlyString const& handle_event = *new Utf16FlyString("handleEvent"_utf16_fly_string);
@@ -201,7 +201,7 @@ JS::Completion invoke_event_handler(WebIDL::CallbackType& callback, DOM::Event& 
 
     auto& callback_realm = callback.associated_realm();
     auto this_value = current_target_wrapper(callback_realm, event);
-    auto& event_realm = this_value ? this_value_realm(callback_realm, this_value) : callback_realm;
+    auto& event_realm = this_value ? this_value->shape().realm() : callback_realm;
     auto wrapped_event = Bindings::event(event_realm, GC::Ref { event });
 
     return WebIDL::invoke_callback(callback, this_value.ptr(), { { wrapped_event } });
@@ -502,10 +502,10 @@ void EventTarget::add_an_event_listener(DOMEventListener& listener)
     // 6. If listener’s signal is not null, then add the following abort steps to it:
     if (listener.signal) {
         // NOTE: `this` and `listener` are protected by AbortSignal using GC::HeapFunction.
-        (void)listener.signal->add_abort_algorithm([this, &listener] {
+        (void)listener.signal->add_abort_algorithm(GC::create_function(GC::Heap::the(), GC::captures(*this, listener), [](EventTarget& self, DOMEventListener& listener) {
             // 1. Remove an event listener with eventTarget and listener.
-            remove_an_event_listener(listener);
-        });
+            self.remove_an_event_listener(listener);
+        }));
     }
 }
 
@@ -742,7 +742,7 @@ WebIDL::CallbackType* EventTarget::get_current_value_of_event_handler(Utf16FlySt
 
         auto source_text = source_builder.to_string();
 
-        auto& vm = Bindings::main_thread_vm();
+        auto& vm = JS::VM::the();
 
         auto compiled_function = JS::CompiledDynamicFunction::compile(vm, source_text, parameters_string, body, JS::FunctionKind::Normal);
 
@@ -885,8 +885,8 @@ void EventTarget::activate_event_handler(Utf16FlyString const& name, HTML::Event
     // 4. Let callback be the result of creating a Web IDL EventListener instance representing a reference to a function of one argument that executes the steps of the event handler processing algorithm, given eventTarget, name, and its argument.
     //    The EventListener's callback context can be arbitrary; it does not impact the steps of the event handler processing algorithm. [DOM]
 
-    // NB: The listener below is eventTarget's and has type name, so the event it is called with gives both. This leaves
-    //     the function no captures for the garbage collector to scan conservatively.
+    // NB: The listener below is eventTarget's and has type name, so the event it is called with gives both, and the
+    //     function needs no captures.
     auto callback_function = JS::NativeFunction::create(
         realm, +[](JS::VM& vm) -> JS::ThrowCompletionOr<JS::Value> {
             // The event dispatcher should only call this with one argument.
@@ -1149,33 +1149,17 @@ bool EventTarget::dispatch_event(Event& event)
     // https://html.spec.whatwg.org/multipage/interaction.html#user-activation-processing-model
     // When a user interaction causes firing of an activation triggering input event in a Document document,
     // the user agent must perform the following activation notification steps before dispatching the event:
-
-    // FIXME: 1. Assert: document is fully active.
-    // FIXME: 2. Let windows be « document's relevant global object ».
-    // FIXME: 3. Extend windows with the active window of each of document's ancestor navigables.
-    // FIXME: 4. Extend windows with the active window of each of document's descendant navigables,
-    //           filtered to include only those navigables whose active document's origin is same origin with document's origin.
-    // FIXME: 5. For each window in windows:
-    // FIXME: 5.1 Set window's last activation timestamp to the current high resolution time.
-    // FIXME: 5.2 Notify the close watcher manager about user activation given window.
-
-    // FIXME: This is ad-hoc, but works for now.
     if (is_activation_triggering_input_event()) {
-        GC::Ptr<HTML::Window> window = [&]() {
-            if (is<HTML::Window>(this))
-                return GC::Ptr { static_cast<HTML::Window*>(this) };
-
-            if (is<DOM::Element>(this))
-                return static_cast<DOM::Element const*>(this)->document().window();
-
-            if (is<DOM::Document>(this))
-                return static_cast<DOM::Document const*>(this)->window();
-
-            return GC::Ptr<HTML::Window> { nullptr };
+        GC::Ptr<Document> document = [&]() -> GC::Ptr<Document> {
+            if (auto* window = as_if<HTML::Window>(*this))
+                return window->associated_document();
+            if (auto* node = as_if<Node>(*this))
+                return node->document();
+            return nullptr;
         }();
 
-        if (window)
-            window->notify_about_user_activation();
+        if (document)
+            HTML::Window::run_activation_notification_steps(*document);
     }
 
     return EventDispatcher::dispatch(*this, event);

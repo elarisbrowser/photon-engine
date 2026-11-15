@@ -1,7 +1,9 @@
 add_cxx_compile_options(-Wvla)
 
 set(SOURCES
+    KeyHandle.cpp
     OpenSSL.cpp
+    RustBindings.cpp
     ASN1/ASN1.cpp
     ASN1/DER.cpp
     ASN1/PEM.cpp
@@ -26,6 +28,7 @@ set(SOURCES
     PK/EC.cpp
     PK/MLDSA.cpp
     PK/MLKEM.cpp
+    PK/ModuleLatticePrivateKey.cpp
     PK/RSA.cpp
 )
 

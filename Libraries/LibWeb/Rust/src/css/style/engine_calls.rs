@@ -584,11 +584,7 @@ pub extern "C" fn style_engine_stage_element_arrival_rows(
                 continue;
             };
             let relations = row.has_relations.then(|| row.relations.decode());
-            writes.record_element_arrival(
-                node,
-                &super::bridge::element_arrival_facts(arrival, row_atoms),
-                relations,
-            );
+            writes.record_element_arrival(node, arrival, row_atoms, relations);
             if arrival.associated_pseudo_kind_plus_one != 0 {
                 unpublished.backing_elements.push(node);
             }
@@ -913,14 +909,6 @@ pub(crate) struct EngineMemo {
     pub(in crate::css::style) projection: std::cell::RefCell<super::pipeline::projection::ProjectionWriter>,
     /// What the host wrote beside the rows since its last barrier.
     unpublished: std::cell::RefCell<UnpublishedInputs>,
-    /// While a batch's reactions are applied, a host's own style application may rewrite the declarations of an
-    /// element in its shadow tree, after the engine computed that element's record from the ones it had. These name
-    /// the elements whose declarations changed that way, while `applying_reactions` counts the batches being applied.
-    declarations_changed_during_apply: std::cell::RefCell<super::HashSet<StyleNodeID>>,
-    applying_reactions: std::cell::Cell<u32>,
-    /// Whether the transaction the host takes is one a style update applies, whose reactions close over the elements
-    /// they inherit through as the engine computes them.
-    takes_transaction_to_apply: std::cell::Cell<bool>,
     /// What `LIBWEB_STYLE_SELFCHECK` asked for as the host started.
     pub(super) style_self_check: super::pipeline::SelfCheckSettings,
     /// Whether the self-check of a style update that flew is yet to run: it is the next update's to run.
@@ -941,7 +929,7 @@ impl EngineMemo {
     /// Counts what the memo holds toward the host's own owner, but for its projection writer, whose rows count toward
     /// the projection.
     pub(crate) fn report_memory(&self, report: &mut super::memory_report::MemoryReport) {
-        use crate::heap_size::{set_bytes, vec_bytes};
+        use crate::heap_size::vec_bytes;
         let unpublished = self.unpublished.borrow();
         let bytes = size_of::<Memo<*const c_void>>()
             + self.held.borrow().heap_size()
@@ -950,8 +938,7 @@ impl EngineMemo {
             + self.baselines.borrow().heap_size()
             + self.atoms.borrow().heap_size()
             + vec_bytes(&unpublished.backing_elements)
-            + vec_bytes(&unpublished.declarations)
-            + set_bytes(&self.declarations_changed_during_apply.borrow());
+            + vec_bytes(&unpublished.declarations);
         report.add(super::memory_report::MemoryOwner::HostMemo, bytes);
     }
 
@@ -1017,25 +1004,6 @@ impl EngineMemo {
     pub(crate) fn follow_queued(&self, queued: crate::render_state::QueuedStyleChange<'_>) {
         self.deferred.borrow_mut().follow(queued);
     }
-
-    /// Notes the declarations of `node` changed, where a batch's reactions are being applied.
-    fn note_declarations_changed(&self, node: StyleNodeID) {
-        if self.applying_reactions.get() > 0 {
-            self.declarations_changed_during_apply.borrow_mut().insert(node);
-        }
-    }
-
-    /// Marks the transactions the host takes until the answer is dropped as ones a style update applies.
-    pub(crate) fn take_transactions_to_apply(&self) -> impl Drop + '_ {
-        struct Taking<'a>(&'a EngineMemo);
-        impl Drop for Taking<'_> {
-            fn drop(&mut self) {
-                self.0.takes_transaction_to_apply.set(false);
-            }
-        }
-        self.takes_transaction_to_apply.set(true);
-        Taking(self)
-    }
 }
 
 impl Default for EngineMemo {
@@ -1050,9 +1018,6 @@ impl Default for EngineMemo {
             identities: Default::default(),
             projection: Default::default(),
             unpublished: Default::default(),
-            declarations_changed_during_apply: Default::default(),
-            applying_reactions: Default::default(),
-            takes_transaction_to_apply: Default::default(),
             style_self_check: super::pipeline::SelfCheckSettings::from_environment(),
             flown_update_awaits_self_check: Default::default(),
         }
@@ -1325,6 +1290,17 @@ pub extern "C" fn style_engine_for_each_element_custom_property_environment(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn style_engine_begin_composition_settling(host: &DocumentHost, read: &BegunRead, node: u32) {
+    let node = StyleNodeID::from_raw(node).expect("a composition settles for an element");
+    with_engine(read, host, |engine| engine.begin_composition_settling(node));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn style_engine_end_composition_settling(host: &DocumentHost, read: &BegunRead) {
+    with_engine(read, host, |engine| engine.end_composition_settling());
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn style_engine_has_pending_transaction(host: &DocumentHost, read: &BegunRead) -> bool {
     match host.known_engine_facts() {
         Some(facts) => facts.has_pending_style_update,
@@ -1411,14 +1387,6 @@ pub extern "C" fn style_engine_has_size_containers_needing_evaluation_after_layo
         None => with_engine(read, host, |engine| {
             engine.has_size_containers_needing_evaluation_after_layout()
         }),
-    }
-}
-
-/// Notes that the host rewrote the declarations of `node`, which a batch of reactions being applied reads.
-#[unsafe(no_mangle)]
-pub extern "C" fn style_engine_note_element_declarations_changed(host: &DocumentHost, node: u32) {
-    if let Some(node) = StyleNodeID::from_raw(node) {
-        host.engine_memo().note_declarations_changed(node);
     }
 }
 
@@ -1552,6 +1520,13 @@ pub unsafe extern "C" fn style_engine_memory_report(
     MemoryOwner::COUNT
 }
 
+/// Lets go of what the style passes of `host`'s document work in and keep for the next one, for a document that has not
+/// styled in a while.
+#[unsafe(no_mangle)]
+pub extern "C" fn style_engine_trim_scratch(host: &DocumentHost, read: &crate::render_state::BegunRead) {
+    with_engine(read, host, StyleEngine::trim_scratch);
+}
+
 /// A record of the allocations reports have counted, for [`style_engine_memory_beyond`].
 #[unsafe(no_mangle)]
 pub extern "C" fn style_engine_memory_sizer_create() -> *mut c_void {
@@ -1633,7 +1608,6 @@ pub unsafe extern "C" fn style_engine_decide_transitions(
     on_actions: unsafe extern "C" fn(*mut c_void, *const FfiTransitionAction, usize),
     context: *mut c_void,
 ) {
-    crate::css::ffi_stats::note_transition_decision();
     // SAFETY: Guaranteed by the caller.
     let existing = unsafe { ak::slice_from_raw_parts(input.existing_transitions, input.existing_transition_count) };
     // SAFETY: As above.

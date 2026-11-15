@@ -5,9 +5,10 @@
  */
 
 #include <LibWebView/Application.h>
-#include <LibWebView/BookmarkStore.h>
+#include <UI/Qt/Application.h>
 #include <UI/Qt/BookmarkDialog.h>
 #include <UI/Qt/BookmarkPopover.h>
+#include <UI/Qt/BookmarkStore.h>
 #include <UI/Qt/ChromeStyle.h>
 #include <UI/Qt/StringUtils.h>
 
@@ -29,7 +30,7 @@ struct BookmarkPlace {
     size_t sibling_count { 0 };
 };
 
-static Optional<BookmarkPlace> find_bookmark_place(ReadonlySpan<WebView::BookmarkItem> items, StringView id, Optional<String> folder_id = {})
+static Optional<BookmarkPlace> find_bookmark_place(ReadonlySpan<BookmarkItem> items, StringView id, Optional<String> folder_id = {})
 {
     for (auto const& item : items) {
         if (item.id == id)
@@ -42,7 +43,7 @@ static Optional<BookmarkPlace> find_bookmark_place(ReadonlySpan<WebView::Bookmar
     return {};
 }
 
-static size_t item_count_in_folder(ReadonlySpan<WebView::BookmarkItem> items, Optional<String> const& folder_id)
+static size_t item_count_in_folder(ReadonlySpan<BookmarkItem> items, Optional<String> const& folder_id)
 {
     if (!folder_id.has_value())
         return items.size();
@@ -108,7 +109,7 @@ BookmarkPopover::BookmarkPopover(QWidget* parent)
     remove_button->setAttribute(Qt::WA_LayoutUsesWidgetRect);
     QObject::connect(remove_button, &QPushButton::clicked, this, [this] {
         m_is_removed = true;
-        Function<void()> remove = [this] { WebView::Application::bookmark_store().remove_item(m_bookmark_id); };
+        Function<void()> remove = [this] { Application::bookmark_store().remove_item(m_bookmark_id); };
         if (on_remove)
             on_remove(remove);
         else
@@ -132,13 +133,13 @@ void BookmarkPopover::set_bookmark(String id, JustAdded just_added)
     m_is_removed = false;
     m_title_label->setText(just_added == JustAdded::Yes ? "Bookmark added" : "Edit bookmark");
 
-    auto& store = WebView::Application::bookmark_store();
+    auto& store = Application::bookmark_store();
     auto item = store.find_item_by_id(m_bookmark_id);
     if (!item.has_value() || !item->is_bookmark())
         return;
 
     auto const& bookmark = item->bookmark();
-    m_name_field->setText(qstring_from_ak_string(bookmark.title.value_or(bookmark.url.serialize())));
+    m_name_field->setText(qstring_from_ak_string(bookmark.title.value_or({})));
 
     auto place = find_bookmark_place(store.root_items(), m_bookmark_id);
     auto folder_id = place.has_value() ? place->folder_id : Optional<String> {};
@@ -163,16 +164,16 @@ void BookmarkPopover::set_bookmark(String id, JustAdded just_added)
 
 void BookmarkPopover::save()
 {
-    auto& store = WebView::Application::bookmark_store();
+    auto& store = Application::bookmark_store();
     auto item = store.find_item_by_id(m_bookmark_id);
     if (!item.has_value() || !item->is_bookmark())
         return;
 
     auto url = item->bookmark().url;
-    // NB: A bookmark without a title is shown by its URL, which is only kept as its title once it is edited.
-    auto title = ak_string_from_qstring(m_name_field->text().trimmed());
-    auto shown_title = item->bookmark().title.value_or(url.serialize());
-    if (!title.is_empty() && title != shown_title)
+    Optional<String> title;
+    if (auto name = ak_string_from_qstring(m_name_field->text()); !name.is_empty())
+        title = AK::move(name);
+    if (title != item->bookmark().title)
         store.edit_bookmark(m_bookmark_id, url, AK::move(title));
 
     auto place = find_bookmark_place(store.root_items(), m_bookmark_id);

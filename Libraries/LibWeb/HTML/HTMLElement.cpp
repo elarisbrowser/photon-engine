@@ -6,9 +6,10 @@
  */
 
 #include <AK/Utf16StringBuilder.h>
-#include <LibGC/ConservativeVector.h>
+#include <LibGC/RootVector.h>
 #include <LibJS/Runtime/NativeFunction.h>
 #include <LibWeb/ARIA/Roles.h>
+#include <LibWeb/CSS/CSSStyleProperties.h>
 #include <LibWeb/CSS/ComputedValues.h>
 #include <LibWeb/CSS/Invalidation/ElementStateInvalidator.h>
 #include <LibWeb/CSS/Invalidation/FormControlInvalidator.h>
@@ -43,7 +44,10 @@
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLLabelElement.h>
 #include <LibWeb/HTML/HTMLObjectElement.h>
+#include <LibWeb/HTML/HTMLOptGroupElement.h>
+#include <LibWeb/HTML/HTMLOptionElement.h>
 #include <LibWeb/HTML/HTMLParagraphElement.h>
+#include <LibWeb/HTML/HTMLSelectElement.h>
 #include <LibWeb/HTML/Numbers.h>
 #include <LibWeb/HTML/PopoverTargetAttributes.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
@@ -593,8 +597,47 @@ static void apply_white_space_processing_rules(Vector<RenderedTextItem>& items, 
 }
 
 // https://html.spec.whatwg.org/multipage/dom.html#rendered-text-collection-steps
+static void collect_select_rendered_text(DOM::Node const& node, Vector<RenderedTextItem>& items, bool inside_optgroup = false)
+{
+    // A select's light-DOM children have no layout nodes: Its shadow tree renders the control's labels instead.
+    // Collect the option text separately, retaining the required line breaks for empty options and groups.
+    node.for_each_child([&](auto const& child) {
+        if (auto const* option = as_if<HTMLOptionElement>(child)) {
+            items.append(RequiredLineBreakCount { 1 });
+            // AD-HOC: The spec calls for normal block boxes in options. Use their normalized text here, since the
+            //         control renders labels rather than those boxes, and the label attribute isn't part of innerText.
+            items.append(option->text());
+            items.append(RequiredLineBreakCount { 1 });
+        } else if (is<HTMLOptGroupElement>(child)) {
+            if (!inside_optgroup) {
+                items.append(RequiredLineBreakCount { 1 });
+                collect_select_rendered_text(child, items, true);
+                items.append(RequiredLineBreakCount { 1 });
+            }
+        } else {
+            collect_select_rendered_text(child, items, inside_optgroup);
+        }
+        return IterationDecision::Continue;
+    });
+}
+
+// https://html.spec.whatwg.org/multipage/dom.html#rendered-text-collection-steps
 static Vector<RenderedTextItem> rendered_text_collection_steps(Layout::BegunRead const& read, DOM::Node const& node)
 {
+    auto* layout_node = node.layout_node(read);
+    if (auto const* select = as_if<HTMLSelectElement>(node); select && layout_node) {
+        Vector<RenderedTextItem> items;
+        auto const& style_node = as<Layout::NodeWithStyle>(*layout_node);
+        if (style_node.visibility() == CSS::Visibility::Visible && style_node.content_visibility() != CSS::ContentVisibility::Hidden) {
+            if (layout_node->is_atomic_inline())
+                items.append(AtomicInlineStart {});
+            collect_select_rendered_text(*select, items);
+            if (layout_node->is_atomic_inline())
+                items.append(AtomicInlineEnd {});
+        }
+        return items;
+    }
+
     // 1. Let items be the result of running the rendered text collection steps with each child node of node in tree
     //    order, and then concatenating the results to a single list.
     Vector<RenderedTextItem> items;
@@ -609,10 +652,12 @@ static Vector<RenderedTextItem> rendered_text_collection_steps(Layout::BegunRead
     // 3. If node is not being rendered, then return items.
     //    For the purpose of this step, the following elements must act as described
     //    if the computed value of the 'display' property is not 'none':
-    //    FIXME: - select elements have an associated non-replaced inline CSS box whose child boxes include only those of optgroup and option element child nodes;
-    //    FIXME: - optgroup elements have an associated non-replaced block-level CSS box whose child boxes include only those of option element child nodes; and
-    //    FIXME: - option elements have an associated non-replaced block-level CSS box whose child boxes are as normal for non-replaced block-level CSS boxes.
-    auto* layout_node = node.layout_node(read);
+    //    - select elements have an associated non-replaced inline CSS box whose child boxes include only those of
+    //      optgroup and option element descendant nodes;
+    //    - optgroup elements have an associated non-replaced block-level CSS box whose child boxes include only those
+    //      of option element descendant nodes; and
+    //    - option elements have an associated non-replaced block-level CSS box whose child boxes are as normal for
+    //      non-replaced block-level CSS boxes.
     if (!layout_node)
         return items;
     if (!layout_node->has_style_or_parent_with_style())
@@ -628,6 +673,14 @@ static Vector<RenderedTextItem> rendered_text_collection_steps(Layout::BegunRead
     // AD-HOC: If node's computed value of 'content-visibility' is 'hidden', then return items.
     if (style_node.content_visibility() == CSS::ContentVisibility::Hidden)
         return items;
+
+    if (auto const* option = as_if<HTMLOptionElement>(node)) {
+        items.clear();
+        items.append(RequiredLineBreakCount { 1 });
+        items.append(option->text());
+        items.append(RequiredLineBreakCount { 1 });
+        return items;
+    }
 
     // 4. If node is a Text node, then for each CSS text box produced by node, in content order, compute the text of the
     //    box after application of the CSS 'white-space' processing rules and 'text-transform' rules, set items to the
@@ -693,19 +746,29 @@ Utf16String HTMLElement::get_the_text_steps()
     if (!has_layout_box())
         return descendant_text_content();
 
+    if (layout_node(read)->content_visibility() == CSS::ContentVisibility::Hidden)
+        return {};
+
+    if (auto const* option = as_if<HTMLOptionElement>(*this))
+        return option->text();
+
     // 2. Let results be a new empty list.
     Vector<RenderedTextItem> results;
 
-    // 3. For each child node node of element:
-    for_each_child([&](Node const& node) {
-        // 1. Let current be the list resulting in running the rendered text collection steps with node.
-        //    Each item in results will either be a string or a positive integer (a required line break count).
-        auto current = rendered_text_collection_steps(read, node);
+    if (is<HTMLSelectElement>(*this)) {
+        collect_select_rendered_text(*this, results);
+    } else {
+        // 3. For each child node node of element:
+        for_each_child([&](Node const& node) {
+            // 1. Let current be the list resulting in running the rendered text collection steps with node.
+            //    Each item in results will either be a string or a positive integer (a required line break count).
+            auto current = rendered_text_collection_steps(read, node);
 
-        // 2. For each item item in current, append item to results.
-        results.extend(move(current));
-        return IterationDecision::Continue;
-    });
+            // 2. For each item item in current, append item to results.
+            results.extend(move(current));
+            return IterationDecision::Continue;
+        });
+    }
 
     // NB: Apply the CSS 'white-space' processing rules to the text that remains unprocessed. The start and the end of
     //     the element only start and end lines if the element is not inline-level.
@@ -921,10 +984,7 @@ static CSSPixelPoint sticky_offset_of(Layout::Node const& layout_node)
 {
     if (!Painting::has_sticky_positioned_inclusive_ancestor(layout_node))
         return {};
-    auto& document = const_cast<DOM::Document&>(layout_node.document());
-    document.update_paint_and_hit_testing_properties_if_needed();
-    auto visual_context_tree = document.visual_context_tree();
-    return Painting::accumulated_sticky_offset(layout_node, Painting::rect_to_viewport_transform(document, visual_context_tree));
+    return Painting::accumulated_sticky_offset(layout_node);
 }
 
 // https://www.w3.org/TR/cssom-view-1/#dom-htmlelement-offsettop
@@ -1065,8 +1125,10 @@ void HTMLElement::attribute_changed(Utf16FlyString const& name, Optional<Utf16St
     struct PreviousReadWriteState {
         GC::Ptr<DOM::Element> element;
         bool value;
+
+        void visit_edges(GC::Cell::Visitor& visitor) { visitor.visit(element); }
     };
-    GC::ConservativeVector<PreviousReadWriteState> previous_read_write_states;
+    GC::RootVector<PreviousReadWriteState> previous_read_write_states;
     if (name == HTML::AttributeNames::contenteditable && old_value != value) {
         for_each_in_inclusive_subtree_of_type<DOM::Element>([&](DOM::Element& element) {
             previous_read_write_states.append({ element, SelectorMatching::element_matches_state(element, CSS::PseudoClass::ReadWrite) });
@@ -1165,8 +1227,10 @@ void HTMLElement::set_subtree_inertness(bool is_inert)
     struct PreviousReadWriteState {
         GC::Ptr<DOM::Element> element;
         bool value;
+
+        void visit_edges(GC::Cell::Visitor& visitor) { visitor.visit(element); }
     };
-    GC::ConservativeVector<PreviousReadWriteState> previous_read_write_states;
+    GC::RootVector<PreviousReadWriteState> previous_read_write_states;
     for_each_shadow_including_inclusive_descendant([&](DOM::Node& node) {
         if (auto* element = as_if<DOM::Element>(node))
             previous_read_write_states.append({ *element, SelectorMatching::element_matches_state(*element, CSS::PseudoClass::ReadWrite) });
@@ -1289,11 +1353,11 @@ GC::Ptr<DOM::NodeList> HTMLElement::labels()
 
     auto& labels = ensure_html_element_rare_data().labels;
     if (!labels) {
-        auto filter = [&](DOM::Node const& node) {
+        auto filter = GC::create_function(heap(), GC::captures(*this), [](HTMLElement const& element, DOM::Node const& node) {
             auto const* label_element = as_if<HTMLLabelElement>(node);
-            return label_element && label_element->control().ptr() == this;
-        };
-        labels = DOM::LiveNodeList::create(root(), DOM::LiveNodeList::Scope::Descendants, move(filter), DOM::LiveNodeList::Kind::Labels);
+            return label_element && label_element->control().ptr() == &element;
+        });
+        labels = DOM::LiveNodeList::create(root(), DOM::LiveNodeList::Scope::Descendants, filter, DOM::LiveNodeList::Kind::Labels);
     }
 
     return labels;
@@ -1915,11 +1979,11 @@ WebIDL::ExceptionOr<void> HTMLElement::show_popover(ThrowExceptions throw_except
         // NB: We simply don't add an event listener for the cancel action.
         // - closeAction being to hide a popover given element, true, true, false, and null.
         auto close_callback_function = JS::NativeFunction::create(
-            HTML::relevant_realm(*this), [this](JS::VM&) {
-                MUST(hide_popover(FocusPreviousElement::Yes, FireEvents::Yes, ThrowExceptions::No, IgnoreDomState::No, nullptr));
+            HTML::relevant_realm(*this), GC::create_function<JS::ThrowCompletionOr<JS::Value>(JS::VM&)>(GC::Heap::the(), GC::captures(*this), [](auto& self, JS::VM&) {
+                MUST(self.hide_popover(FocusPreviousElement::Yes, FireEvents::Yes, ThrowExceptions::No, IgnoreDomState::No, nullptr));
 
                 return JS::js_undefined();
-            },
+            }),
             0, Utf16FlyString {}, &HTML::relevant_realm(*this));
         auto close_callback = GC::Heap::the().allocate<WebIDL::CallbackType>(*close_callback_function, HTML::relevant_realm(*this));
         // - getEnabledState being to return true.
@@ -1941,7 +2005,8 @@ WebIDL::ExceptionOr<void> HTMLElement::show_popover(ThrowExceptions throw_except
     set_popover_visibility_state(PopoverVisibilityState::Showing);
     // 23. Set element's popover trigger to source.
     rare_data.popover_trigger = source;
-    // FIXME: 24. Set element's implicit anchor element to source.
+    // 24. Set element's implicit anchor element to source.
+    set_implicit_anchor_element(source);
     // 25. Run the popover focusing steps given element.
     run_popover_focusing_steps(*this);
     // 26. If shouldRestoreFocus is true and element's popover attribute is not in the No Popover state, then set element's previously focused element to originallyFocusedElement.
@@ -2038,10 +2103,14 @@ WebIDL::ExceptionOr<void> HTMLElement::hide_popover(FocusPreviousElement focus_p
         }
         // 9.4. Request an element to be removed from the top layer given element.
         document.request_an_element_to_be_remove_from_the_top_layer(*this);
+
+        // 9.5. Set element's implicit anchor element to null.
+        set_implicit_anchor_element(nullptr);
     }
     // 10. Otherwise, remove an element from the top layer immediately given element.
     else {
         document.remove_an_element_from_the_top_layer_immediately(*this);
+        set_implicit_anchor_element(nullptr);
     }
 
     // AD-HOC: The following block of code is all ad-hoc.
@@ -2429,7 +2498,7 @@ void HTMLElement::queue_a_popover_toggle_event_task(Utf16FlyString old_state, Ut
     }
 
     // 2. Queue an element task given the DOM manipulation task source and element to run the following steps:
-    auto task_id = queue_an_element_task(HTML::Task::Source::DOMManipulation, [this, old_state, new_state = move(new_state), source]() mutable {
+    auto task_id = queue_an_element_task(HTML::Task::Source::DOMManipulation, GC::create_function(GC::Heap::the(), GC::captures(*this, old_state, move(new_state), source), [](auto& self, auto& old_state, auto& new_state, auto& source) {
         // 1. Fire an event named toggle at element, using ToggleEvent, with the oldState attribute initialized to
         //    oldState, the newState attribute initialized to newState, and the source attribute initialized to source.
         ToggleEventInit event_init {};
@@ -2437,11 +2506,11 @@ void HTMLElement::queue_a_popover_toggle_event_task(Utf16FlyString old_state, Ut
         event_init.new_state = move(new_state);
         event_init.source = GC::make_root<DOM::Element>(source.ptr());
 
-        dispatch_event(ToggleEvent::create(HTML::EventNames::toggle, move(event_init), HighResolutionTime::current_high_resolution_time(relevant_global_object(*this))));
+        self.dispatch_event(ToggleEvent::create(HTML::EventNames::toggle, move(event_init), HighResolutionTime::current_high_resolution_time(relevant_global_object(self))));
 
         // 2. Set element's popover toggle task tracker to null.
-        ensure_html_element_rare_data().popover_toggle_task_tracker = {};
-    });
+        self.ensure_html_element_rare_data().popover_toggle_task_tracker = {};
+    }));
 
     // 3. Set element's popover toggle task tracker to a struct with task set to the just-queued task and old state set to oldState.
     popover_toggle_task_tracker = ToggleTaskTracker {
@@ -3081,6 +3150,48 @@ WebIDL::UnsignedLong HTMLElement::computed_heading_offset() const
 
     // 4. Return offset.
     return offset;
+}
+
+// A user-agent shadow tree's inner elements share their default declarations, parsed once, but each
+// holds its own copy: a declaration block is an element's own input, and one shared between elements
+// would change every one of them at once while telling none. The element's copy is replaced only
+// when the defaults it should hold differ from the ones it holds.
+void HTMLElement::set_own_inline_style(DOM::Element& element, CSS::CSSStyleProperties const& defaults)
+{
+    // Every value change asks again, and nearly always the element holds the defaults already. The element's copy
+    // shares the declarations it was given until either side changes, so sharing answers that without serializing.
+    if (auto current = element.inline_style(); current && current->owner_node().has_value() && current->declaration_block().shares_declarations_with(defaults.declaration_block()))
+        return;
+    auto style = CSS::CSSStyleProperties::create_element_inline_style({ element });
+    style->set_declarations_from(defaults);
+    element.set_inline_style(style);
+}
+
+static GC::Ref<CSS::CSSStyleProperties> slider_track_style_without_native_appearance()
+{
+    static auto& style = *new GC::Root<CSS::CSSStyleProperties>;
+    if (!style) {
+        style = CSS::CSSStyleProperties::create({}, {});
+        style->set_declarations_from_text(R"~~~(
+                height: 100%;
+                margin-top: 0;
+                border-radius: 0;
+                background-color: gray;
+            )~~~"sv);
+    }
+    return *style;
+}
+
+void HTMLElement::update_slider_track_style(DOM::Element& slider_track) const
+{
+    auto style = computed_style();
+    if (!style)
+        return;
+
+    if (style->appearance() != CSS::Appearance::None && !style->native_appearance_disabled())
+        slider_track.set_inline_style(nullptr);
+    else
+        set_own_inline_style(slider_track, slider_track_style_without_native_appearance());
 }
 
 }

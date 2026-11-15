@@ -18,14 +18,13 @@
 #include <AK/Utf16FlyString.h>
 #include <AK/Utf16String.h>
 #include <AK/Utf16StringBuilder.h>
-#include <AK/kmalloc.h>
 #include <LibCompositing/FontServiceClient.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Process.h>
 #include <LibCore/StatsLog.h>
 #include <LibDevTools/IndexedDBSerialization.h>
 #include <LibGC/Heap.h>
-#include <LibGC/PerformanceDiagnostics.h>
+#include <LibGC/Internals.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/Color.h>
 #include <LibGfx/Font/Font.h>
@@ -34,11 +33,12 @@
 #include <LibIPC/Transport.h>
 #include <LibJS/Runtime/ConsoleObject.h>
 #include <LibJS/Runtime/Date.h>
+#include <LibJS/Runtime/HostObject.h>
+#include <LibJS/Runtime/Object.h>
 #include <LibUnicode/TimeZone.h>
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/CSS/CustomPropertyData.h>
 #include <LibWeb/CSS/Parser/ErrorReporter.h>
-#include <LibWeb/CSS/PerformanceDiagnostics.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleScope.h>
 #include <LibWeb/CSS/StyleSheetState.h>
@@ -65,7 +65,6 @@
 #include <LibWeb/HTML/BroadcastChannel.h>
 #include <LibWeb/HTML/BrowsingContext.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
-#include <LibWeb/HTML/EventLoop/TaskQueue.h>
 #include <LibWeb/HTML/Focus.h>
 #include <LibWeb/HTML/FormAssociatedElement.h>
 #include <LibWeb/HTML/HTMLIFrameElement.h>
@@ -98,6 +97,7 @@
 #include <LibWeb/PictureInPicture/PictureInPictureController.h>
 #include <LibWeb/Platform/EventLoopPlugin.h>
 #include <LibWeb/Platform/FontPlugin.h>
+#include <LibWeb/Platform/RemoteImageCodecPlugin.h>
 #include <LibWeb/Selection/Selection.h>
 #include <LibWeb/UIEvents/InputTypes.h>
 #include <LibWebCommon/HTML/SelectedFile.h>
@@ -116,6 +116,7 @@
 #include <WebContent/WebContentClientEndpoint.h>
 #include <WebContent/WebContentCompositorHost.h>
 #include <WebContent/WebDriverBiDi.h>
+#include <WebContent/Worker/WorkerThread.h>
 
 namespace WebContent {
 
@@ -385,144 +386,11 @@ void ConnectionFromClient::close_server()
     shutdown();
 }
 
-void ConnectionFromClient::set_task_queue_diagnostics_enabled(bool enabled)
+void ConnectionFromClient::start_worker_thread(IPC::TransportHandle worker_transport, Web::HTML::AgentType agent_type)
 {
-    if (enabled)
-        m_task_queue_diagnostics_document_baseline = collect_performance_document_counters();
-    else
-        m_task_queue_diagnostics_document_baseline.clear();
-    Web::HTML::TaskQueue::set_performance_diagnostics_enabled(enabled);
-    Web::CSS::set_performance_diagnostics_enabled(enabled);
-    GC::set_performance_diagnostics_enabled(Web::Bindings::main_thread_vm().heap(), enabled);
-}
-
-Messages::WebContentServer::GetTaskQueueDiagnosticsResponse ConnectionFromClient::get_task_queue_diagnostics()
-{
-    auto task_diagnostics = JsonValue::from_string(Web::HTML::TaskQueue::performance_diagnostics_json());
-    if (task_diagnostics.is_error())
-        return Web::HTML::TaskQueue::performance_diagnostics_json();
-    auto result = task_diagnostics.release_value().as_object();
-    result.set("style_and_layout"sv, style_and_layout_diagnostics());
-    result.set("gc"sv, GC::performance_diagnostics(Web::Bindings::main_thread_vm().heap()));
-    return result.serialized();
-}
-
-HashMap<void const*, ConnectionFromClient::PerformanceDocumentCounters> ConnectionFromClient::collect_performance_document_counters() const
-{
-    HashMap<void const*, PerformanceDocumentCounters> counters_by_document;
-    m_page_host->for_each_page([&](PageClient& page_client) {
-        for (auto& navigable : page_client.page().hosted_navigables()) {
-            auto document = navigable->active_document();
-            if (!document)
-                continue;
-            auto const& style = document->style_invalidation_counters();
-            auto const layout = document->layout_counts();
-            counters_by_document.set(document.ptr(), {
-                                                         .style_update_microseconds = style.style_update_microseconds,
-                                                         .style_reaction_elements = style.style_engine_reaction_elements,
-                                                         .style_reaction_batches = style.style_engine_reaction_batch_runs,
-                                                         .style_update_submission_microseconds = style.style_update_submission_microseconds,
-                                                         .style_update_bridge_microseconds = style.style_update_bridge_microseconds,
-                                                         .style_update_apply_microseconds = style.style_update_apply_microseconds,
-                                                         .style_update_remainder_microseconds = style.style_update_remainder_microseconds,
-                                                         .style_engine_transaction_setup_microseconds = style.style_engine_transaction_setup_microseconds,
-                                                         .style_engine_transaction_setups = style.style_engine_transaction_setups,
-                                                         .full_layout_count = layout.full_layouts,
-                                                         .partial_layout_count = layout.partial_layouts,
-                                                         .full_layout_microseconds = layout.full_layout_microseconds,
-                                                         .partial_layout_microseconds = layout.partial_layout_microseconds,
-                                                     });
-        }
-    });
-    return counters_by_document;
-}
-
-JsonObject ConnectionFromClient::style_and_layout_diagnostics() const
-{
-    auto current = collect_performance_document_counters();
-    bool document_set_unchanged = current.size() == m_task_queue_diagnostics_document_baseline.size();
-    bool counters_monotonic = true;
-    PerformanceDocumentCounters totals;
-
-    for (auto const& [document, counters] : current) {
-        auto baseline = m_task_queue_diagnostics_document_baseline.get(document);
-        if (!baseline.has_value()) {
-            document_set_unchanged = false;
-            continue;
-        }
-        auto const& start = *baseline;
-        auto add_delta = [&](u64 PerformanceDocumentCounters::* field) {
-            if (counters.*field < start.*field) {
-                counters_monotonic = false;
-                return;
-            }
-            totals.*field += counters.*field - start.*field;
-        };
-        for (auto field : {
-                 &PerformanceDocumentCounters::style_update_microseconds,
-                 &PerformanceDocumentCounters::style_reaction_elements,
-                 &PerformanceDocumentCounters::style_reaction_batches,
-                 &PerformanceDocumentCounters::style_update_submission_microseconds,
-                 &PerformanceDocumentCounters::style_update_bridge_microseconds,
-                 &PerformanceDocumentCounters::style_update_apply_microseconds,
-                 &PerformanceDocumentCounters::style_update_remainder_microseconds,
-                 &PerformanceDocumentCounters::style_engine_transaction_setup_microseconds,
-                 &PerformanceDocumentCounters::style_engine_transaction_setups,
-                 &PerformanceDocumentCounters::full_layout_count,
-                 &PerformanceDocumentCounters::partial_layout_count,
-                 &PerformanceDocumentCounters::full_layout_microseconds,
-                 &PerformanceDocumentCounters::partial_layout_microseconds,
-             })
-            add_delta(field);
-    }
-
-    JsonObject result;
-    result.set("scope"sv, "webcontent_process_active_documents"sv);
-    result.set("document_count"sv, current.size());
-    result.set("document_set_unchanged"sv, document_set_unchanged);
-    result.set("available"sv, document_set_unchanged && counters_monotonic);
-    result.set("style_update_duration_semantics"sv, "sum of elapsed wall time for update_style() calls over active documents; includes the pre-style embedding-container layout check; nested document calls can overlap; not CPU time or a disjoint phase budget"sv);
-    result.set("style_reaction_elements_semantics"sv, "published style-reaction entries counted by the existing style engine; not every element visited or every computed style recomputed"sv);
-    result.set("style_reaction_batches_semantics"sv, "style application passes that contain published style reactions; not transaction count or full-document traversal count"sv);
-    result.set("layout_duration_semantics"sv, "elapsed wall time inside classified full or partial render-state layout rounds, summed over active document arenas; includes round work and committed-layout preparation, excludes waiting before the render-state job and paint recording; not CPU time"sv);
-    if (document_set_unchanged && counters_monotonic) {
-        auto set_duration = [&](StringView name, u64 microseconds) {
-            result.set(name, static_cast<double>(microseconds) / 1000.0);
-        };
-        auto set_count = [&](StringView name, u64 count) { result.set(name, count); };
-        set_duration("style_update_duration_ms"sv, totals.style_update_microseconds);
-        set_count("style_reaction_elements"sv, totals.style_reaction_elements);
-        set_count("style_reaction_batches"sv, totals.style_reaction_batches);
-        set_duration("style_update_submission_duration_ms"sv, totals.style_update_submission_microseconds);
-        set_duration("style_update_bridge_duration_ms"sv, totals.style_update_bridge_microseconds);
-        set_duration("style_update_apply_duration_ms"sv, totals.style_update_apply_microseconds);
-        set_duration("style_update_remainder_duration_ms"sv, totals.style_update_remainder_microseconds);
-        set_duration("style_engine_transaction_setup_duration_ms"sv, totals.style_engine_transaction_setup_microseconds);
-        set_count("style_engine_transaction_setup_count"sv, totals.style_engine_transaction_setups);
-        set_count("full_layout_count"sv, totals.full_layout_count);
-        set_count("partial_layout_count"sv, totals.partial_layout_count);
-        set_duration("layout_full_duration_ms"sv, totals.full_layout_microseconds);
-        set_duration("layout_partial_duration_ms"sv, totals.partial_layout_microseconds);
-    } else {
-        result.set("unavailable_reason"sv, document_set_unchanged ? "document_counters_were_reset"sv : "document_set_changed_during_session"sv);
-        for (StringView name : {
-                 "style_update_duration_ms"sv,
-                 "style_reaction_elements"sv,
-                 "style_reaction_batches"sv,
-                 "style_update_submission_duration_ms"sv,
-                 "style_update_bridge_duration_ms"sv,
-                 "style_update_apply_duration_ms"sv,
-                 "style_update_remainder_duration_ms"sv,
-                 "style_engine_transaction_setup_duration_ms"sv,
-                 "style_engine_transaction_setup_count"sv,
-                 "full_layout_count"sv,
-                 "partial_layout_count"sv,
-                 "layout_full_duration_ms"sv,
-                 "layout_partial_duration_ms"sv,
-             })
-            result.set(name, JsonValue {});
-    }
-    return result;
+    // NB: The UI process notices a transport that nobody takes up, and tells the owners that their worker is gone.
+    if (auto result = WebWorker::start_worker_thread(move(worker_transport), agent_type); result.is_error())
+        dbgln("Unable to start a thread for a worker: {}", result.error());
 }
 
 Messages::WebContentServer::GetWindowHandleResponse ConnectionFromClient::get_window_handle(Web::PageId page_id)
@@ -540,6 +408,16 @@ void ConnectionFromClient::set_window_handle(Web::PageId page_id, String handle)
     }
 }
 
+// A WebDriver command sees what the commands before it did, such as the viewport they set. The sizes that the windows
+// took while a rendering update was in flight become their sizes before the command runs.
+static void take_viewport_sizes_held_for_webdriver_command(PageHost& page_host)
+{
+    page_host.for_each_page([](PageClient& page_client) {
+        if (page_client.page().has_local_traversable())
+            page_client.page().local_traversable()->take_viewport_size_held_for_rendering_update_in_flight();
+    });
+}
+
 void ConnectionFromClient::run_webdriver_command(Web::PageId page_id, u64 command_id, Optional<Web::HTML::CrossProcessId> navigable_id, String name, JsonValue payload, Vector<String> arguments)
 {
     auto page = this->page(page_id);
@@ -549,6 +427,7 @@ void ConnectionFromClient::run_webdriver_command(Web::PageId page_id, u64 comman
         return;
     }
 
+    take_viewport_sizes_held_for_webdriver_command(*m_page_host);
     page->run_webdriver_command(command_id, navigable_id, name, move(payload), move(arguments));
 }
 
@@ -561,6 +440,7 @@ void ConnectionFromClient::run_webdriver_bidi_command(Web::PageId page_id, u64 c
         return;
     }
 
+    take_viewport_sizes_held_for_webdriver_command(*m_page_host);
     WebContent::run_webdriver_bidi_command(*page, command_id, navigable_id, method, move(params));
 }
 
@@ -596,10 +476,13 @@ void ConnectionFromClient::connect_to_web_ui(Web::PageId page_id, IPC::Transport
     }
 }
 
-void ConnectionFromClient::connect_to_image_decoder(IPC::TransportHandle handle)
+void ConnectionFromClient::disconnect_from_image_decoder()
 {
-    if (on_image_decoder_connection)
-        on_image_decoder_connection(handle);
+    auto disconnect = [] {
+        static_cast<Web::Platform::RemoteImageCodecPlugin&>(Web::Platform::ImageCodecPlugin::the()).disconnect_client();
+    };
+    disconnect();
+    WebWorker::post_to_worker_threads(disconnect);
 }
 
 void ConnectionFromClient::connect_to_compositor_process(IPC::TransportHandle handle, IPC::TransportHandle render_clock_handle)
@@ -623,7 +506,7 @@ void ConnectionFromClient::connect_to_compositor_process(IPC::TransportHandle ha
     };
 
     m_compositor_connection->attach_render_clock(move(render_clock_handle));
-    m_compositor_connection->hand_frame_sink_to_paint_thread();
+    m_compositor_connection->hand_poster_to_paint_thread();
 }
 
 void ConnectionFromClient::compositor_process_reconnected()
@@ -658,6 +541,14 @@ ErrorOr<NonnullOwnPtr<IPC::Transport>> ConnectionFromClient::request_webrtc_clie
     auto response = send_sync_but_allow_failure<Messages::WebContentClient::RequestWebrtcClientConnection>();
     if (!response || !response->handle().has_value())
         return Error::from_string_literal("The Browser did not launch a WebRTCClient");
+    return response->take_handle()->create_transport();
+}
+
+ErrorOr<NonnullOwnPtr<IPC::Transport>> ConnectionFromClient::request_image_decoder_transport()
+{
+    auto response = send_sync_but_allow_failure<Messages::WebContentClient::RequestImageDecoderConnection>();
+    if (!response || !response->handle().has_value())
+        return Error::from_string_literal("The Browser did not connect an image decoder");
     return response->take_handle()->create_transport();
 }
 
@@ -736,8 +627,10 @@ void ConnectionFromClient::run_beforeunload_check(Web::PageId page_id, Web::HTML
         return;
     }
 
-    page->page().history_executor().run_ui_beforeunload_check(move(navigable_ids), move(target_entry), user_involvement_for_navigate_event, unload_prompt_shown, GC::create_function(Web::HTML::main_thread_event_loop().heap(), [this, page_id, check_id](Web::HTML::CheckIfUnloadingIsCanceledResult result, Web::HTML::UnloadPromptShown unload_prompt_shown) {
-        async_beforeunload_check_result(page_id, check_id, result, unload_prompt_shown);
+    page->page().history_executor().run_ui_beforeunload_check(move(navigable_ids), move(target_entry), user_involvement_for_navigate_event, unload_prompt_shown, GC::create_function(Web::HTML::main_thread_event_loop().heap(), GC::captures(make_weak_ptr<ConnectionFromClient>(), page_id, check_id), [](auto& connection, auto& page_id, auto& check_id, Web::HTML::CheckIfUnloadingIsCanceledResult result, Web::HTML::UnloadPromptShown unload_prompt_shown) {
+        if (!connection)
+            return;
+        connection->async_beforeunload_check_result(page_id, check_id, result, unload_prompt_shown);
     }));
 }
 
@@ -799,8 +692,10 @@ void ConnectionFromClient::populate_history_entry_document(Web::PageId page_id, 
         return;
     }
     page->page().history_executor().populate_ui_history_entry_document(operation_id, move(target_entry), navigation_type, ongoing_navigation_is_traversal, move(population),
-        GC::create_function(Web::HTML::main_thread_event_loop().heap(), [this, page_id, operation_id, navigable_id](Web::HTML::ChangingNavigableHistoryStepJobDisposition disposition, bool update_only) {
-            async_changing_navigable_history_job_ready(page_id, operation_id, navigable_id, disposition, update_only);
+        GC::create_function(Web::HTML::main_thread_event_loop().heap(), GC::captures(make_weak_ptr<ConnectionFromClient>(), page_id, operation_id, navigable_id), [](auto& connection, auto& page_id, auto& operation_id, auto& navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition disposition, bool update_only) {
+            if (!connection)
+                return;
+            connection->async_changing_navigable_history_job_ready(page_id, operation_id, navigable_id, disposition, update_only);
         }));
 }
 
@@ -812,8 +707,10 @@ void ConnectionFromClient::run_changing_navigable_history_job(Web::PageId page_i
         return;
     }
 
-    page->page().history_executor().run_ui_changing_navigable_history_job(operation_id, navigable_id, move(target_entry), user_involvement, navigation_type, move(finalized_navigation_id), ongoing_navigation_is_traversal, needs_population, GC::create_function(Web::HTML::main_thread_event_loop().heap(), [this, page_id, operation_id, navigable_id](Web::HTML::ChangingNavigableHistoryStepJobDisposition disposition, bool update_only) {
-        async_changing_navigable_history_job_ready(page_id, operation_id, navigable_id, disposition, update_only);
+    page->page().history_executor().run_ui_changing_navigable_history_job(operation_id, navigable_id, move(target_entry), user_involvement, navigation_type, move(finalized_navigation_id), ongoing_navigation_is_traversal, needs_population, GC::create_function(Web::HTML::main_thread_event_loop().heap(), GC::captures(make_weak_ptr<ConnectionFromClient>(), page_id, operation_id, navigable_id), [](auto& connection, auto& page_id, auto& operation_id, auto& navigable_id, Web::HTML::ChangingNavigableHistoryStepJobDisposition disposition, bool update_only) {
+        if (!connection)
+            return;
+        connection->async_changing_navigable_history_job_ready(page_id, operation_id, navigable_id, disposition, update_only);
     }));
 }
 
@@ -839,8 +736,10 @@ void ConnectionFromClient::apply_changing_navigable_continuation(Web::PageId pag
         return;
     }
 
-    page->page().history_executor().apply_ui_changing_navigable_continuation(operation_id, navigable_id, target_entry, { script_history_length, script_history_index }, move(entries_for_navigation_api), clear_classic_history_api_state, clear_navigable_target_name, GC::create_function(Web::HTML::main_thread_event_loop().heap(), [this, page_id, operation_id, navigable_id](Optional<Web::HTML::HostedNavigableState> activated_navigable_state, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state) {
-        async_changing_navigable_continuation_applied(page_id, operation_id, navigable_id, move(activated_navigable_state), move(previous_entry_persisted_state));
+    page->page().history_executor().apply_ui_changing_navigable_continuation(operation_id, navigable_id, target_entry, { script_history_length, script_history_index }, move(entries_for_navigation_api), clear_classic_history_api_state, clear_navigable_target_name, GC::create_function(Web::HTML::main_thread_event_loop().heap(), GC::captures(make_weak_ptr<ConnectionFromClient>(), page_id, operation_id, navigable_id), [](auto& connection, auto& page_id, auto& operation_id, auto& navigable_id, Optional<Web::HTML::HostedNavigableState> activated_navigable_state, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state) {
+        if (!connection)
+            return;
+        connection->async_changing_navigable_continuation_applied(page_id, operation_id, navigable_id, move(activated_navigable_state), move(previous_entry_persisted_state));
     }));
 }
 
@@ -852,8 +751,10 @@ void ConnectionFromClient::unload_displayed_document_and_apply_changing_navigabl
         return;
     }
 
-    page->page().history_executor().unload_displayed_document_and_apply_ui_changing_navigable_continuation(operation_id, navigable_id, target_entry, { script_history_length, script_history_index }, move(entries_for_navigation_api), clear_classic_history_api_state, clear_navigable_target_name, GC::create_function(Web::HTML::main_thread_event_loop().heap(), [this, page_id, operation_id, navigable_id](Optional<Web::HTML::HostedNavigableState> activated_navigable_state, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state) {
-        async_changing_navigable_continuation_applied(page_id, operation_id, navigable_id, move(activated_navigable_state), move(previous_entry_persisted_state));
+    page->page().history_executor().unload_displayed_document_and_apply_ui_changing_navigable_continuation(operation_id, navigable_id, target_entry, { script_history_length, script_history_index }, move(entries_for_navigation_api), clear_classic_history_api_state, clear_navigable_target_name, GC::create_function(Web::HTML::main_thread_event_loop().heap(), GC::captures(make_weak_ptr<ConnectionFromClient>(), page_id, operation_id, navigable_id), [](auto& connection, auto& page_id, auto& operation_id, auto& navigable_id, Optional<Web::HTML::HostedNavigableState> activated_navigable_state, Optional<Web::HTML::SessionHistoryEntryPersistedState> previous_entry_persisted_state) {
+        if (!connection)
+            return;
+        connection->async_changing_navigable_continuation_applied(page_id, operation_id, navigable_id, move(activated_navigable_state), move(previous_entry_persisted_state));
     }));
 }
 
@@ -867,8 +768,10 @@ void ConnectionFromClient::run_descendant_unload_task(Web::PageId page_id, Web::
     }
     VERIFY(&navigable->page() == &page->page());
 
-    navigable->run_ui_descendant_unload_task(child_navigable_destruction, stop_hosting_after_unload, GC::create_function(navigable->heap(), [this, page_id, unload_id, navigable_id] {
-        async_descendant_unload_task_complete(page_id, unload_id, navigable_id);
+    navigable->run_ui_descendant_unload_task(child_navigable_destruction, stop_hosting_after_unload, GC::create_function(navigable->heap(), GC::captures(make_weak_ptr<ConnectionFromClient>(), page_id, unload_id, navigable_id), [](auto& connection, auto& page_id, auto& unload_id, auto& navigable_id) {
+        if (!connection)
+            return;
+        connection->async_descendant_unload_task_complete(page_id, unload_id, navigable_id);
     }));
 }
 
@@ -898,7 +801,7 @@ void ConnectionFromClient::abort_navigable_document(Web::PageId page_id, Web::HT
         return;
 
     // 3. For each descendantNavigable of descendantNavigables, queue a global task on the navigation and traversal task source given descendantNavigable's active window to perform the following steps:
-    Web::HTML::queue_global_task(Web::HTML::Task::Source::NavigationAndTraversal, Web::HTML::relevant_global_object(*navigable->active_window()), GC::create_function(GC::Heap::the(), [navigable = GC::Ref { *navigable }] {
+    Web::HTML::queue_global_task(Web::HTML::Task::Source::NavigationAndTraversal, Web::HTML::relevant_global_object(*navigable->active_window()), GC::create_function(GC::Heap::the(), GC::captures(GC::Ref { *navigable }), [](auto& navigable) {
         auto document = navigable->active_document();
         if (!document)
             return;
@@ -1005,8 +908,10 @@ void ConnectionFromClient::update_nonchanging_navigable_history_state(Web::PageI
         return;
     }
 
-    navigable->update_nonchanging_navigable_history_step_state({ script_history_length, script_history_index }, GC::create_function(navigable->heap(), [this, page_id, operation_id, navigable_id] {
-        async_nonchanging_navigable_history_state_updated(page_id, operation_id, navigable_id);
+    navigable->update_nonchanging_navigable_history_step_state({ script_history_length, script_history_index }, GC::create_function(navigable->heap(), GC::captures(make_weak_ptr<ConnectionFromClient>(), page_id, operation_id, navigable_id), [](auto& connection, auto& page_id, auto& operation_id, auto& navigable_id) {
+        if (!connection)
+            return;
+        connection->async_nonchanging_navigable_history_state_updated(page_id, operation_id, navigable_id);
     }));
 }
 
@@ -1039,12 +944,6 @@ void ConnectionFromClient::set_viewport(Web::PageId page_id, Web::DevicePixelSiz
         page->set_viewport(size, device_pixel_ratio);
         page->page().set_viewport_is_fullscreen(is_fullscreen);
     }
-}
-
-void ConnectionFromClient::check_page_responsiveness(Web::PageId page_id, u64 request_id)
-{
-    if (this->page(page_id).has_value())
-        async_did_respond_to_page_responsiveness_check(page_id, request_id);
 }
 
 void ConnectionFromClient::key_event(Web::PageId page_id, Web::KeyEvent event)
@@ -1201,8 +1100,104 @@ void ConnectionFromClient::enqueue_input_event(Web::QueuedInputEvent event)
         Web::HTML::main_thread_event_loop().queue_task_to_process_input_events();
 }
 
+// Whether the destroyed document at the end of the path is reachable only because script holds objects of its realm, as
+// of a removed iframe whose built-ins the page kept. That is when the first cell of the document's realm on the path is
+// held for script: by a JS object, or by a callback that the platform keeps for script, such as an event listener,
+// maybe through other cells of the JS runtime, such as the environment of a closure. Any other cell holding it keeps the
+// document alive by itself.
+// NB: Only the shortest path is looked at, so a document that a leak keeps alive too can be put down to script. Cells
+//     of the Wasm runtime count as cells of the engine, as their heap blocks do not tell them apart.
+static bool is_held_by_script(GC::Heap::RetainingPath const& path)
+{
+    auto& document = static_cast<Web::DOM::Document&>(*path.steps.last().cell);
+    // NB: A window that another document reuses is that document's, as is its realm.
+    auto window = document.window();
+    if (window && &window->associated_document() != &document)
+        window = nullptr;
+    JS::Realm const* realm = window ? &window->principal_realm() : nullptr;
+
+    auto as_object = [](GC::Cell const& cell) -> JS::Object const* {
+        if (cell.cell_kind() != GC::CellKind::Object)
+            return nullptr;
+        return GC::static_cell_cast<JS::Object const>(&cell);
+    };
+
+    auto is_of_document_realm = [&](GC::Cell const& cell) {
+        if (&cell == &document)
+            return true;
+        if (!window)
+            return false;
+        if (&cell == window.ptr() || &cell == GC::as_cell(realm))
+            return true;
+        auto const* object = as_object(cell);
+        return object && &Web::HTML::relevant_realm(*object) == realm;
+    };
+
+    auto entry = path.steps.find_first_index_if([&](auto const& step) { return is_of_document_realm(*step.cell); });
+    VERIFY(entry.has_value());
+    for (size_t i = *entry; i > 0; --i) {
+        auto const& holder = *path.steps[i - 1].cell;
+        // NB: As for documents, the class the heap block records tells a callback apart without a cast.
+        if (as_object(holder) || GC::class_name_of(holder) == "CallbackType"sv)
+            return true;
+        // NB: The heap block of a cell that is not a C++ object records the type its foreign implementation gave it.
+        if (!GC::HeapBlockBase::from_cell(&holder)->foreign_type())
+            return false;
+        // NB: The wrapper of a platform object that is implemented in Rust holds the object as its host data.
+        if (i >= 2) {
+            auto const* wrapper = as_object(*path.steps[i - 2].cell);
+            if (wrapper && JS::host_data_of(*wrapper).ptr() == &holder)
+                return false;
+        }
+    }
+    return false;
+}
+
+namespace {
+
+// Paths to destroyed documents, grouped by the root and the classes along them.
+struct LeakedDocumentPaths {
+    void add(GC::Heap::RetainingPath const& path)
+    {
+        StringBuilder builder;
+        builder.append(GC::Heap::describe_root(path.root));
+        for (size_t i = 0; i < path.steps.size(); ++i) {
+            builder.append(i == 0 ? ": "sv : " -> "sv);
+            builder.append(path.steps[i].class_name);
+        }
+        auto signature = builder.to_string_without_validation();
+        auto& count = counts.ensure(signature, [&] -> size_t {
+            order.append(signature);
+            return 0;
+        });
+        ++count;
+        ++documents;
+    }
+
+    JsonArray print_and_serialize()
+    {
+        quick_sort(order, [&](auto const& a, auto const& b) { return counts.get(a).value() > counts.get(b).value(); });
+        JsonArray groups;
+        for (auto const& signature : order) {
+            auto count = counts.get(signature).value();
+            dbgln("  {}x {}", count, signature);
+            JsonObject group;
+            group.set("count"sv, count);
+            group.set("path"sv, signature);
+            groups.must_append(move(group));
+        }
+        return groups;
+    }
+
+    size_t documents { 0 };
+    HashMap<String, size_t> counts;
+    Vector<String> order;
+};
+
+}
+
 // Prints the shortest path from a root to each destroyed document that is still reachable, grouped by the classes along
-// it. Unless script still holds objects of the document, as of a removed iframe, whatever keeps it alive leaks it.
+// it. Whatever keeps such a document alive leaks it, unless script holds objects of its realm. Those are listed apart.
 static void report_leaked_documents()
 {
     static constexpr size_t max_documents = 1000;
@@ -1214,54 +1209,30 @@ static void report_leaked_documents()
     },
         max_documents);
 
-    HashMap<String, size_t> counts;
-    Vector<String> order;
+    LeakedDocumentPaths leaked;
+    LeakedDocumentPaths held_by_script;
     for (auto const& path : paths) {
-        StringBuilder builder;
-        builder.append(GC::Heap::describe_root(path.root));
-        for (size_t i = 0; i < path.steps.size(); ++i) {
-            auto const& step = path.steps[i];
-            if (i == 0) {
-                builder.append(": "sv);
-            } else {
-                switch (step.edge_kind) {
-                case GC::Heap::RetainingEdgeKind::Precise:
-                    builder.append(" -> "sv);
-                    break;
-                case GC::Heap::RetainingEdgeKind::ConservativeWord:
-                    builder.append(" ~word~> "sv);
-                    break;
-                case GC::Heap::RetainingEdgeKind::ConservativeHalf:
-                    builder.append(" ~half~> "sv);
-                    break;
-                }
-            }
-            builder.append(step.class_name);
-        }
-        auto signature = builder.to_string_without_validation();
-        auto& count = counts.ensure(signature, [&] -> size_t {
-            order.append(signature);
-            return 0;
-        });
-        ++count;
+        if (is_held_by_script(path))
+            held_by_script.add(path);
+        else
+            leaked.add(path);
     }
-    quick_sort(order, [&](auto const& a, auto const& b) { return counts.get(a).value() > counts.get(b).value(); });
 
-    dbgln("Leaked documents: {} destroyed documents are reachable{}", paths.size(), paths.size() >= max_documents ? " (or more)"sv : ""sv);
-    JsonArray groups;
-    for (auto const& signature : order) {
-        auto count = counts.get(signature).value();
-        dbgln("  {}x {}", count, signature);
-        JsonObject group;
-        group.set("count"sv, count);
-        group.set("path"sv, signature);
-        groups.must_append(move(group));
-    }
+    auto or_more = paths.size() >= max_documents ? " (or more)"sv : ""sv;
+    dbgln("Leaked documents: {} destroyed documents are reachable{}", leaked.documents, or_more);
+    auto leaked_groups = leaked.print_and_serialize();
+    if (held_by_script.documents > 0)
+        dbgln("Held by script: {} destroyed documents are reachable through objects of their realms that script holds{}", held_by_script.documents, or_more);
+    auto held_by_script_groups = held_by_script.print_and_serialize();
 
     if (auto* log = Core::StatsLog::the()) {
         JsonObject data;
-        data.set("documents"sv, paths.size());
-        data.set("paths"sv, move(groups));
+        data.set("documents"sv, leaked.documents);
+        // NB: The search stops at max_documents destroyed documents, held by script or not.
+        data.set("truncated"sv, paths.size() >= max_documents);
+        data.set("paths"sv, move(leaked_groups));
+        data.set("documents_held_by_script"sv, held_by_script.documents);
+        data.set("paths_held_by_script"sv, move(held_by_script_groups));
         log->event("leaked_documents"sv, move(data));
     }
 }
@@ -1306,7 +1277,6 @@ void ConnectionFromClient::debug_request(Web::PageId page_id, ByteString request
             Web::Layout::ForcedReadScope read { *doc };
             if (doc->layout_node(read)) {
                 VERIFY(doc->has_committed_viewport_box());
-                doc->update_paint_and_hit_testing_properties_if_needed();
                 StringBuilder builder;
                 Web::Painting::dump_stacking_context_tree(read, builder, *doc);
                 dbgln("{}", builder.string_view());
@@ -1386,25 +1356,9 @@ void ConnectionFromClient::debug_request(Web::PageId page_id, ByteString request
     }
 
     if (request == "collect-garbage") {
-        auto release_hidden_layout = argument == "release-hidden-layout"sv;
-        if (release_hidden_layout) {
-            if (page->page().system_visibility_state() != Web::HTML::VisibilityState::Hidden)
-                return;
-
-            // The DOM and JS state remain live while a tab is in the background, but its layout boxes can be rebuilt
-            // on the next visible frame. Drop those boxes now so the Layout allocator can return their pages.
-            for (auto const& navigable : page->page().hosted_navigables()) {
-                if (auto document = navigable->active_document())
-                    document->invalidate_layout_tree(Web::DOM::InvalidateLayoutTreeReason::BackgroundTabMemoryReclamation);
-            }
-        }
-
         // NOTE: We use deferred_invoke here to ensure that GC runs with as little on the stack as possible.
-        auto print_report = argument != "quiet"sv && !release_hidden_layout;
-        Core::deferred_invoke([print_report] {
-            Web::Bindings::main_thread_vm().heap().collect_garbage(GC::Heap::CollectionType::CollectGarbage, print_report);
-            // Return already-free pages held by the WebContent process's mimalloc heaps.
-            ak_kmalloc_collect();
+        Core::deferred_invoke([] {
+            Web::Bindings::main_thread_vm().heap().collect_garbage(GC::Heap::CollectionType::CollectGarbage, true);
         });
         return;
     }
@@ -1445,6 +1399,7 @@ void ConnectionFromClient::debug_request(Web::PageId page_id, ByteString request
 
     if (request == "clear-cache") {
         Web::Fetch::Fetching::clear_http_memory_cache();
+        WebWorker::post_to_worker_threads(Web::Fetch::Fetching::clear_http_memory_cache);
         Web::CSS::StyleScope::release_kept_data();
         return;
     }
@@ -2886,7 +2841,6 @@ static void append_stacking_context_tree(Web::Page& page, StringBuilder& builder
         return;
     }
 
-    document->update_paint_and_hit_testing_properties_if_needed();
     Web::Painting::dump_stacking_context_tree(read, builder, *document);
 }
 
@@ -3327,11 +3281,11 @@ void ConnectionFromClient::paste(Web::PageId page_id, Utf16String text)
     }
 }
 
-void ConnectionFromClient::paste_from_clipboard(Web::PageId page_id)
+void ConnectionFromClient::paste_from_clipboard(Web::PageId page_id, Vector<Web::Clipboard::SystemClipboardItem> system_clipboard_data)
 {
     if (auto page = this->page(page_id); page.has_value()) {
         if (auto navigable = page->page().hosted_focused_navigable())
-            navigable->paste_from_clipboard();
+            navigable->paste_from_clipboard(system_clipboard_data);
     }
 }
 
@@ -3464,9 +3418,15 @@ void ConnectionFromClient::set_force_dark_settings(Web::PageId page_id, bool ena
         page->page().local_traversable()->set_force_dark_settings(enabled, move(per_host));
 }
 
-void ConnectionFromClient::set_autoplay_settings(Web::PageId, Web::HTML::AutoplayPolicy policy, Vector<Utf16String> allowlist)
+void ConnectionFromClient::set_force_dark_for_local_roots(Web::PageId page_id, bool enabled)
 {
-    Web::HTML::AutoplaySettings::the().set_policy(policy, allowlist);
+    if (auto page = this->page(page_id); page.has_value() && !page->page().has_local_traversable())
+        page->page().set_force_dark_for_local_roots(enabled);
+}
+
+void ConnectionFromClient::set_autoplay_settings(Web::PageId, Web::HTML::AutoplayPolicy policy, OrderedHashMap<String, Web::HTML::AutoplayPolicy> site_policies)
+{
+    Web::HTML::AutoplaySettings::the().set_policy(policy, site_policies);
 }
 
 void ConnectionFromClient::set_preferred_color_scheme(Web::PageId page_id, Web::CSS::PreferredColorScheme color_scheme)
@@ -3539,17 +3499,6 @@ void ConnectionFromClient::permission_request_completed(Web::PageId page_id, u64
         page->permission_request_completed(request_id, state);
 }
 
-void ConnectionFromClient::http_credentials_provided(Web::PageId page_id, u64 request_id, Optional<String> username, Optional<String> password)
-{
-    auto page = this->page(page_id);
-    if (!page.has_value())
-        return;
-    Optional<Web::Page::HTTPCredentials> credentials;
-    if (username.has_value() && password.has_value())
-        credentials = Web::Page::HTTPCredentials { username.release_value(), password.release_value() };
-    page->page().http_credentials_provided(request_id, move(credentials));
-}
-
 void ConnectionFromClient::notification_shown(Web::PageId page_id, u64 notification_id)
 {
     if (auto page = this->page(page_id); page.has_value())
@@ -3602,6 +3551,12 @@ void ConnectionFromClient::set_maximum_frames_per_second(Web::PageId page_id, do
 {
     if (auto page = this->page(page_id); page.has_value())
         page->set_maximum_frames_per_second(maximum_frames_per_second);
+}
+
+void ConnectionFromClient::set_screen_shows_high_dynamic_range(Web::PageId page_id, bool screen_shows_high_dynamic_range)
+{
+    if (auto page = this->page(page_id); page.has_value())
+        page->set_screen_shows_high_dynamic_range(screen_shows_high_dynamic_range);
 }
 
 void ConnectionFromClient::set_frame_rate_capped(Web::PageId page_id, bool capped)
@@ -3683,7 +3638,7 @@ void ConnectionFromClient::update_visibility_state(Web::PageId page_id, Web::HTM
 
     // 2. Queue a global task on the user interaction task source given document's relevant global object
     //    to update the visibility state of document with newState.
-    Web::HTML::queue_global_task(Web::HTML::Task::Source::UserInteraction, Web::HTML::relevant_global_object(*document), GC::create_function(GC::Heap::the(), [visibility_state, document] {
+    Web::HTML::queue_global_task(Web::HTML::Task::Source::UserInteraction, Web::HTML::relevant_global_object(*document), GC::create_function(GC::Heap::the(), GC::captures(visibility_state, document), [](auto& visibility_state, auto& document) {
         document->update_the_visibility_state(visibility_state);
     }));
 }
@@ -4005,11 +3960,6 @@ void ConnectionFromClient::did_worker_agent_fail_loading_script(Web::HTML::Worke
     Web::HTML::WorkerAgentParent::did_fail_loading_worker_script(owner_token);
 }
 
-void ConnectionFromClient::did_worker_agent_report_exception(Web::HTML::WorkerAgentOwnerToken owner_token, Utf16String message, Utf16String filename, u32 lineno, u32 colno)
-{
-    Web::HTML::WorkerAgentParent::did_report_worker_exception(owner_token, move(message), move(filename), lineno, colno);
-}
-
 void ConnectionFromClient::did_worker_agent_report_content_security_policy_violation(Web::HTML::WorkerAgentOwnerToken owner_token, u64 policy_index, String effective_directive, URL::URL resource)
 {
     Web::HTML::WorkerAgentParent::did_report_content_security_policy_violation(owner_token, policy_index, move(effective_directive), move(resource));
@@ -4023,11 +3973,6 @@ void ConnectionFromClient::did_worker_agent_close(Web::HTML::WorkerAgentOwnerTok
 void ConnectionFromClient::did_worker_agent_die(Web::HTML::WorkerAgentOwnerToken owner_token)
 {
     Web::HTML::WorkerAgentParent::did_worker_agent_die(owner_token);
-}
-
-void ConnectionFromClient::did_worker_rtc_transform_encoded_audio_frame_written(Web::HTML::WorkerAgentOwnerToken owner_token, u64 transform_id, ByteBuffer payload, u32 ssrc, u8 payload_type, u32 rtp_timestamp, u16 sequence_number)
-{
-    Web::HTML::WorkerAgentParent::did_write_rtc_transform_encoded_audio_frame(owner_token, transform_id, move(payload), ssrc, payload_type, rtp_timestamp, sequence_number);
 }
 
 // https://html.spec.whatwg.org/multipage/speculative-loading.html#nav-traversal-ui:close-a-top-level-traversable
@@ -4058,8 +4003,10 @@ void ConnectionFromClient::request_close_preflight(Web::PageId page_id, u64 requ
         return;
     }
 
-    traversable->request_close_preflight(GC::create_function(Web::Bindings::main_thread_vm().heap(), [this, page_id, request_id](bool approved) {
-        async_did_complete_close_preflight(page_id, request_id, approved);
+    traversable->request_close_preflight(GC::create_function(Web::Bindings::main_thread_vm().heap(), GC::captures(make_weak_ptr<ConnectionFromClient>(), page_id, request_id), [](auto& connection, auto& page_id, auto& request_id, bool approved) {
+        if (!connection)
+            return;
+        connection->async_did_complete_close_preflight(page_id, request_id, approved);
     }));
 }
 

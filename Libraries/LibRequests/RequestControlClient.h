@@ -15,6 +15,7 @@
 #include <LibRequests/CacheSizes.h>
 #include <LibRequests/CertificateSummary.h>
 #include <LibRequests/NetworkUsage.h>
+#include <LibRequests/RequestTransferLease.h>
 #include <RequestServer/IsPrivate.h>
 #include <RequestServer/RequestServerControlClientEndpoint.h>
 #include <RequestServer/RequestServerControlEndpoint.h>
@@ -35,11 +36,13 @@ public:
     NonnullRefPtr<Core::Promise<Empty>> clear_cache(UnixDateTime since);
     NonnullRefPtr<Core::Promise<Vector<CacheAccessBucket>>> retrieve_cache_access_profile(AK::Duration granularity);
     NonnullRefPtr<Core::Promise<Optional<CertificateSummary>>> retrieve_peer_certificate(ByteString host);
+    // Resolves once RequestServer has handled the designation.
+    NonnullRefPtr<Core::Promise<Empty>> designate_request_adopter(RequestTransferLeaseKey, int adopter_client_id);
 
     Function<void(Vector<NetworkUsage>, u64 interval_microseconds)> on_network_usage;
     Function<void(int client_id)> on_client_disconnected;
-    Function<String(int client_id, URL::URL const&, Optional<HTTP::Cookie::PartitionContext> const&)> on_retrieve_http_cookie;
-    Function<void(int client_id, URL::URL const&, Optional<HTTP::Cookie::PartitionContext> const&, Vector<HTTP::Cookie::ParsedCookie> const&, Optional<HTTP::HSTS::ParsedHSTSPolicy> const&)> on_store_response_cookies_and_hsts_policy;
+    Function<String(int client_id, URL::URL const&, Optional<HTTP::Cookie::PartitionContext> const&, HTTP::Cookie::SameSiteContext)> on_retrieve_http_cookie;
+    Function<void(int client_id, URL::URL const&, Optional<HTTP::Cookie::PartitionContext> const&, HTTP::Cookie::SameSiteContext, Vector<HTTP::Cookie::ParsedCookie> const&, Optional<HTTP::HSTS::ParsedHSTSPolicy> const&)> on_store_response_cookies_and_hsts_policy;
     Function<void()> on_request_server_died;
     Function<void(u64 size)> on_disk_cache_size_changed;
 
@@ -48,13 +51,14 @@ private:
 
     virtual void network_usage(Vector<NetworkUsage> usage, u64 interval_microseconds) override;
     virtual void client_disconnected(int client_id) override;
-    virtual void retrieve_http_cookie(int client_id, u64 request_id, RequestServer::RequestType request_type, u64 cookie_request_id, URL::URL url, Optional<HTTP::Cookie::PartitionContext> partition_context) override;
-    virtual void store_response_cookies_and_hsts_policy(int client_id, u64 request_id, u64 store_request_id, URL::URL url, Optional<HTTP::Cookie::PartitionContext> partition_context, Vector<HTTP::Cookie::ParsedCookie> cookies, Optional<HTTP::HSTS::ParsedHSTSPolicy> hsts_policy) override;
+    virtual void retrieve_http_cookie(int client_id, u64 request_id, RequestServer::RequestType request_type, u64 cookie_request_id, URL::URL url, Optional<HTTP::Cookie::PartitionContext> partition_context, HTTP::Cookie::SameSiteContext same_site_context) override;
+    virtual void store_response_cookies_and_hsts_policy(int client_id, u64 request_id, u64 store_request_id, URL::URL url, Optional<HTTP::Cookie::PartitionContext> partition_context, HTTP::Cookie::SameSiteContext same_site_context, Vector<HTTP::Cookie::ParsedCookie> cookies, Optional<HTTP::HSTS::ParsedHSTSPolicy> hsts_policy) override;
     virtual void estimated_cache_size(u64 cache_size_estimation_id, CacheSizes sizes) override;
     virtual void retrieved_peer_certificate(u64 certificate_request_id, Optional<CertificateSummary> certificate) override;
     virtual void removed_cache_entries(u64 clear_cache_request_id) override;
     virtual void disk_cache_size_changed(u64 size) override;
     virtual void retrieved_cache_access_profile(u64 access_profile_request_id, Vector<CacheAccessBucket> buckets) override;
+    virtual void request_adopter_designated(u64 designation_id) override;
 
     HashMap<u64, NonnullRefPtr<Core::Promise<Optional<CertificateSummary>>>> m_pending_certificate_requests;
     u64 m_next_certificate_request_id { 0 };
@@ -67,6 +71,9 @@ private:
 
     HashMap<u64, NonnullRefPtr<Core::Promise<Vector<CacheAccessBucket>>>> m_pending_cache_access_profile_requests;
     u64 m_next_cache_access_profile_request_id { 0 };
+
+    HashMap<u64, NonnullRefPtr<Core::Promise<Empty>>> m_pending_adopter_designations;
+    u64 m_next_adopter_designation_id { 0 };
 };
 
 }

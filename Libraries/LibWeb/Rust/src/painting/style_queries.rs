@@ -10,7 +10,7 @@ use crate::css::css_enums::{
     backface_visibility, content_visibility, isolation, line_style, mix_blend_mode, outline_style, overflow,
     positioning, transform_style,
 };
-use crate::css::css_pixels::{CssPixelRect, CssPixels};
+use crate::css::css_pixels::CssPixels;
 use crate::css::css_string::CssString;
 use crate::css::property_metadata::property_name;
 use crate::css::serialize::{StringUnits, with_fly_string_units};
@@ -218,6 +218,20 @@ pub(crate) fn kind_is_svg_element_box(kind: NodeKind) -> bool {
     node_facts::kind_is_svg_box(kind) || matches!(kind, NodeKind::SVGSVGBox | NodeKind::SVGForeignObjectBox)
 }
 
+/// The document element's box among `parent`'s children, looking through anonymous wrappers.
+pub(crate) fn document_element_box_under(arena: &impl PaintRead, parent: NodeSlotId) -> Option<NodeSlotId> {
+    arena.children(parent).find_map(|child| {
+        let flags = arena.node_flags_if_live(child);
+        if flags & NodeFlag::IsDocumentElement as u32 != 0 {
+            return Some(child);
+        }
+        if flags & NodeFlag::Anonymous as u32 != 0 {
+            return document_element_box_under(arena, child);
+        }
+        None
+    })
+}
+
 pub(crate) fn node_is_root_element(arena: &impl PaintRead, node: NodeSlotId) -> bool {
     let flags = arena.node_flags_if_live(node);
     flags & NodeFlag::Anonymous as u32 == 0 && flags & NodeFlag::IsHtmlHtmlElement as u32 != 0
@@ -296,7 +310,7 @@ fn style_establishes_fixed_positioning_containing_block(
     false
 }
 
-pub(crate) fn inline_establishes_absolute_position_containing_block(style: ComputedValuesView<'_>) -> bool {
+fn inline_establishes_absolute_position_containing_block(style: ComputedValuesView<'_>) -> bool {
     let effects = style.effects();
     style.position() != positioning::STATIC
         || filter_has_filters(&effects.filter)
@@ -304,11 +318,45 @@ pub(crate) fn inline_establishes_absolute_position_containing_block(style: Compu
         || will_change_has_any_property(style, &[b"position", b"filter", b"backdrop-filter"])
 }
 
+/// Whether a box with `style` may establish a containing block for absolutely or fixed positioned boxes, which
+/// [`establishes_positioning_containing_blocks`] answers for the box. A box this answers no for establishes neither,
+/// unless it is the viewport or a `<foreignObject>`'s box, which establish them whatever their style.
+pub(crate) fn style_may_establish_positioning_containing_blocks(style: ComputedValuesView<'_>) -> bool {
+    use crate::css::css_enums::{backface_visibility, content_visibility};
+    let transform = style.transform();
+    let effects = style.effects();
+    let box_values = style.box_values();
+    let misc = style.misc_interaction();
+    style.position() != positioning::STATIC
+        || !misc.implicit_will_change.as_slice().is_empty()
+        || matches!(handle_value(&misc.will_change), Some(StyleValueData::ValueList { .. }))
+        || !transform.transformations.pointer.is_null()
+        || !transform.translate.pointer.is_null()
+        || !transform.rotate.pointer.is_null()
+        || !transform.scale.pointer.is_null()
+        || transform.has_offset_path
+        || transform.has_perspective
+        || filter_has_filters(&effects.filter)
+        || filter_has_filters(&effects.backdrop_filter)
+        || box_values.layout_containment
+        || box_values.paint_containment
+        || style.content_visibility() == content_visibility::AUTO
+        || transform.transform_style == transform_style::PRESERVE_3D
+        || transform.backface_visibility == backface_visibility::HIDDEN
+}
+
 pub(crate) fn establishes_positioning_containing_blocks(arena: &impl PaintRead, node: NodeSlotId) -> (bool, bool) {
     let Some(row) = arena.node(node) else {
         return (false, false);
     };
     let kind = row.kind();
+    if kind == NodeKind::InlineNode {
+        let absolute = !node_facts::has_flag(&row, NodeFlag::Anonymous)
+            && row
+                .style()
+                .is_some_and(inline_establishes_absolute_position_containing_block);
+        return (absolute, false);
+    }
     if !node_facts::kind_is_box(kind) {
         return (false, false);
     }
@@ -360,10 +408,6 @@ pub(crate) fn has_css_transform(arena: &impl PaintRead, node: NodeSlotId, style:
         || !transform.scale.pointer.is_null()
         || transform.has_offset_path;
     has_transform && is_transformable(arena, node)
-}
-
-pub(crate) fn is_atomic_inline(arena: &impl PaintRead, node: NodeSlotId) -> bool {
-    arena.node(node).is_some_and(PaintRow::is_atomic_inline)
 }
 
 pub(crate) fn is_transformable(arena: &impl PaintRead, node: NodeSlotId) -> bool {
@@ -610,42 +654,6 @@ pub(crate) fn is_sticky_position(style: ComputedValuesView<'_>) -> bool {
 
 pub(crate) fn is_floating(arena: &impl PaintRead, node: NodeSlotId) -> bool {
     arena.node(node).is_some_and(PaintRow::is_floating)
-}
-
-pub(crate) fn is_invisible_for_line_clamp(arena: &impl PaintRead, node: NodeSlotId) -> bool {
-    arena.with_committed_fragment_link(node, |link| link.is_some_and(|link| link.is_invisible_for_line_clamp))
-}
-
-pub(crate) fn has_line_clamp_point(arena: &impl PaintRead, node: NodeSlotId) -> bool {
-    arena.with_committed_fragment_link(node, |link| link.is_some_and(|link| link.fragment.has_line_clamp_point))
-}
-
-fn line_clamp_container(arena: &impl PaintRead, start: Option<NodeSlotId>) -> Option<NodeSlotId> {
-    std::iter::successors(start, |node| arena.node_parent_if_live(*node))
-        .find(|node| has_line_clamp_point(arena, *node))
-}
-
-pub(crate) fn line_clamp_clip_rect(arena: &impl PaintRead, container: NodeSlotId) -> CssPixelRect {
-    let style = arena
-        .node_style_if_live(container)
-        .expect("line clamp container must be live");
-    let content_rect = crate::painting::paintable_geometry::absolute_rect(arena, container);
-    let extent = CssPixels::from_integer((crate::css::css_pixels::MAX_INTEGER_VALUE / 4) as i64);
-    if style.writing_mode() == crate::css::css_enums::writing_mode::HORIZONTAL_TB {
-        CssPixelRect::new(-extent, -extent, extent * 2, content_rect.bottom() + extent)
-    } else if style.block_axis_is_reverse() {
-        CssPixelRect::new(content_rect.x, -extent, extent - content_rect.x, extent * 2)
-    } else {
-        CssPixelRect::new(-extent, -extent, content_rect.right() + extent, extent * 2)
-    }
-}
-
-pub(crate) fn line_clamp_float_clip_rect(arena: &impl PaintRead, node: NodeSlotId) -> Option<CssPixelRect> {
-    if is_invisible_for_line_clamp(arena, node) {
-        return Some(CssPixelRect::default());
-    }
-    let container = line_clamp_container(arena, Some(node))?;
-    Some(line_clamp_clip_rect(arena, container))
 }
 
 pub(crate) fn is_inline(arena: &impl PaintRead, node: NodeSlotId) -> bool {

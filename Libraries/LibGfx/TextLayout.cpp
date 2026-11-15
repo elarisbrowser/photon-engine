@@ -24,6 +24,16 @@
 
 namespace Gfx {
 
+// How far synthetic bold can spread the ink of a font's glyphs past their outlines, in device pixels. The rasterizer
+// decides the stroke, so this allows for the widest it's known to use: It bounds what a run may paint, and isn't a
+// measurement of its ink.
+static float synthetic_bold_outset(Font const& font, float scale)
+{
+    if (!font.synthesis().bold)
+        return 0;
+    return max(font.pixel_size() * scale / 24, 1.0f);
+}
+
 // Tight bounds of the ink of the painted glyphs, from their own extents, in the coordinates of glyph_run_bounding_box().
 // Empty if no painted glyph has ink.
 static FloatRect glyph_run_ink_bounding_box(Font const& font, ReadonlySpan<ShapedGlyph> glyphs, float scale)
@@ -94,11 +104,28 @@ FloatRect glyph_run_bounding_box(Font const& font, ReadonlySpan<ShapedGlyph> gly
         auto right = max_x + font_bounding_box.x_max * font_units_to_pixels;
         auto top = min_y - font_bounding_box.y_max * font_units_to_pixels;
         auto bottom = max_y - font_bounding_box.y_min * font_units_to_pixels;
+        // A synthetic oblique shifts each point of a glyph along the line by its height above the baseline.
+        if (auto angle = font.synthesis().oblique_angle; angle != 0) {
+            auto slant = AK::tan(AK::to_radians(angle));
+            auto shift_at_top = font_bounding_box.y_max * font_units_to_pixels * slant;
+            auto shift_at_bottom = font_bounding_box.y_min * font_units_to_pixels * slant;
+            left += min(0.0f, min(shift_at_top, shift_at_bottom));
+            right += max(0.0f, max(shift_at_top, shift_at_bottom));
+        }
+        auto outset = synthetic_bold_outset(font, scale);
+        left -= outset;
+        right += outset;
+        top -= outset;
+        bottom += outset;
         return { left, top, right - left, bottom - top };
     }
 
     // The font doesn't record an overall bounding box (e.g. bitmap-only fonts), so unite the glyphs' own extents.
-    return glyph_run_ink_bounding_box(font, glyphs, scale);
+    // NB: HarfBuzz slants the extents of a synthetic oblique itself.
+    auto bounds = glyph_run_ink_bounding_box(font, glyphs, scale);
+    if (auto outset = synthetic_bold_outset(font, scale); outset > 0 && !bounds.is_empty())
+        bounds.inflate(outset * 2, outset * 2);
+    return bounds;
 }
 
 namespace {
@@ -381,9 +408,15 @@ Vector<float> glyph_run_glyph_intercepts(Font const& font, ReadonlySpan<ShapedGl
     return intervals;
 }
 
-static hb_buffer_t* setup_text_shaping(Utf16View const& string, Font const& font, FFI::TextType text_type)
+static hb_buffer_t* setup_text_shaping(Utf16View const& string, Font const& font, FFI::TextType text_type, FFI::JoiningContext joining_context = {})
 {
     hb_buffer_t* buffer = hb_buffer_create();
+
+    // A zero width joiner as context before or after the text gives the letters at its edges the forms that join them
+    // to letters outside it.
+    static constexpr hb_codepoint_t ZERO_WIDTH_JOINER = 0x200D;
+    if (joining_context.joins_before)
+        hb_buffer_add_codepoints(buffer, &ZERO_WIDTH_JOINER, 1, 1, 0);
 
     if (string.has_ascii_storage()) {
         hb_buffer_add_utf8(buffer, string.ascii_span().data(), string.length_in_code_units(), 0, -1);
@@ -406,6 +439,9 @@ static hb_buffer_t* setup_text_shaping(Utf16View const& string, Font const& font
             hb_buffer_guess_segment_properties(buffer);
         }
     }
+
+    if (joining_context.joins_after)
+        hb_buffer_add_codepoints(buffer, &ZERO_WIDTH_JOINER, 1, 0, 0);
 
     auto* hb_font = font.harfbuzz_font();
     hb_feature_t const* hb_features_data = nullptr;
@@ -459,10 +495,10 @@ struct ShapedGlyphs {
     TrailingWhitespace trailing_whitespace;
 };
 
-static ShapedGlyphs build_origin_relative_shape(Utf16View const& string, Font const& font, FFI::TextType text_type, float letter_spacing, float word_spacing)
+static ShapedGlyphs build_origin_relative_shape(Utf16View const& string, Font const& font, FFI::TextType text_type, float letter_spacing, float word_spacing, FFI::JoiningContext joining_context)
 {
     auto const& metrics = font.pixel_metrics();
-    auto* buffer = setup_text_shaping(string, font, text_type);
+    auto* buffer = setup_text_shaping(string, font, text_type, joining_context);
 
     u32 glyph_count;
     auto const* glyph_info = hb_buffer_get_glyph_infos(buffer, &glyph_count);
@@ -575,7 +611,7 @@ static_assert(offsetof(Gfx::FFI::ShapedGlyph, glyph_id) == offsetof(Gfx::ShapedG
 static_assert(offsetof(Gfx::FFI::ShapedGlyph, should_paint) == offsetof(Gfx::ShapedGlyph, should_paint));
 
 extern "C" {
-void ladybird_gfx_shape_text_uncached(void const*, u16 const*, size_t, Gfx::FFI::TextType, float, float, void*, void (*)(void*, Gfx::FFI::ShapedGlyph const*, size_t, float, size_t, float));
+void ladybird_gfx_shape_text_uncached(void const*, u16 const*, size_t, Gfx::FFI::TextType, float, float, Gfx::FFI::JoiningContext, void*, void (*)(void*, Gfx::FFI::ShapedGlyph const*, size_t, float, size_t, float));
 float ladybird_gfx_font_measure_text_width(void const*, u16 const*, size_t);
 void ladybird_gfx_glyph_run_bounding_box(void const*, Gfx::FFI::ShapedGlyph const*, size_t, float, float*);
 void ladybird_gfx_glyph_run_ink_bounding_box(void const*, Gfx::FFI::ShapedGlyph const*, size_t, float, float*);
@@ -589,6 +625,7 @@ extern "C" void ladybird_gfx_shape_text_uncached(
     Gfx::FFI::TextType text_type,
     float letter_spacing,
     float word_spacing,
+    Gfx::FFI::JoiningContext joining_context,
     void* sink,
     void (*emit)(void*, Gfx::FFI::ShapedGlyph const*, size_t, float, size_t, float))
 {
@@ -603,7 +640,8 @@ extern "C" void ladybird_gfx_shape_text_uncached(
         *static_cast<Gfx::Font const*>(font),
         text_type,
         letter_spacing,
-        word_spacing);
+        word_spacing,
+        joining_context);
     emit(
         sink,
         reinterpret_cast<Gfx::FFI::ShapedGlyph const*>(shape.glyphs.data()),

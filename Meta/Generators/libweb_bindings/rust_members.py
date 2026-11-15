@@ -39,16 +39,19 @@ SUPPORTED_ATTRIBUTE_EXTENDED_ATTRIBUTES = {
     "AttributeCallbackName",
     "CachedAccessor",
     "CEReactions",
+    "Exposed",
     "FIXME",
     "ImplementedAs",
     "LegacyNullToEmptyString",
     "NeedsCallerRealm",
     "NewObject",
     "PutForwards",
+    "ReturnsJSValue",
     "SameObject",
     "SecureContext",
 }
 SUPPORTED_OPERATION_EXTENDED_ATTRIBUTES = {
+    "CreatesPromise",
     "CEReactions",
     "Default",
     "Exposed",
@@ -57,12 +60,24 @@ SUPPORTED_OPERATION_EXTENDED_ATTRIBUTES = {
     "NeedsCallerRealm",
     "NewObject",
     "SameObject",
+    "SecureContext",
 }
 SUPPORTED_STRINGIFIER_EXTENDED_ATTRIBUTES = {"Exposed"}
 
-# The value of [Exposed] that the Rust bindings handle on a member: a member that only a Window has, which the
-# bindings define when the global object of the realm is a Window.
-SUPPORTED_MEMBER_EXPOSURE = "Window"
+# The values of [Exposed] that the Rust bindings handle on a member, without spaces, with the condition on the realm
+# under which the member is exposed.
+MEMBER_EXPOSURE_CONDITIONS = {
+    "Window": "realm_is_window(realm)",
+    "(Window,Worker)": "window_or_worker_global_scope_from_global_object(realm.global_object()).is_some()",
+}
+
+
+def member_exposure_condition(extended_attributes: dict) -> Optional[str]:
+    """The condition on the realm under which a member is exposed, if it names the globals that expose it."""
+    exposure = extended_attributes.get("Exposed")
+    if exposure is None:
+        return None
+    return MEMBER_EXPOSURE_CONDITIONS.get(exposure.replace(" ", ""))
 
 
 def generated_function_stem(method: str) -> str:
@@ -97,6 +112,14 @@ class RustAttribute:
         return "CachedAccessor" in self.attribute.extended_attributes
 
     @property
+    def returns_js_value(self) -> bool:
+        return "ReturnsJSValue" in self.attribute.extended_attributes
+
+    @property
+    def exposure_condition(self) -> Optional[str]:
+        return member_exposure_condition(self.attribute.extended_attributes)
+
+    @property
     def function_stem(self) -> str:
         """What the generated native functions are named after. [AttributeCallbackName] tells apart the attributes that
         name the same methods."""
@@ -121,6 +144,9 @@ class RustOperation:
     # for a [Default] toJSON operation: the bindings run the default toJSON steps instead,
     # https://webidl.spec.whatwg.org/#default-tojson-steps
     method: str
+    omitted_parameter: Optional[OperationParameter] = None
+    omitted_parameter_index: Optional[int] = None
+    implementation_parameters: Optional[List[OperationParameter]] = None
 
     @property
     def length(self) -> int:
@@ -134,7 +160,8 @@ class RustOperation:
     def steps_function(self) -> str:
         """The generated function of the steps of the operation, when the operation is one of several overloads that
         the function of the prototype chooses between."""
-        return f"{generated_function_stem(self.method)}_steps"
+        suffix = f"_{len(self.operation.parameters)}" if self.omitted_parameter is not None else ""
+        return f"{generated_function_stem(self.method)}{suffix}_steps"
 
 
 @dataclass
@@ -154,9 +181,12 @@ class RustOperationSet:
         return min(overload.length for overload in self.overloads)
 
     @property
-    def is_window_only(self) -> bool:
-        """Whether only a Window has the operation: [Exposed=Window] on an interface exposed elsewhere as well."""
-        return self.overloads[0].operation.extended_attributes.get("Exposed") == SUPPORTED_MEMBER_EXPOSURE
+    def is_secure_context_only(self) -> bool:
+        return "SecureContext" in self.overloads[0].operation.extended_attributes
+
+    @property
+    def exposure_condition(self) -> Optional[str]:
+        return member_exposure_condition(self.overloads[0].operation.extended_attributes)
 
 
 @dataclass
@@ -164,8 +194,8 @@ class RustStringifier:
     """The stringifier of an interface, https://webidl.spec.whatwg.org/#es-stringifier: an operation, which the
     implementation runs through its method to_string, or an attribute, whose getter method it runs."""
 
-    # Whether only a Window has the stringifier.
-    is_window_only: bool
+    # The condition on the realm under which the stringifier is exposed, if it names the globals that expose it.
+    exposure_condition: Optional[str]
     # The getter method of the attribute, for a stringifier that is an attribute.
     attribute_getter_method: Optional[str] = None
 
@@ -301,6 +331,8 @@ class RustConstructor:
 class RustMembers:
     # The attributes and the operations that the implementation has methods for.
     attributes: List[RustAttribute] = field(default_factory=list)
+    # The static attributes, which the interface object has.
+    static_attributes: List[RustAttribute] = field(default_factory=list)
     operation_sets: List[RustOperationSet] = field(default_factory=list)
     # The static operations, which the interface object has.
     static_operation_sets: List[RustOperationSet] = field(default_factory=list)
@@ -389,8 +421,6 @@ def rust_members(interface: Interface) -> RustMembers:
     if interface.async_iterable is not None and interface.async_iterable.key_type is not None:
         fail("it has a pair asynchronously iterable declaration")
     has_value_iterator = interface.iterable is not None and interface.iterable.key_type is None
-    if interface.static_attributes:
-        fail("it has static attributes")
 
     members = RustMembers()
     if interface.async_iterable is not None:
@@ -479,9 +509,13 @@ def rust_members(interface: Interface) -> RustMembers:
 
     def check_exposure(member_name: str, extended_attributes: dict) -> None:
         exposure = extended_attributes.get("Exposed")
-        if exposure is not None and exposure != SUPPORTED_MEMBER_EXPOSURE:
+        interface_exposure = interface.extended_attributes.get("Exposed", "")
+        if exposure is None or exposure.replace(" ", "") == interface_exposure.replace(" ", ""):
+            return
+        if exposure.replace(" ", "") not in MEMBER_EXPOSURE_CONDITIONS:
             fail(
-                f"{member_name} is [Exposed={exposure}], and the Rust bindings only handle [Exposed=Window] on members"
+                f"{member_name} is [Exposed={exposure}], and the Rust bindings only handle [Exposed=Window], "
+                "[Exposed=(Window,Worker)], or the exposure of the interface on members"
             )
 
     if interface.stringifier is not None:
@@ -494,7 +528,7 @@ def rust_members(interface: Interface) -> RustMembers:
         if stringifier.attribute is not None:
             attribute_getter_method = method_of(stringifier.attribute.name, stringifier.attribute.extended_attributes)
         members.stringifier = RustStringifier(
-            stringifier.extended_attributes.get("Exposed") == SUPPORTED_MEMBER_EXPOSURE, attribute_getter_method
+            member_exposure_condition(stringifier.extended_attributes), attribute_getter_method
         )
 
     constructor_attributes = {"ImplementedAs"} if len(interface.constructors) > 1 else set()
@@ -524,6 +558,7 @@ def rust_members(interface: Interface) -> RustMembers:
         check_extended_attributes(
             attribute.name, attribute.extended_attributes, SUPPORTED_ATTRIBUTE_EXTENDED_ATTRIBUTES
         )
+        check_exposure(attribute.name, attribute.extended_attributes)
         if "FIXME" in attribute.extended_attributes:
             members.attributes_in_order.append(attribute.name)
             continue
@@ -540,12 +575,27 @@ def rust_members(interface: Interface) -> RustMembers:
         members.attributes.append(rust_attribute)
         members.attributes_in_order.append(rust_attribute)
 
+    for attribute in interface.static_attributes:
+        check_extended_attributes(
+            attribute.name, attribute.extended_attributes, SUPPORTED_ATTRIBUTE_EXTENDED_ATTRIBUTES - {"FIXME"}
+        )
+        check_exposure(attribute.name, attribute.extended_attributes)
+        if not attribute.readonly:
+            fail(f"its static attribute {attribute.name} is not read only, which the Rust bindings do not handle yet")
+        members.static_attributes.append(
+            RustAttribute(attribute, method_of(attribute.name, attribute.extended_attributes), None)
+        )
+
     def operation_sets(static: bool) -> List[RustOperationSet]:
         operations_of_interface = interface.static_operations if static else interface.regular_operations
         for operation in operations_of_interface:
             check_extended_attributes(
                 operation.name, operation.extended_attributes, SUPPORTED_OPERATION_EXTENDED_ATTRIBUTES
             )
+            if "CreatesPromise" in operation.extended_attributes and (
+                not operation.return_type_is_promise() or operation.return_type.nullable
+            ):
+                fail(f"its operation {operation.name} is [CreatesPromise] but does not return a non-nullable promise")
             check_exposure(operation.name, operation.extended_attributes)
             if "Default" in operation.extended_attributes and (
                 static or operation.name != "toJSON" or operation.return_type.name != "object" or operation.parameters
@@ -568,11 +618,40 @@ def rust_members(interface: Interface) -> RustMembers:
                     )
                 if len({operation.return_type_is_promise() for operation in operations}) > 1:
                     fail(f"some overloads of its operation {name} return a promise type and others do not")
-                if len({operation.extended_attributes.get("Exposed") for operation in operations}) > 1:
+                exposure = {
+                    (operation.extended_attributes.get("Exposed"), "SecureContext" in operation.extended_attributes)
+                    for operation in operations
+                }
+                if len(exposure) > 1:
                     fail(f"the overloads of its operation {name} are exposed differently")
             overloads = [
                 RustOperation(operation, method_of(name, operation.extended_attributes)) for operation in operations
             ]
+            for method in {overload.method for overload in overloads}:
+                shared = [overload for overload in overloads if overload.method == method]
+                if len(shared) == 1:
+                    continue
+                if static or len(shared) != 2:
+                    fail(f"the overloads sharing the Rust method {method} must differ by one required parameter")
+                shorter, longer = sorted(shared, key=lambda overload: len(overload.operation.parameters))
+                short_parameters = shorter.operation.parameters
+                long_parameters = longer.operation.parameters
+                if len(long_parameters) != len(short_parameters) + 1:
+                    fail(f"the overloads sharing the Rust method {method} must differ by one required parameter")
+                indices = [
+                    index
+                    for index, parameter in enumerate(long_parameters)
+                    if not parameter.optional
+                    and not parameter.variadic
+                    and long_parameters[:index] + long_parameters[index + 1 :] == short_parameters
+                ]
+                if len(indices) != 1 or shorter.operation.return_type != longer.operation.return_type:
+                    fail(f"the overloads sharing the Rust method {method} must differ by one required parameter")
+                index = indices[0]
+                for overload in shared:
+                    overload.omitted_parameter = long_parameters[index]
+                    overload.omitted_parameter_index = index
+                    overload.implementation_parameters = long_parameters
             sets.append(RustOperationSet(name, overloads))
         if static and any("FIXME" in operation.extended_attributes for operation in operations_of_interface):
             fail("it has static operations marked [FIXME], which the Rust bindings do not record yet")
@@ -599,15 +678,15 @@ def rust_members(interface: Interface) -> RustMembers:
 
     # NB: The spellings of a CSS descriptor or property are attributes with the same steps, which name the same methods.
     attribute_methods = {attribute.getter_method for attribute in members.attributes if attribute.event_type is None}
+    attribute_methods.update(attribute.getter_method for attribute in members.static_attributes)
     attribute_methods.update(
         attribute.setter_method for attribute in members.attributes if attribute.setter_method is not None
     )
     methods = sorted(attribute_methods)
     methods.extend(
-        overload.method
+        method
         for operation_set in members.operation_sets + members.static_operation_sets
-        for overload in operation_set.overloads
-        if not overload.is_default_to_json
+        for method in {overload.method for overload in operation_set.overloads if not overload.is_default_to_json}
     )
     if members.stringifier is not None and members.stringifier.defines_method:
         methods.append(members.stringifier.method)

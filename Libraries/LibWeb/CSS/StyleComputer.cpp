@@ -85,6 +85,7 @@
 #include <LibWeb/DOM/ShadowRoot.h>
 #include <LibWeb/DOM/Text.h>
 #include <LibWeb/HTML/AttributeNames.h>
+#include <LibWeb/HTML/EventLoop/EventLoop.h>
 #include <LibWeb/HTML/HTMLBRElement.h>
 #include <LibWeb/HTML/HTMLImageElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
@@ -106,33 +107,24 @@
 
 namespace Web::CSS {
 
-class Fnv1a64 {
-public:
-    void add(u64 value)
-    {
-        m_hash ^= value;
-        m_hash *= 0x100000001b3ull;
-    }
+void StyleComputer::AnimationRefreshRequest::visit_edges(GC::Cell::Visitor& visitor) const
+{
+    abstract_element.visit_edges(visitor);
+    visitor.visit(effects);
+}
 
-    u64 value() const { return m_hash; }
-
-private:
-    u64 m_hash { 0xcbf29ce484222325ull };
-};
+void StyleComputer::SampledAnimationOverlay::visit_edges(GC::Cell::Visitor& visitor) const
+{
+    element.visit_edges(visitor);
+}
 
 GC_DEFINE_ALLOCATOR(StyleComputer);
 
 StyleComputer::StyleComputer(DOM::Document& document)
     : m_document(document)
-    , m_default_font_metrics(16, Platform::FontPlugin::the().default_font(16)->pixel_metrics(), normal_line_height(Platform::FontPlugin::the().default_font(16)->pixel_metrics()))
-    , m_root_element_font_metrics(m_default_font_metrics)
+    , m_root_element_font_metrics(16, Platform::FontPlugin::the().default_font(16)->pixel_metrics(), normal_line_height(Platform::FontPlugin::the().default_font(16)->pixel_metrics()))
     , m_style_engine(this)
 {
-}
-
-void StyleComputer::prepare_for_style_engine_transaction() const
-{
-    sweep_custom_property_environments();
 }
 
 void StyleComputer::begin_style_update() const
@@ -327,7 +319,7 @@ DOM::ShadowRoot* StyleComputer::shadow_root_for_tree_scope(TreeScopeID tree_scop
 void StyleComputer::prepare_elements_for_style_computation()
 {
     for (;;) {
-        auto elements = m_style_engine.take_elements_awaiting_first_style_computation();
+        auto elements = m_style_engine.take_elements_awaiting_preparation_for_style_computation();
         if (elements.is_empty())
             break;
         for (auto style_node : elements) {
@@ -423,7 +415,7 @@ void StyleComputer::commit_transition_stabilization_epoch()
         auto commit_proposed_transition = [&] {
             VERIFY(state.proposed_transition);
             state.proposed_transition->commit_provisional_transition();
-            ++document().style_invalidation_counters().committed_transitions_started;
+            HTML::note_rendering_trace_event("transition started"sv);
         };
 
         switch (state.action) {
@@ -449,7 +441,7 @@ void StyleComputer::commit_transition_stabilization_epoch()
             commit_proposed_transition();
             break;
         }
-        ++document().style_invalidation_counters().committed_transition_actions;
+        HTML::note_rendering_trace_event("transition action committed"sv);
     }
     m_provisional_transition_states.clear();
     m_provisional_transition_state_indices.clear();
@@ -482,11 +474,6 @@ Optional<Utf16String> StyleComputer::user_agent_style_sheet_source(Utf16View nam
     return {};
 }
 
-struct ResolvedScope {
-    GC::Ptr<DOM::Element const> root;
-    size_t proximity { NumericLimits<size_t>::max() };
-};
-
 static RefPtr<CustomPropertyData const> inheritable_custom_property_data(Layout::BegunRead const& read, DOM::AbstractElement abstract_element)
 {
     auto data = abstract_element.custom_property_data();
@@ -509,6 +496,7 @@ struct StyleComputer::AnimationSample {
         DOM::AbstractElement abstract_element;
         ComputedStyleWorkingSet& computed_properties;
     } context;
+    AnimationSamplePurpose purpose { AnimationSamplePurpose::Rendering };
     Vector<ComputedValuesFFI::FfiSampledAnimationEffect, 1> sampled_effects;
     Vector<Vector<Compositing::RustFFI::FfiLinearEasingPoint>, 1> easing_points;
     Vector<u8> document_supported_color_scheme_codes;
@@ -620,16 +608,30 @@ void StyleComputer::collect_animation_effects_into(Layout::BegunRead const& read
     finish_animation_sample(*sample, result);
 }
 
-NonnullOwnPtr<StyleComputer::AnimationSample> StyleComputer::begin_animation_sample(Layout::BegunRead const& read, DOM::AbstractElement abstract_element, ReadonlySpan<GC::Ref<Animations::KeyframeEffect>> effects, ComputedStyleWorkingSet& computed_properties) const
+NonnullRefPtr<ComputedStyleWorkingSet> StyleComputer::compute_style_for_animation_commit(Layout::BegunRead const& read, DOM::AbstractElement element, ReadonlySpan<GC::Ref<Animations::KeyframeEffect>> effects) const
+{
+    auto style = reconstruct_computed_properties_for_animation(element.installed_style());
+    auto sample = begin_animation_sample(read, element, effects, *style, AnimationSamplePurpose::CommitStyles);
+    with_animation_effect_descriptions(effects, [&](auto const& descriptions) {
+        auto result = ComputedValuesFFI::rust_sample_animation_effects_for_commit_styles(&sample->input, &descriptions, &read);
+        finish_animation_sample(*sample, result);
+    });
+    return style;
+}
+
+NonnullOwnPtr<StyleComputer::AnimationSample> StyleComputer::begin_animation_sample(Layout::BegunRead const& read, DOM::AbstractElement abstract_element, ReadonlySpan<GC::Ref<Animations::KeyframeEffect>> effects, ComputedStyleWorkingSet& computed_properties, AnimationSamplePurpose purpose) const
 {
     auto sample = make<AnimationSample>(*this, abstract_element, computed_properties);
+    sample->purpose = purpose;
     // The style engine samples each effect from the description it holds of it, kept current here, right before
     // the element is sampled.
     auto const animation_slot = abstract_element.pseudo_element().map([](auto pseudo_element) { return static_cast<u8>(to_underlying(pseudo_element) + 1); }).value_or(0);
-    record_element_animation_effect_descriptions(abstract_element.element(), animation_slot, effects);
+    if (purpose == AnimationSamplePurpose::Rendering)
+        record_element_animation_effect_descriptions(abstract_element.element(), animation_slot, effects);
 
     // The effects and their timing are the host's; the key each samples at, and what their keyframes compute to, are
-    // the engine's. The host computes the key only for a timing the engine cannot decide.
+    // the engine's. The host computes endpoint-inclusive keys for committing styles, and otherwise only for a timing
+    // the engine cannot decide.
     auto& sampled_effects = sample->sampled_effects;
     auto& easing_points = sample->easing_points;
     sampled_effects.ensure_capacity(effects.size());
@@ -640,8 +642,11 @@ NonnullOwnPtr<StyleComputer::AnimationSample> StyleComputer::begin_animation_sam
             continue;
         auto timing = style_engine_effect_timing(*effect, *animation);
         Optional<double> current_key;
-        if (!timing.decidable) {
-            if (auto output_progress = effect->transformed_progress(); output_progress.has_value())
+        if (purpose == AnimationSamplePurpose::CommitStyles || !timing.decidable) {
+            auto endpoint_inclusive = purpose == AnimationSamplePurpose::CommitStyles
+                ? Animations::AnimationEffect::EndpointInclusiveActiveInterval::Yes
+                : Animations::AnimationEffect::EndpointInclusiveActiveInterval::No;
+            if (auto output_progress = effect->transformed_progress(endpoint_inclusive); output_progress.has_value())
                 current_key = clamp(*output_progress * 100.0 * Animations::KeyframeEffect::AnimationKeyFrameKeyScaleFactor, static_cast<double>(NumericLimits<i64>::min()), static_cast<double>(NumericLimits<i64>::max()));
         }
         easing_points.unchecked_append({});
@@ -733,16 +738,44 @@ NonnullOwnPtr<StyleComputer::AnimationSample> StyleComputer::begin_animation_sam
         .length_contexts = [](void* context, u8 container_relative_length_unit_mask, ComputedValuesFFI::FfiAnimationLengthContexts* contexts) {
             auto& sample = *static_cast<SampleContext*>(context);
             // Each context is the sampled element's own, built afresh: a batch builds several elements' contexts in one call.
-            auto length_context_for = [&](PropertyID property_id) {
+            auto length_context_for = [&](LengthResolutionPhase phase) {
                 return to_ffi_length_resolution_context_with_container_bases(
-                    sample.style_computer->make_computation_context_for_property(property_id, sample.computed_properties, sample.abstract_element).length_resolution_context,
+                    sample.style_computer->make_length_resolution_context(phase, sample.computed_properties, sample.abstract_element),
                     container_relative_length_unit_mask);
             };
-            contexts->font = length_context_for(PropertyID::FontFamily);
-            contexts->line_height = length_context_for(PropertyID::LineHeight);
-            contexts->remaining = length_context_for(PropertyID::Color); },
+            contexts->font = length_context_for(LengthResolutionPhase::Font);
+            contexts->line_height = length_context_for(LengthResolutionPhase::LineHeight);
+            contexts->remaining = length_context_for(LengthResolutionPhase::Remaining); },
     };
     return sample;
+}
+
+Animations::BaseKeyframe::ParsedProperties StyleComputer::compute_css_keyframe_values(DOM::AbstractElement element, Vector<Animations::BaseKeyframe>& frames, Optional<Animations::KeyframeEffect::KeyFrameSet::StyleSheetResourceContext> const& resource_context) const
+{
+    Layout::ForcedReadScope read { element.element().document() };
+    auto properties = reconstruct_computed_properties_for_animation(element.installed_style());
+    auto sample = begin_animation_sample(read, element, {}, *properties, AnimationSamplePurpose::KeyframeReflection);
+    Vector<ComputedValuesFFI::FfiReflectedKeyframeProperty> declarations;
+    for (size_t i = 0; i < frames.size(); ++i) {
+        for (auto const& [property, value] : frames[i].parsed_properties()) {
+            declarations.append({ i, to_underlying(property.id()), value.data() });
+        }
+    }
+    ComputedValuesFFI::FfiStyleSheetResourceContext context {};
+    if (resource_context.has_value()) {
+        auto bytes = resource_context->base_url.bytes();
+        context = { bytes.data(), bytes.size(), true, resource_context->origin_clean };
+    }
+    Vector<Animations::BaseKeyframe::ParsedProperties> computed;
+    computed.resize(frames.size() + 1);
+    ComputedValuesFFI::rust_compute_css_keyframe_values(&sample->input, read, declarations.data(), declarations.size(), frames.size(), &context, &computed,
+        [](void* context, size_t index, u16 property, auto* value) {
+            auto& computed = *static_cast<Vector<Animations::BaseKeyframe::ParsedProperties>*>(context);
+            computed[index].set(PropertyNameAndID::from_id(static_cast<PropertyID>(property)), RustStyleValueHandle::retained(value));
+        });
+    for (size_t i = 0; i < frames.size(); ++i)
+        frames[i].properties = move(computed[i]);
+    return move(computed.last());
 }
 
 void StyleComputer::finish_animation_sample(AnimationSample& sample, ComputedValuesFFI::FfiHostAnimationSampleResult const& result) const
@@ -752,11 +785,11 @@ void StyleComputer::finish_animation_sample(AnimationSample& sample, ComputedVal
     // What the substituted values read is what the element's style now depends on, as for a value its cascade
     // substituted.
     auto& element = abstract_element.element();
-    if (result.substitution_marks & ComputedValuesFFI::SUBSTITUTION_MARK_ATTR)
+    if (sample.purpose == AnimationSamplePurpose::Rendering && result.substitution_marks & ComputedValuesFFI::SUBSTITUTION_MARK_ATTR)
         element.set_style_uses_attr_css_function();
-    if (result.substitution_marks & ComputedValuesFFI::SUBSTITUTION_MARK_IF)
+    if (sample.purpose == AnimationSamplePurpose::Rendering && result.substitution_marks & ComputedValuesFFI::SUBSTITUTION_MARK_IF)
         element.set_style_uses_if_css_function();
-    if (result.substitution_marks & ComputedValuesFFI::SUBSTITUTION_MARK_CUSTOM_FUNCTION)
+    if (sample.purpose == AnimationSamplePurpose::Rendering && result.substitution_marks & ComputedValuesFFI::SUBSTITUTION_MARK_CUSTOM_FUNCTION)
         element.set_style_uses_custom_function();
 
     switch (result.outcome) {
@@ -773,7 +806,7 @@ void StyleComputer::finish_animation_sample(AnimationSample& sample, ComputedVal
         computed_properties.set_depends_on_viewport_metrics();
     if (result.font_metrics_depend_on_viewport_metrics)
         computed_properties.set_font_metrics_depend_on_viewport_metrics();
-    if (result.uses_tree_counting_function)
+    if (sample.purpose == AnimationSamplePurpose::Rendering && result.uses_tree_counting_function)
         element.set_style_uses_tree_counting_function();
     for (auto const& property : ReadonlySpan<ComputedValuesFFI::FfiAnimatedCustomPropertyResult> { result.animated_custom_properties, result.animated_custom_property_count }) {
         auto value = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(static_cast<StyleValueFFI::StyleValueData const*>(property.value)));
@@ -1139,6 +1172,16 @@ RequiredInvalidationAfterStyleChange StyleComputer::run_transition_step_for_inst
     StyleEngineFFI::FfiAnimationOverlayPublication publication;
     publish_sampled_animation_overlays(read, { &overlay, 1 }, { &publication, 1 });
     element.refresh_computed_style(read, pseudo_element, InstalledStyle::adopt(publication.record));
+    // NB: refresh_computed_style() shows the new record on the element's own layout node. A transition that starts
+    //     with an inherited property moves what that node's anonymous descendants inherit, too, and applying the
+    //     style reaches them; otherwise they show the after-change value until the next animation frame.
+    auto* layout_node = pseudo_element.has_value() ? element.pseudo_element_unsafe_layout_node(read, *pseudo_element) : element.unsafe_layout_node(read);
+    if (layout_node) {
+        if (publication.invalidation.requires_layout_node_style_application)
+            layout_node->apply_style(element.style_record_identity(pseudo_element));
+        else if (publication.invalidation.requires_style_resource_update)
+            layout_node->attach_style_resources();
+    }
     if (auto* svg_element = as_if<SVG::SVGElement>(element); svg_element && !pseudo_element.has_value())
         svg_element->note_svg_paint_resource_description_may_have_changed();
     return decode_style_invalidation(publication.invalidation.invalidation);
@@ -1200,9 +1243,9 @@ RefPtr<ComputedStyleWorkingSet> StyleComputer::start_needed_transitions(Layout::
     // A transition action is provisional until the stabilization epoch commits; a later pass of the epoch decides
     // again, superseding the decision of this one.
     auto decide = [&](ProvisionalTransitionState& state, StyleValueFFI::FfiTransitionActionKind action) {
-        ++document().style_invalidation_counters().provisional_transition_decisions;
+        HTML::note_rendering_trace_event("provisional transition decision"sv);
         if (state.has_decision)
-            ++document().style_invalidation_counters().superseded_provisional_transition_decisions;
+            HTML::note_rendering_trace_event("provisional transition decision superseded"sv);
         state.has_decision = true;
         if (state.proposed_transition)
             state.proposed_transition->discard_provisional_transition();
@@ -1529,50 +1572,7 @@ CSSPixels StyleComputer::default_user_font_size()
     return 16;
 }
 
-// https://w3c.github.io/csswg-drafts/css-fonts/#absolute-size-mapping
-CSSPixels StyleComputer::absolute_size_mapping(AbsoluteSize absolute_size, CSSPixels default_font_size)
-{
-    // An <absolute-size> keyword refers to an entry in a table of font sizes computed and kept by the user agent. See
-    // § 2.5.1 Absolute Size Keyword Mapping Table.
-    // INTEROP: Other browsers share this keyword table for integral default sizes from 9px through 16px, so we use
-    //          it instead of the ratios from the spec's guideline table.
-    static constexpr Array<Array<u8, 8>, 8> font_size_table { {
-        { 9, 9, 9, 9, 11, 14, 18, 27 },
-        { 9, 9, 9, 10, 12, 15, 20, 30 },
-        { 9, 9, 10, 11, 13, 17, 22, 33 },
-        { 9, 9, 10, 12, 14, 18, 24, 36 },
-        { 9, 10, 12, 13, 16, 20, 26, 39 },
-        { 9, 10, 12, 14, 17, 21, 28, 42 },
-        { 9, 10, 13, 15, 18, 23, 30, 45 },
-        { 9, 10, 13, 16, 18, 24, 32, 48 },
-    } };
-    auto default_size = default_font_size.to_int();
-    if (default_size >= 9 && default_size <= 16 && default_font_size == CSSPixels(default_size))
-        return CSSPixels(font_size_table[default_size - 9][to_underlying(absolute_size)]);
-
-    switch (absolute_size) {
-    case AbsoluteSize::XxSmall:
-        return default_font_size * CSSPixels(3) / 5;
-    case AbsoluteSize::XSmall:
-        return default_font_size * CSSPixels(3) / 4;
-    case AbsoluteSize::Small:
-        return default_font_size * CSSPixels(8) / 9;
-    case AbsoluteSize::Medium:
-        return default_font_size;
-    case AbsoluteSize::Large:
-        return default_font_size * CSSPixels(6) / 5;
-    case AbsoluteSize::XLarge:
-        return default_font_size * CSSPixels(3) / 2;
-    case AbsoluteSize::XxLarge:
-        return default_font_size * 2;
-    case AbsoluteSize::XxxLarge:
-        return default_font_size * 3;
-    }
-
-    VERIFY_NOT_REACHED();
-}
-
-ComputationContext StyleComputer::make_computation_context_for_property(PropertyID property_id, ComputedStyleWorkingSet const& style, Optional<DOM::AbstractElement> abstract_element) const
+Length::ResolutionContext StyleComputer::make_length_resolution_context(LengthResolutionPhase phase, ComputedStyleWorkingSet const& style, Optional<DOM::AbstractElement> abstract_element) const
 {
     auto subject_inline_axis_is_horizontal = [&]() {
         auto writing_mode = [&](DOM::AbstractElement const& candidate) -> Optional<WritingMode> {
@@ -1593,95 +1593,45 @@ ComputationContext StyleComputer::make_computation_context_for_property(Property
     bool const is_document_element = abstract_element.has_value()
         && !abstract_element->pseudo_element().has_value()
         && abstract_element->element().is_document_element();
+    bool const subject_is_pseudo_element = abstract_element.has_value() && abstract_element->pseudo_element().has_value();
+    auto const* subject_element = abstract_element.has_value() ? &abstract_element->element() : nullptr;
+    // NB: The remaining properties read nothing from the parent, so they skip looking for it.
+    auto inheritance_parent = phase == LengthResolutionPhase::Remaining
+        ? Optional<DOM::AbstractElement> {}
+        : abstract_element.map([](auto& element) { return element.element_to_inherit_style_from(); }).value_or(OptionalNone {});
 
-    switch (property_id) {
-    // FIXME: While `color-scheme` doesn't actually require a computation context (since it only takes keyword values),
-    //        callers request one uniformly. Since `color-scheme` must be computed before creating a generic computation
-    //        context, use the font context instead.
-    case PropertyID::ColorScheme:
-    case PropertyID::FontFamily:
-    case PropertyID::FontFeatureSettings:
-    case PropertyID::FontKerning:
-    case PropertyID::FontOpticalSizing:
-    case PropertyID::FontSize:
-    case PropertyID::FontSizeAdjust:
-    case PropertyID::FontStyle:
-    case PropertyID::FontVariantAlternates:
-    case PropertyID::FontVariantCaps:
-    case PropertyID::FontVariantEastAsian:
-    case PropertyID::FontVariantEmoji:
-    case PropertyID::FontVariantLigatures:
-    case PropertyID::FontVariantNumeric:
-    case PropertyID::FontVariantPosition:
-    case PropertyID::FontVariationSettings:
-    case PropertyID::FontWeight:
-    case PropertyID::FontWidth:
-    case PropertyID::MathDepth:
-    case PropertyID::TextRendering: {
-        auto inheritance_parent = abstract_element.map([](auto& element) { return element.element_to_inherit_style_from(); }).value_or(OptionalNone {});
+    if (phase == LengthResolutionPhase::Font) {
         auto length_resolution_context = inheritance_parent.has_value() && inheritance_parent->has_style() && inheritance_parent->element().navigable()
             ? Length::ResolutionContext::for_element(inheritance_parent.value())
             : Length::ResolutionContext::for_document(m_document);
         length_resolution_context.subject_inline_axis_is_horizontal = subject_inline_axis_is_horizontal;
-        length_resolution_context.subject_element = abstract_element.has_value() ? &abstract_element->element() : nullptr;
-        length_resolution_context.subject_is_pseudo_element = abstract_element.has_value() && abstract_element->pseudo_element().has_value();
-
-        return {
-            .length_resolution_context = length_resolution_context,
-            .abstract_element = abstract_element
-        };
-    }
-    case PropertyID::LineHeight: {
-        auto inheritance_parent = abstract_element.map([](auto& element) { return element.element_to_inherit_style_from(); }).value_or(OptionalNone {});
-
-        auto line_height_font_metrics = Length::FontMetrics {
-            style.font_size(),
-            style.first_available_computed_font(document().font_computer())->pixel_metrics(),
-            inheritance_parent.has_value() && inheritance_parent->has_style() ? inheritance_parent->computed_style()->line_height() : normal_line_height(document().font_computer().initial_font().pixel_metrics())
-        };
-
-        return {
-            .length_resolution_context = {
-                .viewport_rect = viewport_rect(),
-                .font_metrics = line_height_font_metrics,
-                .root_font_metrics = is_document_element
-                    ? line_height_font_metrics
-                    : m_root_element_font_metrics,
-                .font_metrics_depend_on_viewport_metrics = style.font_metrics_depend_on_viewport_metrics(),
-                .root_font_metrics_depend_on_viewport_metrics = is_document_element
-                    ? style.font_metrics_depend_on_viewport_metrics()
-                    : m_root_element_font_metrics_depend_on_viewport_metrics,
-                .subject_inline_axis_is_horizontal = subject_inline_axis_is_horizontal,
-                .subject_is_pseudo_element = abstract_element.has_value() && abstract_element->pseudo_element().has_value(),
-                .subject_element = abstract_element.has_value() ? &abstract_element->element() : nullptr,
-            },
-            .abstract_element = abstract_element
-        };
-    }
-    default: {
-        auto font_metrics = Length::FontMetrics {
-            style.font_size(),
-            style.first_available_computed_font(document().font_computer())->pixel_metrics(),
-            style.line_height(document().font_computer())
-        };
-        return {
-            .length_resolution_context = {
-                .viewport_rect = viewport_rect(),
-                .font_metrics = font_metrics,
-                .root_font_metrics = is_document_element ? font_metrics : m_root_element_font_metrics,
-                .font_metrics_depend_on_viewport_metrics = style.font_metrics_depend_on_viewport_metrics(),
-                .root_font_metrics_depend_on_viewport_metrics = is_document_element ? style.font_metrics_depend_on_viewport_metrics() : m_root_element_font_metrics_depend_on_viewport_metrics,
-                .subject_inline_axis_is_horizontal = subject_inline_axis_is_horizontal,
-                .subject_is_pseudo_element = abstract_element.has_value() && abstract_element->pseudo_element().has_value(),
-                .subject_element = abstract_element.has_value() ? &abstract_element->element() : nullptr,
-            },
-            .abstract_element = abstract_element,
-            .color_scheme = style.color_scheme(document().page().preferred_color_scheme(), document().supported_color_schemes())
-        };
-    }
+        length_resolution_context.subject_element = subject_element;
+        length_resolution_context.subject_is_pseudo_element = subject_is_pseudo_element;
+        return length_resolution_context;
     }
 
-    VERIFY_NOT_REACHED();
+    auto line_height = [&]() -> CSSPixels {
+        if (phase == LengthResolutionPhase::Remaining)
+            return style.line_height(document().font_computer());
+        if (inheritance_parent.has_value() && inheritance_parent->has_style())
+            return inheritance_parent->computed_style()->line_height();
+        return normal_line_height(document().font_computer().initial_font().pixel_metrics());
+    }();
+    auto font_metrics = Length::FontMetrics {
+        style.font_size(),
+        style.first_available_computed_font(document().font_computer())->pixel_metrics(),
+        line_height
+    };
+    return {
+        .viewport_rect = m_viewport_rect,
+        .font_metrics = font_metrics,
+        .root_font_metrics = is_document_element ? font_metrics : m_root_element_font_metrics,
+        .font_metrics_depend_on_viewport_metrics = style.font_metrics_depend_on_viewport_metrics(),
+        .root_font_metrics_depend_on_viewport_metrics = is_document_element ? style.font_metrics_depend_on_viewport_metrics() : m_root_element_font_metrics_depend_on_viewport_metrics,
+        .subject_inline_axis_is_horizontal = subject_inline_axis_is_horizontal,
+        .subject_is_pseudo_element = subject_is_pseudo_element,
+        .subject_element = subject_element,
+    };
 }
 
 static ComputedValuesFFI::FfiInputLineHeightMetrics input_line_height_metrics(ComputedStyleWorkingSet const& style, DOM::AbstractElement abstract_element, bool should_measure)
@@ -1714,7 +1664,7 @@ StyleRecordID StyleComputer::intern_document_style(Layout::BegunRead const& read
             document_supported_color_scheme_codes.unchecked_append(to_underlying(preferred_color_scheme_from_string(scheme)));
     }
     auto length_resolution_context = CSS::Length::ResolutionContext::for_document(document());
-    auto viewport_rect = this->viewport_rect();
+    auto viewport_rect = m_viewport_rect;
     ComputedValuesFFI::FfiDocumentLonghandInput const input {
         .color_scheme_input = {
             .preferred_color_scheme = static_cast<u8>(to_underlying(document().page().preferred_color_scheme())),
@@ -1745,8 +1695,10 @@ void StyleComputer::publish_sampled_animation_overlays(Layout::BegunRead const& 
         ComputedStyleWorkingSet const& style;
         GC::Ref<DOM::Document const> document;
         TreeScopeID tree_scope;
+
+        void visit_edges(GC::Cell::Visitor& visitor) { visitor.visit(document); }
     };
-    GC::ConservativeVector<OverlayFont, 1> fonts;
+    GC::RootVector<OverlayFont, 1> fonts;
     Vector<StyleEngineFFI::FfiAnimationOverlayPublicationInput, 1> inputs;
     fonts.ensure_capacity(overlays.size());
     inputs.ensure_capacity(overlays.size());
@@ -1819,7 +1771,7 @@ RefPtr<ComputedValues const> StyleComputer::engine_transient_pseudo_element_styl
         return {};
     auto view = computed_style_record_view(style);
     // The engine holds the record only until the element's styles are next read or settled.
-    return ComputedValues::Builder { *view }.build();
+    return view->clone();
 }
 
 NonnullRefPtr<ComputedStyleWorkingSet> StyleComputer::reconstruct_computed_properties(ComputedValues const& computed_values) const

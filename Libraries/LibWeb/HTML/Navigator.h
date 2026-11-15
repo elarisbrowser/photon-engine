@@ -76,6 +76,7 @@ public:
 
     GC::Ref<MediaCapabilitiesAPI::MediaCapabilities> media_capabilities();
     GC::Ref<MediaCapture::MediaDevices> media_devices();
+    void webkit_get_user_media(MediaCapture::MediaStreamConstraints const&, GC::Ref<WebIDL::CallbackType> success_callback, GC::Ref<WebIDL::CallbackType> error_callback);
     GC::Ptr<MediaCapture::MediaDevices> media_devices_if_created() const { return m_media_devices; }
 
     static WebIDL::Long max_touch_points();
@@ -88,7 +89,7 @@ protected:
 private:
     explicit Navigator(Window&);
 
-    virtual URL::URL navigator_id_url() const override;
+    virtual EnvironmentSettingsObject const& navigator_id_settings_object() const override { return navigator_storage_settings_object(); }
 
     // ^StorageAPI::NavigatorStorage
     virtual EnvironmentSettingsObject& navigator_storage_settings_object() const override;

@@ -1,23 +1,16 @@
 ladybird_test_suite(Compositor)
 
 set(TEST_SOURCES
-    TestAsyncScrollTree.cpp
-    TestBackingStoreManager.cpp
     TestBitmapExport.cpp
     TestCanvasSurfaceRegistry.cpp
-    TestContextState.cpp
-    TestScrollbarController.cpp
     TestVideoFrameHolds.cpp
     TestVSyncScheduler.cpp
 )
 
 # These drive Skia directly, and the compositor keeps its Skia dependency private.
 list(APPEND TEST_SOURCES
-    BenchmarkForceDarkImageFilter.cpp
-    TestDisplayListImageFilters.cpp
     TestForceDarkImageFilter.cpp
     TestPaintingSurface.cpp
-    TestPhotonGaneshPersistentCache.cpp
     TestYUVData.cpp
 )
 

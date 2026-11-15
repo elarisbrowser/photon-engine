@@ -8,7 +8,6 @@
 #include <AK/JsonArray.h>
 #include <AK/JsonObject.h>
 #include <AK/NeverDestroyed.h>
-#include <AK/QuickSort.h>
 #include <AK/WeakPtr.h>
 #include <LibCore/ElapsedTimer.h>
 #include <LibCore/EventLoop.h>
@@ -37,7 +36,7 @@
 #include <LibWebView/GamepadManager.h>
 #include <LibWebView/HSTSStore.h>
 #include <LibWebView/HelperProcess.h>
-#include <LibWebView/HistoryStore.h>
+#include <LibWebView/ImageDecoderManager.h>
 #include <LibWebView/NavigationLoader.h>
 #include <LibWebView/NotificationManager.h>
 #include <LibWebView/PermissionManager.h>
@@ -49,7 +48,7 @@
 #include <LibWebView/WebContentTestClient.h>
 #include <LibWebView/WebDriverBiDi.h>
 #include <LibWebView/WebUI.h>
-#include <LibWebView/WorkerProcessManager.h>
+#include <LibWebView/WorkerAgentManager.h>
 
 namespace WebView {
 
@@ -59,6 +58,66 @@ Messages::WebContentClient::DidAddBlobUrlEntryResponse WebContentClient::did_add
         return page->did_add_blob_url_entry(move(environment_id), move(url), move(entry));
 
     return URL::BlobURLEntry::Token { 0 };
+}
+
+void WebContentClient::did_remove_blob_url_entries(Web::PageId page_id, Web::HTML::EnvironmentId environment_id, Vector<Utf16String> urls)
+{
+    if (auto* page = this->page(page_id)) {
+        page->did_remove_blob_url_entries(move(environment_id), move(urls));
+        return;
+    }
+
+    // NB: A closed page's environments went with it, so its process can only revoke the entries it added itself.
+    if (may_act_for_page(page_id))
+        m_session->blob_url_store->remove_entries_added_by(urls, WeakPtr<WebContentClient> { *this });
+}
+
+void WebContentClient::close_worker_agent(Web::PageId page_id, Web::HTML::WorkerAgentId agent_id, Web::HTML::WorkerAgentOwnerToken owner_token)
+{
+    // NB: A page's workers are closed as its documents are destroyed, which happens after the tab's page has closed.
+    if (may_act_for_page(page_id))
+        WorkerAgentManager::the().close_worker_agent(*this, agent_id, owner_token);
+}
+
+void WebContentClient::note_hosted_document(CanonicalDocument const& document)
+{
+    // NB: An about:blank document starts out empty, and its origin is that of a document the process already hosts or
+    //     an opaque one that nothing else can script.
+    if (m_has_hosted_more_than_tabs_of_one_origin || Web::HTML::url_matches_about_blank(document.creation_url()))
+        return;
+
+    auto const& origin = document.origin();
+    if (document.may_share_a_process_with_tabs_of_its_origin()) {
+        if (!m_origin_of_hosted_tabs.has_value()) {
+            m_origin_of_hosted_tabs = origin;
+            m_hosted_tabs_are_origin_keyed = document.relevant_global_object().agent().agent_cluster_is_origin_keyed();
+        }
+        if (has_hosted_only_tabs_like(document))
+            return;
+    } else if (!document.is_top_level() && m_origin_of_hosted_tabs.has_value()) {
+        // NB: A data: URL iframe is hosted in the process of the document that made it, and holds only what that
+        //     document already had.
+        if (origin.is_opaque()) {
+            if (document.creation_url().scheme() == "data"sv)
+                return;
+        } else if (m_hosted_tabs_are_origin_keyed ? origin.is_same_origin(*m_origin_of_hosted_tabs) : origin.is_same_site(*m_origin_of_hosted_tabs)) {
+            return;
+        }
+    }
+
+    m_has_hosted_more_than_tabs_of_one_origin = true;
+    m_origin_of_hosted_tabs.clear();
+}
+
+bool WebContentClient::has_hosted_only_tabs_like(CanonicalDocument const& document) const
+{
+    return m_origin_of_hosted_tabs == document.origin()
+        && m_hosted_tabs_are_origin_keyed == document.relevant_global_object().agent().agent_cluster_is_origin_keyed();
+}
+
+bool WebContentClient::has_hosted_only_tabs_unlike(CanonicalDocument const& document) const
+{
+    return m_origin_of_hosted_tabs.has_value() && !has_hosted_only_tabs_like(document);
 }
 
 bool WebContentClient::hosts_an_environment_with_storage_key(Web::StorageAPI::StorageKey const& storage_key)
@@ -108,6 +167,7 @@ Messages::WebContentClient::DidRequestBlobUrlEntryResponse WebContentClient::did
 void WebContentClient::connect_test_endpoint(NonnullOwnPtr<IPC::Transport> transport)
 {
     m_test_connection = make_ref_counted<WebContentTestClient>(move(transport), *this);
+    GamepadManager::the().client_did_connect_test_endpoint(*this);
 }
 
 void WebContentClient::remove_blob_url_entries()
@@ -125,10 +185,10 @@ static constexpr auto detached_page_close_timeout_ms = 1000;
 static constexpr auto close_server_exit_timeout_ms = 5000;
 static constexpr auto detached_page_forced_exit_timeout_ms = detached_page_close_timeout_ms + close_server_exit_timeout_ms;
 
-WebContentClient::WebContentClient(NonnullOwnPtr<IPC::Transport> transport, IsPrivate is_private, Web::PageId initial_page_id, Web::HTML::CrossProcessId root_navigable_id)
+WebContentClient::WebContentClient(NonnullOwnPtr<IPC::Transport> transport, BrowsingSession& session, Web::PageId initial_page_id, Web::HTML::CrossProcessId root_navigable_id)
     : IPC::ConnectionToServer<WebContentClientEndpoint, WebContentServerEndpoint, WebContentClientPageRoutingStub>(*this, move(transport))
-    , m_is_private(is_private)
-    , m_session(Application::existing_session(is_private))
+    , m_is_private(session.is_private())
+    , m_session(session)
     , m_request_server_site_bindings([this](RequestServerClientConnection& connection, Optional<Utf16String> const& top_level_site) {
         async_connect_to_request_server(move(connection.handle), connection.client_id, top_level_site);
     })
@@ -137,7 +197,6 @@ WebContentClient::WebContentClient(NonnullOwnPtr<IPC::Transport> transport, IsPr
     , m_audio_tab_id(allocate_audio_tab_id())
 {
     VERIFY(initial_page_id > 0);
-    VERIFY(m_session);
     clients().set(this);
 }
 
@@ -149,7 +208,7 @@ WebContentClient::~WebContentClient()
     cancel_navigation_transactions();
     remove_blob_url_entries();
     StorageAreaRegistry::the().remove_listener(*this);
-    WorkerProcessManager::the().remove_web_content_owner(*this);
+    WorkerAgentManager::the().remove_web_content_owner(*this);
     GamepadManager::the().client_disconnected(*this);
     clients().remove(this);
 }
@@ -302,7 +361,13 @@ void WebContentClient::close_page_of_closed_tab(Web::PageId page_id)
         // e.g. because the user requested a forced close.
         if (page->needs_beforeunload_check())
             page->set_detached_close_pending(false);
+        // NB: The process can stay alive for other pages or for a shared worker, and the document must not go on in it.
+        //     Its close steps run through the traversable that is going away, so it cannot close by itself.
+        if (!page->detached_close_pending() || WorkerAgentManager::the().hosts_shared_worker(*this))
+            page->async_discard_embedded_page();
         PictureInPictureManager::the().close_window_and_its_page(*page);
+        // NB: Other tabs can keep the process alive, so its page has to go as well.
+        page->async_discard_embedded_page();
         page->close();
     }
     // Forgotten once the page is closed, so nothing registers it again.
@@ -325,6 +390,7 @@ void WebContentClient::register_embedded_page(Web::PageId page_id, CanonicalTrav
     Application::process_manager().cancel_forced_exit(child_id());
 
     page.view().send_preferences_to_page(page);
+    page.view().send_force_dark_to_embedded_page(page);
     if (Application::browser_options().webdriver_browser_endpoint.has_value())
         Application::the().push_webdriver_session_config(page);
     page.async_set_has_focus(traversable.has_system_focus());
@@ -429,12 +495,18 @@ Optional<CanonicalNavigable&> WebContentClient::hosted_navigable(Web::HTML::Cros
 
 void WebContentClient::close_server_if_unused()
 {
+    if (m_requested_close)
+        return;
+
     bool any_detached_close_pending = false;
     for (auto const& page : m_pages) {
         if (page.value->is_open())
             return;
         any_detached_close_pending |= page.value->detached_close_pending();
     }
+
+    if (WorkerAgentManager::the().hosts_shared_worker(*this))
+        return;
 
     if (!any_detached_close_pending) {
         if (m_detached_page_close_timer)
@@ -498,6 +570,7 @@ void WebContentClient::replay_compositor_view_state_after_reconnect(Badge<Applic
         if (!m_compositor_contexts.contains(context_id))
             continue;
         auto& view = page->view();
+        view.recreate_remote_layer_after_compositor_reconnect({});
         Application::the().update_compositor_viewport(context_id, view.viewport_size().to_type<int>(), view.device_pixel_ratio());
         Application::the().update_compositor_display_metadata(context_id, view.display_id(), view.maximum_frames_per_second());
         Application::the().update_compositor_context_visibility(context_id, view.traversable().system_visibility_state());
@@ -683,7 +756,7 @@ Messages::WebContentClient::DidRequestCookieResponse WebContentClient::did_reque
         return HTTP::Cookie::VersionedCookie {};
 
     HTTP::Cookie::VersionedCookie cookie;
-    cookie.cookie = m_session->cookie_jar->get_cookie(url, source, {});
+    cookie.cookie = m_session->cookie_jar->get_cookie(url, source, {}, HTTP::Cookie::SameSiteContext::same_site());
     return cookie;
 }
 
@@ -768,10 +841,10 @@ Messages::WebContentClient::DidStartDownloadWithoutRequestResponse WebContentCli
     return Optional<u64> {};
 }
 
-Messages::WebContentClient::DidStartDownloadResponse WebContentClient::did_start_download(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> navigation_id, URL::URL url, ByteString suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data, JsonValue network_response)
+Messages::WebContentClient::DidStartDownloadResponse WebContentClient::did_start_download(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> navigation_id, URL::URL url, ByteString suggested_filename, Optional<u64> total_size, HTTP::Cookie::SameSiteContext same_site_context, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data, JsonValue network_response)
 {
     if (auto* page = this->page(page_id))
-        return page->did_start_download(navigable_id, move(navigation_id), move(url), move(suggested_filename), total_size, request_server_client_id, request_server_request_id, move(initial_data), move(network_response));
+        return page->did_start_download(navigable_id, move(navigation_id), move(url), move(suggested_filename), total_size, same_site_context, request_server_client_id, request_server_request_id, move(initial_data), move(network_response));
 
     return Optional<u64> {};
 }
@@ -789,7 +862,13 @@ Messages::WebContentClient::StartWorkerAgentResponse WebContentClient::start_wor
     if (auto* page = this->page(page_id))
         return page->start_worker_agent(move(request));
 
-    return Web::HTML::WorkerAgentId {};
+    return { Web::HTML::WorkerAgentId {}, Optional<IPC::TransportHandle> {}, false };
+}
+
+void WebContentClient::register_dedicated_worker(Web::PageId page_id, Web::HTML::WorkerAgentStartRequest request, IPC::TransportHandle worker_transport)
+{
+    if (auto* page = this->page(page_id))
+        page->register_dedicated_worker(move(request), move(worker_transport));
 }
 
 void WebContentClient::did_close_browsing_context(Web::PageId page_id)
@@ -815,11 +894,6 @@ void WebContentClient::did_update_cookie(HTTP::Cookie::Cookie cookie)
     }
 
     m_session->cookie_jar->update_cookie(cookie);
-}
-
-void WebContentClient::did_update_managed_heap_bytes(u64 bytes)
-{
-    m_managed_heap_bytes = bytes;
 }
 
 Messages::WebContentClient::DidIsKnownHstsHostResponse WebContentClient::did_is_known_hsts_host(String domain)
@@ -922,18 +996,24 @@ ErrorOr<void> WebContentClient::ensure_audio_server_controller()
 
 ErrorOr<void> WebContentClient::initialize_audio_server_controller()
 {
-    m_audio_server_client->on_capture_requested = [weak_self = make_weak_ptr<WebContentClient>()](u64 tab_id, u64 request_id, ByteString const&) {
+    m_audio_server_client->on_capture_requested = [weak_self = make_weak_ptr<WebContentClient>()](u64 tab_id, u64 request_id, ByteString const&, Audio::PlaybackGroupId group) {
         auto self = weak_self.strong_ref();
         if (self && tab_id == self->m_audio_tab_id)
-            self->decide_audio_capture_request(request_id);
+            self->decide_audio_capture_request(request_id, group);
     };
-    m_audio_server_audibility.watch(*m_audio_server_client, [weak_self = make_weak_ptr<WebContentClient>()](u64 tab_id, Audio::PlaybackGroupId group, Audio::Audibility audibility) {
-        auto self = weak_self.strong_ref();
-        if (!self || tab_id != self->m_audio_tab_id)
-            return false;
-        // A report of sound can trail the revocation of the page's authorization.
-        return audibility == Audio::Audibility::Inaudible || self->m_authorized_audio_playback_groups.contains(group);
-    });
+    m_audio_server_activity.watch(
+        *m_audio_server_client,
+        [weak_self = make_weak_ptr<WebContentClient>()](u64 tab_id, Audio::PlaybackGroupId group, Audio::Audibility audibility) {
+            auto self = weak_self.strong_ref();
+            if (!self || tab_id != self->m_audio_tab_id)
+                return false;
+            // A report of sound can trail the revocation of the page's authorization.
+            return audibility == Audio::Audibility::Inaudible || self->m_authorized_audio_playback_groups.contains(group);
+        },
+        [weak_self = make_weak_ptr<WebContentClient>()](u64 tab_id) {
+            auto self = weak_self.strong_ref();
+            return self && tab_id == self->m_audio_tab_id;
+        });
     if (m_audio_capture_permitted)
         TRY(tell_audio_server_of_capture_permission());
     // A muted group is never heard: the mutes land before the authorizations.
@@ -964,6 +1044,9 @@ ErrorOr<void> WebContentClient::grant_audio_capture_to_file(URL::URL const& url)
 
 void WebContentClient::update_audio_capture_permission()
 {
+    // A page that comes to permit capture, or stops, can take over a stream labelled for no permitting page.
+    update_audio_capture_indicators();
+
     auto permitted = audio_capture_permitted();
     if (permitted == m_audio_capture_permitted)
         return;
@@ -999,29 +1082,63 @@ Messages::WebContentClient::DidRequestPermissionSnapshotResponse WebContentClien
 
 bool WebContentClient::page_may_capture_audio(WebContentPage const& page) const
 {
+    // A new page has no view until the chrome makes one, and replacing a window can get here before that.
+    auto view = page.traversable().view();
+    if (!view.has_value())
+        return false;
+
+    // A window that is part of a tab has the tab's grant, whichever document its process has it show.
+    auto tab_view = view->tab_view();
+    if (!tab_view.has_value())
+        return false;
+
     // The top-level document's origin, which a popup on about:blank has from its opener; only a file page is left with
     // an opaque one, and reads its own grant by URL.
-    auto origin = page.view().permission_origin();
-    if (origin.is_opaque())
-        return m_audio_capture_grants.contains(audio_capture_permission_key(page.view().url()));
+    auto origin = tab_view->permission_origin();
+    if (origin.is_opaque()) {
+        // NB: The global default binds a file: page too; its own grant only matters while sites may ask.
+        if (session().permission_manager->global_default(Web::Permissions::PermissionName::Microphone) == Web::Permissions::EffectiveState::Denied)
+            return false;
+        return m_audio_capture_grants.contains(audio_capture_permission_key(tab_view->url()));
+    }
     return session().permission_manager->effective_state(Web::Permissions::PermissionName::Microphone, origin) == Web::Permissions::EffectiveState::Granted;
 }
 
+// A tab's grant reaches only the documents whose permissions policy allows them the microphone. A window that is part of
+// the tab is held to the document it acts for too, or an iframe could get past its policy by opening a window.
+bool WebContentClient::page_permits_audio_capture(WebContentPage const& page) const
+{
+    if (!page.is_open() || !page_may_capture_audio(page))
+        return false;
+
+    auto microphone = Web::PermissionsPolicy::PolicyControlledFeature::Microphone;
+    if (auto const* owner_document = page.view().owner_document(); owner_document && !owner_document->is_allowed_to_use(microphone))
+        return false;
+    return page.hosts_a_document_allowed_to_use(microphone);
+}
+
+// The process may capture if it hosts a page that permits it, as it can act for any document it hosts.
 WebContentPage* WebContentClient::page_permitting_audio_capture() const
 {
-    // A tab's grant reaches only the documents whose permissions policy allows them the microphone. The process may
-    // capture if it hosts one, as it can act for any document it hosts.
     for (auto const& it : m_pages) {
-        auto const& page = it.value;
-        if (!page->is_open() || !page_may_capture_audio(*page))
-            continue;
-        if (page->hosts_a_document_allowed_to_use(Web::PermissionsPolicy::PolicyControlledFeature::Microphone))
-            return page.ptr();
+        if (page_permits_audio_capture(*it.value))
+            return it.value.ptr();
     }
     return nullptr;
 }
 
-void WebContentClient::decide_audio_capture_request(u64 request_id)
+// WebContent derives the group of a page's sound from the page's ID too.
+static Audio::PlaybackGroupId audio_playback_group(Web::PageId page_id)
+{
+    return Audio::PlaybackGroupId { page_id.value() };
+}
+
+static Web::PageId page_id_of_audio_playback_group(Audio::PlaybackGroupId group)
+{
+    return Web::PageId { group.value() };
+}
+
+void WebContentClient::decide_audio_capture_request(u64 request_id, Audio::PlaybackGroupId group)
 {
     auto* page = page_permitting_audio_capture();
     if (!page) {
@@ -1029,10 +1146,16 @@ void WebContentClient::decide_audio_capture_request(u64 request_id)
         return;
     }
 
+    // The renderer names the page it captures for, so the name only says where the user hears of a refusal, and only
+    // for a page that permits capture.
+    if (auto* named_page = this->page(page_id_of_audio_playback_group(group)); named_page && page_permits_audio_capture(*named_page))
+        page = named_page;
+
+    // A page that permits capture is part of a tab, which is where the user hears of the answer.
+    auto tab_view = page->view().tab_view();
+
     // Only a site the user allowed gets the system to ask the user, if it never has.
-    // FIXME: The AudioServer doesn't say which page asked to capture, so a refusal is told in the tab of the first page
-    //        that may capture, which needn't be the one that asked.
-    page->view().ensure_microphone_authorization([weak_self = make_weak_ptr<WebContentClient>(), request_id](bool authorized) {
+    tab_view->ensure_microphone_authorization([weak_self = make_weak_ptr<WebContentClient>(), request_id](bool authorized) {
         auto self = weak_self.strong_ref();
         if (!self || !self->m_audio_server_client || !self->m_audio_server_client->is_open())
             return;
@@ -1049,23 +1172,37 @@ void WebContentClient::send_audio_capture_decision(u64 request_id, bool allowed)
     m_audio_server_client->async_capture_decided(request_id, allowed);
 }
 
+// The AudioServer counts every capture stream of the process, but the renderer labels them, so a label counts only for a
+// page that permits capture. A stream with any other label is shown on every such page, as the process could be
+// capturing for any of them.
+void WebContentClient::update_audio_capture_indicators()
+{
+    HashTable<Web::PageId> labelled_pages;
+    auto shown_on_every_permitting_page = false;
+    for (auto group : m_audio_server_activity.capturing_groups()) {
+        if (auto* page = this->page(page_id_of_audio_playback_group(group)); page && page_permits_audio_capture(*page))
+            labelled_pages.set(page->id());
+        else
+            shown_on_every_permitting_page = true;
+    }
+
+    for (auto const& [page_id, page] : m_pages) {
+        auto capturing = labelled_pages.contains(page_id) || (shown_on_every_permitting_page && page_permits_audio_capture(*page));
+        page->set_capturing_audio(capturing);
+    }
+}
+
+void WebContentClient::report_audio_capture_for_testing(Web::PageId labelled_page_id, bool capturing)
+{
+    m_audio_server_activity.set_capturing_for_testing(audio_playback_group(labelled_page_id), capturing);
+}
+
 ErrorOr<void> WebContentClient::tell_audio_server_of_capture_permission()
 {
     auto response = m_audio_server_client->send_sync_but_allow_failure<Messages::AudioServerControl::SetCapturePermission>(m_audio_tab_id, m_audio_capture_permitted);
     if (!response)
         return Error::from_string_literal("Failed to tell the AudioServer of the capture permission");
     return {};
-}
-
-// WebContent derives the group of a page's sound from the page's ID too.
-static Audio::PlaybackGroupId audio_playback_group(Web::PageId page_id)
-{
-    return Audio::PlaybackGroupId { page_id.value() };
-}
-
-static Web::PageId page_id_of_audio_playback_group(Audio::PlaybackGroupId group)
-{
-    return Web::PageId { group.value() };
 }
 
 void WebContentClient::did_change_audio_playback_audibility(Audio::PlaybackGroupId group, Audio::Audibility audibility)
@@ -1093,7 +1230,7 @@ void WebContentClient::revoke_audio_playback(Web::PageId page_id)
         return;
     if (m_audio_server_client && m_audio_server_client->is_open())
         m_audio_server_client->async_revoke_playback_group(m_audio_tab_id, group);
-    m_audio_server_audibility.forget(group);
+    m_audio_server_activity.forget_audibility(group);
 }
 
 void WebContentClient::set_audio_playback_mute_state(Web::PageId page_id, Web::HTML::MuteState mute_state)
@@ -1139,22 +1276,6 @@ Messages::WebContentClient::RequestAudioServerConnectionResponse WebContentClien
     return handle.release_value();
 }
 
-Vector<u64> WebContentClient::performance_owners() const
-{
-    Vector<u64> owners;
-    for (auto const& it : m_pages) {
-        auto const& page = it.value;
-        if (!page->is_open())
-            continue;
-        auto const& view = page->view();
-        auto view_id = view.owner_view_id().value_or(view.view_id());
-        if (!owners.contains([&](auto owner) { return owner == view_id; }))
-            owners.append(view_id);
-    }
-    quick_sort(owners);
-    return owners;
-}
-
 Messages::WebContentClient::RequestWebrtcClientConnectionResponse WebContentClient::request_webrtc_client_connection()
 {
     // A renderer asks again whenever its helper dies, so a helper that keeps crashing, or a renderer that keeps asking,
@@ -1176,79 +1297,58 @@ Messages::WebContentClient::RequestWebrtcClientConnectionResponse WebContentClie
     return handle.release_value();
 }
 
+void WebContentClient::did_host_document_of_site(Utf16String site)
+{
+    if (m_has_hosted_documents_of_several_sites)
+        return;
+    if (m_site_of_hosted_documents.has_value() && *m_site_of_hosted_documents != site) {
+        m_has_hosted_documents_of_several_sites = true;
+        m_site_of_hosted_documents.clear();
+        // Only the processes of one site may share a decoder, so this one asks for its own when it next needs one.
+        if (ImageDecoderManager::the().remove_client_from_decoder_of_site(child_id()))
+            async_disconnect_from_image_decoder();
+        return;
+    }
+    m_site_of_hosted_documents = move(site);
+}
+
+Optional<IPC::TransportHandle> WebContentClient::connect_new_image_decoder_client(Optional<u64>& client_generation)
+{
+    return ImageDecoderManager::the().connect_requesting_process(child_id(), m_session, m_site_of_hosted_documents, client_generation);
+}
+
+Messages::WebContentClient::RequestImageDecoderConnectionResponse WebContentClient::request_image_decoder_connection()
+{
+    return connect_new_image_decoder_client(m_image_decoder_client_generation);
+}
+
+void WebContentClient::did_release_image_decoder()
+{
+    if (auto generation = exchange(m_image_decoder_client_generation, {}); generation.has_value())
+        ImageDecoderManager::the().process_did_release_decoder(child_id(), *generation);
+}
+
+Vector<u64> WebContentClient::performance_owners() const
+{
+    Vector<u64> owners;
+    for (auto const& it : m_pages) {
+        auto const& page = it.value;
+        if (!page->is_open())
+            continue;
+        auto const& view = page->view();
+        auto owner = view.owner_view_id().value_or(view.view_id());
+        if (!owners.contains_slow(owner))
+            owners.append(owner);
+    }
+    return owners;
+}
+
 Optional<u64> WebContentClient::exclusive_performance_owner() const
 {
     auto owners = performance_owners();
     if (owners.size() != 1)
         return {};
     return owners.first();
-}
-
-bool WebContentClient::set_task_queue_diagnostics_enabled(u64 view_id, bool enabled)
-{
-    if (enabled) {
-        bool found_owner = false;
-        for (auto& client : clients()) {
-            if (!client->performance_owners().contains([&](auto owner) { return owner == view_id; }))
-                continue;
-            found_owner = true;
-            if (client->m_task_queue_diagnostics_owners.size() > 0
-                && !client->m_task_queue_diagnostics_owners.contains(view_id))
-                return false;
-        }
-        if (!found_owner)
-            return false;
-    }
-
-    for (auto& client : clients()) {
-        bool was_enabled = !client->m_task_queue_diagnostics_owners.is_empty();
-        if (enabled) {
-            if (!client->performance_owners().contains([&](auto owner) { return owner == view_id; }))
-                continue;
-            client->m_task_queue_diagnostics_owners.set(view_id);
-        } else {
-            client->m_task_queue_diagnostics_owners.remove(view_id);
-        }
-        bool is_enabled = !client->m_task_queue_diagnostics_owners.is_empty();
-        if (was_enabled != is_enabled)
-            client->async_set_task_queue_diagnostics_enabled(is_enabled);
-    }
-    return true;
-}
-
-String WebContentClient::task_queue_diagnostics_json(u64 view_id)
-{
-    JsonArray processes;
-    for (auto& client : clients()) {
-        if (!client->m_task_queue_diagnostics_owners.contains(view_id))
-            continue;
-
-        JsonObject process;
-        process.set("process_id"sv, static_cast<u64>(client->pid()));
-        auto owners = client->performance_owners();
-        process.set("scope"sv, "webcontent_process"sv);
-        process.set("shared_with_other_views"sv, owners.size() > 1);
-        if (auto response = client->send_sync_but_allow_failure<Messages::WebContentServer::GetTaskQueueDiagnostics>()) {
-            auto parsed = JsonValue::from_string(response->diagnostics_json());
-            if (!parsed.is_error()) {
-                process.set("available"sv, true);
-                process.set("diagnostics"sv, parsed.release_value());
-            } else {
-                process.set("available"sv, false);
-                process.set("error"sv, "invalid_engine_diagnostics_json"sv);
-            }
-        } else {
-            process.set("available"sv, false);
-            process.set("error"sv, "webcontent_process_unavailable"sv);
-        }
-        processes.must_append(move(process));
-    }
-
-    JsonObject result;
-    result.set("schema_version"sv, 1);
-    result.set("scope"sv, "webcontent_processes"sv);
-    result.set("processes"sv, move(processes));
-    return result.serialized();
 }
 
 }

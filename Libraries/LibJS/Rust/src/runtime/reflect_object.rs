@@ -13,7 +13,7 @@ use crate::layout::function_object::RawNativeFunction;
 use crate::layout::object::Object;
 use crate::layout::value::Value;
 use crate::layout_forward::RawNativeFunctionPointer;
-use crate::runtime::abstract_operations::{call_function_object, construct, create_list_from_array_like};
+use crate::runtime::abstract_operations::{call_function_object, construct, create_argument_list_from_array_like};
 use crate::runtime::array::Array;
 use crate::runtime::completion::ThrowCompletionOr;
 use crate::runtime::error::ErrorKind;
@@ -53,7 +53,8 @@ impl ReflectObject {
             base: Object::new_with_prototype(
                 vm,
                 Self::CLASS,
-                realm.object_prototype(),
+                realm,
+                Some(realm.object_prototype()),
                 MayInterfereWithIndexedPropertyAccess::No,
             ),
         })
@@ -108,7 +109,7 @@ impl ReflectObject {
         }
 
         // 2. Let args be ? CreateListFromArrayLike(argumentsList).
-        let args = create_list_from_array_like(vm, arguments_list, None)?;
+        let args = create_argument_list_from_array_like(vm, arguments_list)?;
 
         // 3. Perform PrepareForTailCall().
         // 4. Return ? Call(target, thisArgument, args).
@@ -136,7 +137,7 @@ impl ReflectObject {
         }
 
         // 4. Let args be ? CreateListFromArrayLike(argumentsList).
-        let args = create_list_from_array_like(vm, arguments_list, None)?;
+        let args = create_argument_list_from_array_like(vm, arguments_list)?;
 
         // 5. Return ? Construct(target, args, newTarget).
         Ok(Value::from_object(construct(

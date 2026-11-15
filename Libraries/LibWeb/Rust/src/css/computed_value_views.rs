@@ -79,7 +79,7 @@ impl LengthPercentageRef<'_> {
         };
         let ratio = crate::css::style_compute::LENGTH_UNIT_CANONICAL_PX_RATIOS[*unit as usize];
         assert!(ratio.is_finite(), "computed length is not absolute");
-        CssPixels::nearest_value_for(value * ratio)
+        CssPixels::truncated_value_for(f64::from((value * ratio) as f32))
     }
 
     /// Matches Percentage::as_fraction(); the multiplication order is
@@ -161,7 +161,7 @@ impl InlineLengthPercentage {
                 let ratio = crate::css::style_compute::LENGTH_UNIT_CANONICAL_PX_RATIOS[*unit as usize];
                 ratio
                     .is_finite()
-                    .then(|| Self::Length(CssPixels::nearest_value_for(value * ratio)))
+                    .then(|| Self::Length(CssPixels::truncated_value_for(f64::from((value * ratio) as f32))))
             }
             StyleValueData::Percentage { value } => {
                 let narrowed = *value as f32;
@@ -663,6 +663,7 @@ scalar_accessors! {
         align_self_overflow: u8 => align_self_overflow,
         justify_self_overflow: u8 => justify_self_overflow,
         align_content_overflow: u8 => align_content_overflow,
+        justify_content_overflow: u8 => justify_content_overflow,
         flex_basis_is_content: bool => flex_basis.is_content,
     }
 }
@@ -1283,6 +1284,34 @@ impl<'a> ComputedValuesView<'a> {
         )
     }
 
+    /// Whether this box's own style forces it to establish an independent formatting context even where it would
+    /// otherwise share one with its parent, as a subgrid does.
+    ///
+    /// https://drafts.csswg.org/css-grid-2/#subgrid-listing
+    /// If there is no parent grid, or if the grid container is otherwise forced to establish an independent formatting
+    /// context (for example, due to layout containment [CSS-CONTAIN-2] or absolute positioning [CSS-POSITION-3]), the
+    /// used value is the initial value, none, and the grid container is not a subgrid.
+    pub(crate) fn is_forced_to_establish_independent_formatting_context(self) -> bool {
+        if self.is_absolutely_positioned() {
+            return true;
+        }
+        let box_values = self.box_values();
+        // https://drafts.csswg.org/css-contain-2/#containment-types
+        // 1. The layout containment box establishes an independent formatting context.
+        // 4. The paint containment box establishes an independent formatting context.
+        let content_visibility_forces_containment =
+            self.misc_layout().content_visibility == crate::css::css_enums::content_visibility::AUTO;
+        if (box_values.layout_containment || box_values.paint_containment || content_visibility_forces_containment)
+            && containment_applies_to_principal_box(box_values.display)
+        {
+            return true;
+        }
+        // https://drafts.csswg.org/css-conditional-5/#valdef-container-type-size
+        // Applies style containment and size containment to the principal box, and establishes an independent
+        // formatting context.
+        box_values.is_size_container || box_values.is_inline_size_container
+    }
+
     // https://developer.mozilla.org/en-US/docs/Web/Guide/CSS/Block_formatting_context
     // The computed-style-only half of the block-formatting-context predicate;
     // node_creates_block_formatting_context adds the terms that need the node
@@ -1327,21 +1356,7 @@ impl<'a> ComputedValuesView<'a> {
             return true;
         }
 
-        // https://drafts.csswg.org/css-contain-2/#containment-types
-        // 1. The layout containment box establishes an independent formatting context.
-        // 4. The paint containment box establishes an independent formatting context.
-        let content_visibility_forces_containment =
-            self.misc_layout().content_visibility == crate::css::css_enums::content_visibility::AUTO;
-        if (box_values.layout_containment || box_values.paint_containment || content_visibility_forces_containment)
-            && containment_applies_to_principal_box(display)
-        {
-            return true;
-        }
-
-        // https://drafts.csswg.org/css-conditional-5/#valdef-container-type-size
-        // Applies style containment and size containment to the principal box, and establishes an independent
-        // formatting context.
-        if box_values.is_size_container || box_values.is_inline_size_container {
+        if self.is_forced_to_establish_independent_formatting_context() {
             return true;
         }
 
@@ -1436,12 +1451,14 @@ impl<'a> ComputedValuesView<'a> {
         self.font().line_height_used()
     }
 
+    // NB: Layout counts a font's ascent and descent in whole pixels, as it does for 'line-height: normal', so text
+    //     with a whole-pixel line height has its baseline on a pixel.
     pub(crate) fn font_ascent(self) -> f32 {
-        self.font().first_available_font_metrics().ascent
+        self.font().first_available_font_metrics().ascent.round_ties_even()
     }
 
     pub(crate) fn font_descent(self) -> f32 {
-        self.font().first_available_font_metrics().descent
+        self.font().first_available_font_metrics().descent.round_ties_even()
     }
 
     pub(crate) fn font_x_height(self) -> f32 {

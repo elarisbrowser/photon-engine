@@ -84,9 +84,8 @@ impl RetainedState {
     /// values in over `record`, the record the host holds for it: the font context, which
     /// reads the record its inheritance parent holds; the line-height context, the element's own
     /// font with the line height it inherits; and the one everything else resolves against, the
-    /// element's own font. A mirror of the host's `make_computation_context_for_property(FontFamily /
-    /// LineHeight / Color)` over the working set it reconstructs from that record, without the
-    /// container bases only the host resolves.
+    /// element's own font. A mirror of the host's `make_length_resolution_context` over the working
+    /// set it reconstructs from that record, without the container bases only the host resolves.
     pub(crate) fn animation_sample_length_contexts(
         &self,
         node: StyleNodeID,
@@ -542,7 +541,7 @@ impl super::StyleEngine {
             return Err(NeedsHost);
         }
         // The sample holds the longhands of the record it composes over, as the host's does.
-        let sampled = self.install_record_derived(&base, groups, None);
+        let sampled = self.install_sample_record(&base, groups, overlay.content_hash());
         release_rebuilt_overlay_payloads(&payloads, rebuilt.groups);
         Ok(super::layout_style::DerivedStyleRecord::pin(self, sampled.raw()))
     }
@@ -603,6 +602,7 @@ impl super::StyleEngine {
             root_effective_zoom: self.root_effective_zoom(),
         };
         let input = AnimationSampleInput {
+            record_dependencies: true,
             style_node: node.raw(),
             pseudo_kind: crate::css::cascaded_properties::NO_PSEUDO_ELEMENT,
             effects: HostSampledEffects::none(),
@@ -1086,6 +1086,11 @@ impl TickShownRecords {
             .find_map(|(shown_node, shown)| (*shown_node == node).then_some(shown))
     }
 
+    /// Whether a clock frame shows a record for `node`'s element or its pseudo-elements.
+    pub(super) fn shows_any(&self, node: StyleNodeID) -> bool {
+        !self.is_empty() && self.get(node).is_some()
+    }
+
     /// The record shown for `node`'s element, where a clock frame shows one.
     pub(super) fn element(&self, node: StyleNodeID) -> Option<super::computed::FinalStyleRecordID> {
         self.get(node).map(|shown| shown.element)
@@ -1278,6 +1283,32 @@ pub(super) fn font_resolution_request<'a>(
         },
         _ => 0,
     };
+    // https://drafts.csswg.org/css-fonts-4/#valdef-font-style-oblique-angle
+    // "The lack of an <angle> represents 14deg."
+    let font_oblique_angle = match value_of(prop::FONT_STYLE) {
+        Some(StyleValueData::FontStyle {
+            font_style,
+            angle_value,
+        }) if *font_style == crate::css::css_enums::font_style_keyword::OBLIQUE => angle_value
+            .optional_data()
+            .and_then(crate::css::table_group_builder::angle_degrees)
+            .unwrap_or(14.0),
+        _ => 14.0,
+    };
+    let mut font_synthesis = 0;
+    if matches!(value_of(prop::FONT_SYNTHESIS_WEIGHT), Some(StyleValueData::Keyword { keyword }) if *keyword == keyword::NONE)
+    {
+        font_synthesis |= bridge::FONT_SYNTHESIS_NO_WEIGHT;
+    }
+    match value_of(prop::FONT_SYNTHESIS_STYLE) {
+        Some(StyleValueData::Keyword { keyword }) if *keyword == keyword::NONE => {
+            font_synthesis |= bridge::FONT_SYNTHESIS_STYLE_NONE << bridge::FONT_SYNTHESIS_STYLE_SHIFT;
+        }
+        Some(StyleValueData::Keyword { keyword }) if *keyword == keyword::OBLIQUE_ONLY => {
+            font_synthesis |= bridge::FONT_SYNTHESIS_STYLE_OBLIQUE_ONLY << bridge::FONT_SYNTHESIS_STYLE_SHIFT;
+        }
+        _ => {}
+    }
     let (font_weight, font_width) = match (value_of(prop::FONT_WEIGHT), value_of(prop::FONT_WIDTH)) {
         (Some(StyleValueData::Number { value: weight }), Some(StyleValueData::Percentage { value: width })) => {
             (*weight, *width)
@@ -1308,6 +1339,8 @@ pub(super) fn font_resolution_request<'a>(
         font_weight,
         font_width,
         font_optical_sizing,
+        font_oblique_angle,
+        font_synthesis,
         font_size_adjust,
         font_size_adjust_metric,
         font_size_adjust_value,

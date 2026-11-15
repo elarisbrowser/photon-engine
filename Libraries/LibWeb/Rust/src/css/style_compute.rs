@@ -19,13 +19,8 @@ use crate::css::computed_values::GroupValuesWriter;
 use crate::css::css_string::CssString;
 use crate::css::ffi_support::OwnedBox;
 use crate::css::style_value::{
-    BackgroundSizePayload, BorderImageSlicePayload, BorderRadiusPayload, BorderRadiusRectPayload, CalculatedPayload,
-    ColorFunctionPayload, ColorMixPayload, ColorSchemePayload, ConicGradientPayload, ContentPayload,
-    CounterDefinitionsPayload, CounterPayload, CounterStylePayload, CursorPayload, EasingPayload, FunctionPayload,
-    GridTrackPlacementPayload, GridTrackSizeListPayload, ImagePayload, ImageSetPayload, LightDarkPayload,
-    LinearGradientPayload, OpenTypeTaggedPayload, PositionPayload, RadialGradientPayload, RadialSizePayload,
-    RandomValueSharingPayload, RatioPayload, RayPayload, RectPayload, ScrollbarColorPayload, ShadowPayload,
-    ShorthandPayload, UrlPayload,
+    CalculatedPayload, ColorSchemePayload, ContentPayload, CounterPayload, CounterStylePayload, FunctionPayload,
+    ImagePayload, OpenTypeTaggedPayload, RandomValueSharingPayload, ShorthandPayload, UrlPayload,
 };
 use crate::css::style_value_arc::StyleValueArc;
 use ak::math;
@@ -45,9 +40,7 @@ use crate::css::property_metadata::property_id;
 use crate::css::property_metadata::property_is_inherited;
 use crate::css::property_metadata::property_is_shorthand;
 use crate::css::retained_fly_string::RetainedUtf16FlyString;
-use crate::css::style_value::{
-    BasicShapeData, GridTrackEntryKind, RetainedStyleValueData, RetainedStyleValueDataList, StyleValueData,
-};
+use crate::css::style_value::{RetainedStyleValueData, RetainedStyleValueDataList, StyleValueData};
 
 pub use crate::css::css_enums::*;
 
@@ -630,6 +623,14 @@ pub extern "C" fn rust_compute_font_width(absolutized_value: &StyleValueData) ->
     compute_font_width(absolutized_value).into()
 }
 
+/// The font size the `<absolute-size>` `keyword` maps to for a default font size of
+/// `default_font_size_raw`, both in raw CSS pixels. Any other keyword maps to the default size.
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_absolute_size_font_mapping(keyword: u16, default_font_size_raw: i32) -> i32 {
+    absolute_size_font_mapping(keyword, CssPixels::from_raw(default_font_size_raw))
+        .map_or(default_font_size_raw, |size| size.raw_value())
+}
+
 /// https://drafts.csswg.org/css-fonts-4/#absolute-size-mapping
 /// An <absolute-size> keyword refers to an entry in a table of font sizes computed and kept by
 /// the user agent. See 2.5.1 Absolute Size Keyword Mapping Table.
@@ -1090,96 +1091,23 @@ pub extern "C" fn rust_style_reads_counter_style_environment(
 /// changed by CSS.
 ///
 /// Returns None for value types that must not reach computational-independence checks. A
-/// container is likewise undecided when any nested value is unsupported.
+/// container is likewise undecided when a nested value is unsupported, unless another nested value
+/// already makes it dependent.
 pub(crate) fn value_is_computationally_independent(value: &StyleValueData) -> Option<bool> {
-    fn grid_entries_are_computationally_independent(
-        entries: &[crate::css::style_value::RetainedGridTrackEntry],
-    ) -> Option<bool> {
-        for entry in entries {
-            let independent = match entry.kind {
-                // A line-name entry carries no style value.
-                GridTrackEntryKind::LineNames => true,
-                // A single track size.
-                GridTrackEntryKind::Size => value_is_computationally_independent(entry.size_value.data())?,
-                // A minmax() track size.
-                GridTrackEntryKind::MinMax => {
-                    value_is_computationally_independent(entry.min_value.data())?
-                        && value_is_computationally_independent(entry.max_value.data())?
-                }
-                // A repeat() track and its optional fixed repeat count.
-                GridTrackEntryKind::Repeat => {
-                    grid_entries_are_computationally_independent(entry.repeat_entries())?
-                        && match entry.repeat_count.optional_data() {
-                            Some(count) => value_is_computationally_independent(count)?,
-                            None => true,
-                        }
-                }
-            };
-            if !independent {
-                return Some(false);
-            }
-        }
-        Some(true)
-    }
-
-    let all_data_in_list = |list: &crate::css::style_value::RetainedStyleValueDataList| -> Option<bool> {
-        let mut independent = true;
-        for retained in list.as_slice() {
-            if let Some(data) = retained.optional_data() {
-                independent = independent && value_is_computationally_independent(data)?;
-            }
-        }
-        Some(independent)
-    };
-    let all_data = |children: &[&crate::css::style_value::RetainedStyleValueData]| -> Option<bool> {
-        let mut independent = true;
-        for retained in children {
-            independent = independent && value_is_computationally_independent(retained.data())?;
-        }
-        Some(independent)
-    };
     match value {
         StyleValueData::Keyword { .. } => {
             if value_is_css_wide_keyword(value) {
                 return Some(false);
             }
             // NB: System colors are computationally independent, although the color scheme decides what they compute
-            //     to, and so is light-dark() below:
+            //     to, and so is light-dark():
             //     https://github.com/w3c/csswg-drafts/issues/12735
             // FIXME: Are there any other keywords which aren't computationally independent?
             Some(true)
         }
         StyleValueData::Length { unit, .. } => Some(!length_unit_is_font_or_container_relative(*unit)),
-        StyleValueData::Number { .. }
-        | StyleValueData::Integer { .. }
-        | StyleValueData::Percentage { .. }
-        | StyleValueData::Angle { .. }
-        | StyleValueData::Flex { .. }
-        | StyleValueData::Frequency { .. }
-        | StyleValueData::Resolution { .. }
-        | StyleValueData::Time { .. }
-        | StyleValueData::String { .. } => Some(true),
-        // NB: anchor() and anchor-size() count as independent even though they carry a
-        //     fallback value, matching their C++ rules.
-        StyleValueData::Anchor { .. }
-        | StyleValueData::AnchorSize { .. }
-        | StyleValueData::ColorScheme { .. }
-        | StyleValueData::CounterStyle { .. }
-        | StyleValueData::CustomIdent { .. }
-        | StyleValueData::Display { .. }
-        | StyleValueData::EmptyOptional
-        | StyleValueData::GridAutoFlow { .. }
-        | StyleValueData::GridTemplateArea { .. }
-        | StyleValueData::Image { .. }
-        | StyleValueData::RepeatStyle { .. }
-        | StyleValueData::TextUnderlinePosition { .. }
-        | StyleValueData::Url { .. }
-        | StyleValueData::FontSource { .. }
-        | StyleValueData::ScrollbarGutter { .. } => Some(true),
-        StyleValueData::LightDark(light_dark) => Some(
-            value_is_computationally_independent(light_dark.light.data())?
-                && value_is_computationally_independent(light_dark.dark.data())?,
-        ),
+        // NB: anchor() and anchor-size() count as independent even though they carry a fallback value.
+        StyleValueData::Anchor { .. } | StyleValueData::AnchorSize { .. } => Some(true),
         StyleValueData::TreeCountingFunction { .. } => Some(false),
         // The calculation tree decides natively; its style value leaves resolve through the
         // same decision, falling back for the types the core cannot decide.
@@ -1190,357 +1118,27 @@ pub(crate) fn value_is_computationally_independent(value: &StyleValueData) -> Op
                 &|retained| value_is_computationally_independent(retained.data()).unwrap_or_default(),
             ))
         }
-        StyleValueData::Ratio(ratio_payload) => {
-            let RatioPayload {
-                numerator, denominator, ..
-            } = &**ratio_payload;
-            all_data(&[numerator, denominator])
-        }
-        StyleValueData::Edge { offset, .. } => match offset.optional_data() {
-            Some(offset) => value_is_computationally_independent(offset),
-            None => Some(true),
-        },
-        StyleValueData::Function(function_payload) => {
-            let FunctionPayload { value, .. } = &**function_payload;
-            all_data(&[value])
-        }
-        StyleValueData::OpacityValue { value } => all_data(&[value]),
-        // Auto placements carry no value; spans and lines recurse into theirs.
-        StyleValueData::GridTrackPlacement(grid_track_placement_payload) => {
-            let GridTrackPlacementPayload { value, .. } = &**grid_track_placement_payload;
-            match value.optional_data() {
-                Some(value) => value_is_computationally_independent(value),
-                None => Some(true),
-            }
-        }
-        StyleValueData::GridTrackSizeList(grid_track_size_list_payload) => {
-            let GridTrackSizeListPayload { entries, .. } = &**grid_track_size_list_payload;
-            grid_entries_are_computationally_independent(entries.as_slice())
-        }
         // FIXME: Consider sub-values once we support <custom-color-space> values
         StyleValueData::ColorInterpolationMethod { .. } => Some(true),
-        StyleValueData::ColorFunction(color_function_payload) => {
-            let ColorFunctionPayload {
-                channel_0,
-                channel_1,
-                channel_2,
-                alpha,
-                origin_color,
-                ..
-            } = &**color_function_payload;
-            let mut independent = true;
-            for value in [channel_0, channel_1, channel_2, alpha, origin_color] {
-                if let Some(value) = value.optional_data() {
-                    independent = independent && value_is_computationally_independent(value)?;
-                }
-            }
-            Some(independent)
-        }
-        StyleValueData::BorderImageSlice(border_image_slice_payload) => {
-            let BorderImageSlicePayload {
-                top,
-                right,
-                bottom,
-                left,
-                ..
-            } = &**border_image_slice_payload;
-            all_data(&[top, right, bottom, left])
-        }
-        StyleValueData::Content(content_payload) => {
-            let ContentPayload { content, alt_text } = &**content_payload;
-            let mut independent = value_is_computationally_independent(content.data())?;
-            if let Some(alt_text) = alt_text.optional_data() {
-                independent = independent && value_is_computationally_independent(alt_text)?;
-            }
-            Some(independent)
-        }
-        // Extent components carry no value; explicit sizes recurse into theirs.
-        StyleValueData::RadialSize(radial_size_payload) => {
-            let RadialSizePayload {
-                component_count,
-                is_extent_0,
-                value_0,
-                is_extent_1,
-                value_1,
-                ..
-            } = &**radial_size_payload;
-            let mut independent = true;
-            if !is_extent_0 {
-                independent = value_is_computationally_independent(value_0.data())?;
-            }
-            if *component_count == 2 && !is_extent_1 {
-                independent = independent && value_is_computationally_independent(value_1.data())?;
-            }
-            Some(independent)
-        }
-        // Every shape kind's rule is a conjunction over the values it uses; the
-        // unused generic fields and point list of the other kinds are absent, so
-        // one null-tolerant conjunction covers inset, xywh, rect, circle,
-        // ellipse, polygon and path exactly.
-        StyleValueData::BasicShape { shape } => {
-            let BasicShapeData {
-                v0,
-                v1,
-                v2,
-                v3,
-                v4,
-                points,
-                ..
-            } = shape.as_ref();
-            let mut independent = true;
-            for value in [v0, v1, v2, v3, v4] {
-                if let Some(value) = value.optional_data() {
-                    independent = independent && value_is_computationally_independent(value)?;
-                }
-            }
-            for point in points.as_slice() {
-                for value in point.values() {
-                    independent = independent && value_is_computationally_independent(value.data())?;
-                }
-            }
-            Some(independent)
-        }
-        // Every filter kind's rule recurses into its single value.
-        StyleValueData::Filter { value, .. } => all_data(&[value]),
-        StyleValueData::Ray(ray_payload) => {
-            let RayPayload { angle, position, .. } = &**ray_payload;
-            let mut independent = value_is_computationally_independent(angle.data())?;
-            if let Some(position) = position.optional_data() {
-                independent = independent && value_is_computationally_independent(position)?;
-            }
-            Some(independent)
-        }
-        StyleValueData::Counter(counter_payload) => {
-            let CounterPayload { counter_style, .. } = &**counter_payload;
-            all_data(&[counter_style])
-        }
-        StyleValueData::OpenTypeTagged(open_type_tagged_payload) => {
-            let OpenTypeTaggedPayload { value, .. } = &**open_type_tagged_payload;
-            all_data(&[value])
-        }
-        StyleValueData::RandomValueSharing(random_value_sharing_payload) => {
-            let RandomValueSharingPayload { fixed_value, .. } = &**random_value_sharing_payload;
-            match fixed_value.optional_data() {
-                Some(fixed_value) => value_is_computationally_independent(fixed_value),
-                None => Some(true),
-            }
-        }
-        StyleValueData::Cursor(cursor_payload) => {
-            let CursorPayload { image, x, y } = &**cursor_payload;
-            let mut independent = value_is_computationally_independent(image.data())?;
-            for coordinate in [x, y] {
-                if let Some(coordinate) = coordinate.optional_data() {
-                    independent = independent && value_is_computationally_independent(coordinate)?;
-                }
-            }
-            Some(independent)
-        }
-        // The unused fields of the non-matching easing kinds are absent, so one
-        // null-tolerant conjunction covers every kind's rule.
-        StyleValueData::Easing(easing_payload) => {
-            let EasingPayload {
-                linear_stops,
-                x1,
-                y1,
-                x2,
-                y2,
-                number_of_intervals,
-                ..
-            } = &**easing_payload;
-            let mut independent = true;
-            for value in [x1, y1, x2, y2, number_of_intervals] {
-                if let Some(value) = value.optional_data() {
-                    independent = independent && value_is_computationally_independent(value)?;
-                }
-            }
-            for stop in linear_stops.as_slice() {
-                for value in stop.values() {
-                    if let Some(value) = value.optional_data() {
-                        independent = independent && value_is_computationally_independent(value)?;
+        StyleValueData::UnicodeRange { .. }
+        | StyleValueData::GuaranteedInvalid
+        | StyleValueData::PendingSubstitution { .. }
+        | StyleValueData::CounterStyleSystem { .. }
+        | StyleValueData::Unresolved { .. } => None,
+        // Any other value is independent when all the values it holds are. A dependent child
+        // decides the answer wherever it is, so the order of the children does not matter.
+        _ => {
+            let mut independent = Some(true);
+            value.for_each_child(&mut |child| {
+                if independent != Some(false) {
+                    let answer = value_is_computationally_independent(child);
+                    if answer != Some(true) {
+                        independent = answer;
                     }
                 }
-            }
-            Some(independent)
+            });
+            independent
         }
-        StyleValueData::ImageSet(image_set_payload) => {
-            let ImageSetPayload { options } = &**image_set_payload;
-            let mut independent = true;
-            for option in options.as_slice() {
-                independent = independent && all_data(&option.values())?;
-            }
-            Some(independent)
-        }
-        StyleValueData::CounterDefinitions(counter_definitions_payload) => {
-            let CounterDefinitionsPayload { counter_definitions } = &**counter_definitions_payload;
-            let mut independent = true;
-            for definition in counter_definitions.as_slice() {
-                if let Some(value) = definition.value().optional_data() {
-                    independent = independent && value_is_computationally_independent(value)?;
-                }
-            }
-            Some(independent)
-        }
-        StyleValueData::LinearGradient(linear_gradient_payload) => {
-            let LinearGradientPayload {
-                direction_value,
-                color_stop_list,
-                color_interpolation_method,
-                ..
-            } = &**linear_gradient_payload;
-            let mut independent = true;
-            for value in [direction_value, color_interpolation_method] {
-                if let Some(value) = value.optional_data() {
-                    independent = independent && value_is_computationally_independent(value)?;
-                }
-            }
-            for stop in color_stop_list.as_slice() {
-                for value in stop.values() {
-                    if let Some(value) = value.optional_data() {
-                        independent = independent && value_is_computationally_independent(value)?;
-                    }
-                }
-            }
-            Some(independent)
-        }
-        StyleValueData::ConicGradient(conic_gradient_payload) => {
-            let ConicGradientPayload {
-                from_angle,
-                position,
-                color_stop_list,
-                color_interpolation_method,
-                ..
-            } = &**conic_gradient_payload;
-            let mut independent = true;
-            for value in [from_angle, position, color_interpolation_method] {
-                if let Some(value) = value.optional_data() {
-                    independent = independent && value_is_computationally_independent(value)?;
-                }
-            }
-            for stop in color_stop_list.as_slice() {
-                for value in stop.values() {
-                    if let Some(value) = value.optional_data() {
-                        independent = independent && value_is_computationally_independent(value)?;
-                    }
-                }
-            }
-            Some(independent)
-        }
-        StyleValueData::RadialGradient(radial_gradient_payload) => {
-            let RadialGradientPayload {
-                size,
-                position,
-                color_stop_list,
-                color_interpolation_method,
-                ..
-            } = &**radial_gradient_payload;
-            let mut independent = true;
-            for value in [size, position, color_interpolation_method] {
-                if let Some(value) = value.optional_data() {
-                    independent = independent && value_is_computationally_independent(value)?;
-                }
-            }
-            for stop in color_stop_list.as_slice() {
-                for value in stop.values() {
-                    if let Some(value) = value.optional_data() {
-                        independent = independent && value_is_computationally_independent(value)?;
-                    }
-                }
-            }
-            Some(independent)
-        }
-        StyleValueData::ContrastColor { color, .. } => all_data(&[color]),
-        StyleValueData::Superellipse { parameter } => all_data(&[parameter]),
-        StyleValueData::ScrollbarColor(scrollbar_color_payload) => {
-            let ScrollbarColorPayload {
-                thumb_color,
-                track_color,
-                ..
-            } = &**scrollbar_color_payload;
-            all_data(&[thumb_color, track_color])
-        }
-        StyleValueData::Rect(rect_payload) => {
-            let RectPayload {
-                top,
-                right,
-                bottom,
-                left,
-                ..
-            } = &**rect_payload;
-            all_data(&[top, right, bottom, left])
-        }
-        StyleValueData::FontStyle { angle_value, .. } => match angle_value.optional_data() {
-            Some(angle_value) => value_is_computationally_independent(angle_value),
-            None => Some(true),
-        },
-        StyleValueData::TextIndent { length_percentage, .. } => all_data(&[length_percentage]),
-        StyleValueData::OverflowClipMargin { offset, .. } => all_data(&[offset]),
-        StyleValueData::BackgroundSize(background_size_payload) => {
-            let BackgroundSizePayload { size_x, size_y, .. } = &**background_size_payload;
-            all_data(&[size_x, size_y])
-        }
-        StyleValueData::Position(position_payload) => {
-            let PositionPayload { edge_x, edge_y, .. } = &**position_payload;
-            all_data(&[edge_x, edge_y])
-        }
-        StyleValueData::Shadow(shadow_payload) => {
-            let ShadowPayload {
-                color,
-                offset_x,
-                offset_y,
-                blur_radius,
-                spread_distance,
-                ..
-            } = &**shadow_payload;
-            let mut independent = value_is_computationally_independent(offset_x.data())?
-                && value_is_computationally_independent(offset_y.data())?;
-            for value in [color, blur_radius, spread_distance] {
-                if let Some(value) = value.optional_data() {
-                    independent = independent && value_is_computationally_independent(value)?;
-                }
-            }
-            Some(independent)
-        }
-        StyleValueData::ColorMix(color_mix_payload) => {
-            let ColorMixPayload {
-                color_interpolation_method,
-                colors,
-                percentages,
-                ..
-            } = &**color_mix_payload;
-            let mut independent = true;
-            for value in std::iter::once(color_interpolation_method)
-                .chain(colors.as_slice())
-                .chain(percentages.as_slice())
-            {
-                if let Some(value) = value.optional_data() {
-                    independent = independent && value_is_computationally_independent(value)?;
-                }
-            }
-            Some(independent)
-        }
-        StyleValueData::Shorthand(_)
-        | StyleValueData::ValueList { .. }
-        | StyleValueData::Tuple { .. }
-        | StyleValueData::Transformation(_) => all_data_in_list(value.child_values().unwrap()),
-        StyleValueData::BorderRadiusRect(border_radius_rect_payload) => {
-            let BorderRadiusRectPayload {
-                top_left,
-                top_right,
-                bottom_right,
-                bottom_left,
-                ..
-            } = &**border_radius_rect_payload;
-            all_data(&[top_left, top_right, bottom_right, bottom_left])
-        }
-        StyleValueData::BorderRadius(border_radius_payload) => {
-            let BorderRadiusPayload {
-                horizontal_radius,
-                vertical_radius,
-                ..
-            } = &**border_radius_payload;
-            all_data(&[horizontal_radius, vertical_radius])
-        }
-        _ => None,
     }
 }
 
@@ -1670,38 +1268,6 @@ pub(crate) fn container_relative_axes_read(unit_mask: u8, subject_inline_axis_is
 }
 
 pub(crate) fn collect_external_value_dependencies(value: &StyleValueData) -> ExternalValueDependencies {
-    fn collect_optional(value: &RetainedStyleValueData, dependencies: &mut ExternalValueDependencies) {
-        if let Some(value) = value.optional_data() {
-            collect(value, dependencies);
-        }
-    }
-
-    fn collect_values(values: &[&RetainedStyleValueData], dependencies: &mut ExternalValueDependencies) {
-        for value in values {
-            collect_optional(value, dependencies);
-        }
-    }
-
-    fn collect_grid_entries(
-        entries: &[crate::css::style_value::RetainedGridTrackEntry],
-        dependencies: &mut ExternalValueDependencies,
-    ) {
-        for entry in entries {
-            match entry.kind {
-                GridTrackEntryKind::LineNames => {}
-                GridTrackEntryKind::Size => collect(entry.size_value.data(), dependencies),
-                GridTrackEntryKind::MinMax => {
-                    collect(entry.min_value.data(), dependencies);
-                    collect(entry.max_value.data(), dependencies);
-                }
-                GridTrackEntryKind::Repeat => {
-                    collect_grid_entries(entry.repeat_entries(), dependencies);
-                    collect_optional(&entry.repeat_count, dependencies);
-                }
-            }
-        }
-    }
-
     fn collect_calculation(node: &crate::css::calc::CalcNode, dependencies: &mut ExternalValueDependencies) {
         match node {
             crate::css::calc::CalcNode::Numeric(crate::css::calc::CalcNumericValue::Length { unit, .. }) => {
@@ -1756,260 +1322,16 @@ pub(crate) fn collect_external_value_dependencies(value: &StyleValueData) -> Ext
                 let CalculatedPayload { rust_calculation, .. } = &**calculated_payload;
                 collect_calculation(rust_calculation.node(), dependencies);
             }
-            StyleValueData::Ratio(ratio_payload) => {
-                let RatioPayload {
-                    numerator, denominator, ..
-                } = &**ratio_payload;
-                collect_values(&[numerator, denominator], dependencies);
-            }
-            StyleValueData::Edge { offset, .. } => collect_optional(offset, dependencies),
-            StyleValueData::Anchor(_) | StyleValueData::AnchorSize(_) => {
-                let (_, _, fallback_value) = value.anchor_name_and_fallback().unwrap();
-                collect_optional(fallback_value, dependencies);
-            }
-            StyleValueData::Ray(ray_payload) => {
-                let RayPayload { angle, position, .. } = &**ray_payload;
-                collect_optional(angle, dependencies);
-                collect_optional(position, dependencies);
-            }
-            StyleValueData::Function(function) => collect_optional(&function.value, dependencies),
-            StyleValueData::OpenTypeTagged(open_type_tagged) => collect_optional(&open_type_tagged.value, dependencies),
-            StyleValueData::GridTrackPlacement(grid_track_placement) => {
-                collect_optional(&grid_track_placement.value, dependencies);
-            }
-            StyleValueData::OpacityValue { value } | StyleValueData::Filter { value, .. } => {
-                collect_optional(value, dependencies);
-            }
-            StyleValueData::GridTrackSizeList(grid_track_size_list_payload) => {
-                let GridTrackSizeListPayload { entries, .. } = &**grid_track_size_list_payload;
-                collect_grid_entries(entries.as_slice(), dependencies);
-            }
-            StyleValueData::ColorFunction(color_function_payload) => {
-                let ColorFunctionPayload {
-                    channel_0,
-                    channel_1,
-                    channel_2,
-                    alpha,
-                    origin_color,
-                    ..
-                } = &**color_function_payload;
-                collect_values(&[channel_0, channel_1, channel_2, alpha, origin_color], dependencies);
-            }
-            StyleValueData::BorderImageSlice(border_image_slice) => {
-                let BorderImageSlicePayload {
-                    top,
-                    right,
-                    bottom,
-                    left,
-                    ..
-                } = &**border_image_slice;
-                collect_values(&[top, right, bottom, left], dependencies);
-            }
-            StyleValueData::Rect(rect_payload) => {
-                let RectPayload {
-                    top,
-                    right,
-                    bottom,
-                    left,
-                } = &**rect_payload;
-                collect_values(&[top, right, bottom, left], dependencies);
-            }
-            StyleValueData::Content(content_payload) => {
-                let ContentPayload { content, alt_text } = &**content_payload;
-                collect(content.data(), dependencies);
-                collect_optional(alt_text, dependencies);
-            }
-            StyleValueData::RadialSize(radial_size_payload) => {
-                let RadialSizePayload { value_0, value_1, .. } = &**radial_size_payload;
-                collect_values(&[value_0, value_1], dependencies);
-            }
-            StyleValueData::BasicShape { shape } => {
-                let BasicShapeData {
-                    v0,
-                    v1,
-                    v2,
-                    v3,
-                    v4,
-                    points,
-                    ..
-                } = shape.as_ref();
-                collect_values(&[v0, v1, v2, v3, v4], dependencies);
-                for point in points.as_slice() {
-                    for value in point.values() {
-                        collect_optional(value, dependencies);
-                    }
-                }
-            }
-            StyleValueData::Counter(counter_payload) => {
-                let CounterPayload { counter_style, .. } = &**counter_payload;
-                collect(counter_style.data(), dependencies);
-            }
             StyleValueData::RandomValueSharing(random_value_sharing_payload) => {
-                let RandomValueSharingPayload { fixed_value, .. } = &**random_value_sharing_payload;
                 dependencies.uses_random_function = true;
-                if fixed_value.optional_data().is_some() {
-                    collect_optional(fixed_value, dependencies);
-                } else {
-                    dependencies.has_unfixed_random_sharing = true;
-                }
+                dependencies.has_unfixed_random_sharing |=
+                    random_value_sharing_payload.fixed_value.optional_data().is_none();
             }
-            StyleValueData::Cursor(cursor_payload) => {
-                let CursorPayload { image, x, y } = &**cursor_payload;
-                collect(image.data(), dependencies);
-                collect_values(&[x, y], dependencies);
-            }
-            StyleValueData::Easing(easing_payload) => {
-                let EasingPayload {
-                    linear_stops,
-                    x1,
-                    y1,
-                    x2,
-                    y2,
-                    number_of_intervals,
-                    ..
-                } = &**easing_payload;
-                collect_values(&[x1, y1, x2, y2, number_of_intervals], dependencies);
-                for stop in linear_stops.as_slice() {
-                    for value in stop.values() {
-                        collect_optional(value, dependencies);
-                    }
-                }
-            }
-            StyleValueData::ImageSet(image_set_payload) => {
-                let ImageSetPayload { options } = &**image_set_payload;
-                dependencies.device_pixel_ratio_dependent = true;
-                for option in options.as_slice() {
-                    for value in option.values() {
-                        collect_optional(value, dependencies);
-                    }
-                }
-            }
-            StyleValueData::CounterDefinitions(counter_definitions_payload) => {
-                let CounterDefinitionsPayload { counter_definitions } = &**counter_definitions_payload;
-                for definition in counter_definitions.as_slice() {
-                    collect_optional(definition.value(), dependencies);
-                }
-            }
-            StyleValueData::LinearGradient(linear_gradient_payload) => {
-                let LinearGradientPayload {
-                    direction_value,
-                    color_stop_list,
-                    color_interpolation_method,
-                    ..
-                } = &**linear_gradient_payload;
-                collect_values(&[direction_value, color_interpolation_method], dependencies);
-                for stop in color_stop_list.as_slice() {
-                    for value in stop.values() {
-                        collect_optional(value, dependencies);
-                    }
-                }
-            }
-            StyleValueData::ConicGradient(conic_gradient_payload) => {
-                let ConicGradientPayload {
-                    from_angle,
-                    position,
-                    color_stop_list,
-                    color_interpolation_method,
-                    ..
-                } = &**conic_gradient_payload;
-                collect_values(&[from_angle, position, color_interpolation_method], dependencies);
-                for stop in color_stop_list.as_slice() {
-                    for value in stop.values() {
-                        collect_optional(value, dependencies);
-                    }
-                }
-            }
-            StyleValueData::RadialGradient(radial_gradient_payload) => {
-                let RadialGradientPayload {
-                    size,
-                    position,
-                    color_stop_list,
-                    color_interpolation_method,
-                    ..
-                } = &**radial_gradient_payload;
-                collect_values(&[size, position, color_interpolation_method], dependencies);
-                for stop in color_stop_list.as_slice() {
-                    for value in stop.values() {
-                        collect_optional(value, dependencies);
-                    }
-                }
-            }
-            StyleValueData::ColorMix(color_mix_payload) => {
-                let ColorMixPayload {
-                    color_interpolation_method,
-                    colors,
-                    percentages,
-                    ..
-                } = &**color_mix_payload;
-                collect_values(&[color_interpolation_method], dependencies);
-                collect_values(&colors.as_slice().iter().collect::<Vec<_>>(), dependencies);
-                collect_values(&percentages.as_slice().iter().collect::<Vec<_>>(), dependencies);
-            }
-            StyleValueData::ContrastColor { color, .. } => collect(color.data(), dependencies),
-            StyleValueData::LightDark(light_dark_payload) => {
-                let LightDarkPayload { light, dark, .. } = &**light_dark_payload;
-                dependencies.color_scheme_dependent = true;
-                collect_values(&[light, dark], dependencies);
-            }
-            StyleValueData::Superellipse { parameter } => collect_optional(parameter, dependencies),
-            StyleValueData::ScrollbarColor(scrollbar_color_payload) => {
-                let ScrollbarColorPayload {
-                    thumb_color,
-                    track_color,
-                } = &**scrollbar_color_payload;
-                collect_values(&[thumb_color, track_color], dependencies);
-            }
-            StyleValueData::FontStyle { angle_value, .. } => collect_optional(angle_value, dependencies),
-            StyleValueData::TextIndent { length_percentage, .. } => {
-                collect_optional(length_percentage, dependencies);
-            }
-            StyleValueData::OverflowClipMargin { offset, .. } => collect_optional(offset, dependencies),
-            StyleValueData::BackgroundSize(background_size_payload) => {
-                let BackgroundSizePayload { size_x, size_y } = &**background_size_payload;
-                collect_values(&[size_x, size_y], dependencies);
-            }
-            StyleValueData::Position(position_payload) => {
-                let PositionPayload { edge_x, edge_y } = &**position_payload;
-                collect_values(&[edge_x, edge_y], dependencies);
-            }
-            StyleValueData::Shadow(shadow_payload) => {
-                let ShadowPayload {
-                    color,
-                    offset_x,
-                    offset_y,
-                    blur_radius,
-                    spread_distance,
-                    ..
-                } = &**shadow_payload;
-                collect_values(&[color, offset_x, offset_y, blur_radius, spread_distance], dependencies);
-            }
-            StyleValueData::Shorthand(_)
-            | StyleValueData::ValueList { .. }
-            | StyleValueData::Tuple { .. }
-            | StyleValueData::Transformation(_) => {
-                for value in value.child_values().unwrap().as_slice() {
-                    collect_optional(value, dependencies);
-                }
-            }
-            StyleValueData::BorderRadiusRect(border_radius_rect_payload) => {
-                let BorderRadiusRectPayload {
-                    top_left,
-                    top_right,
-                    bottom_right,
-                    bottom_left,
-                } = &**border_radius_rect_payload;
-                collect_values(&[top_left, top_right, bottom_right, bottom_left], dependencies);
-            }
-            StyleValueData::BorderRadius(border_radius_payload) => {
-                let BorderRadiusPayload {
-                    horizontal_radius,
-                    vertical_radius,
-                    ..
-                } = &**border_radius_payload;
-                collect_values(&[horizontal_radius, vertical_radius], dependencies);
-            }
+            StyleValueData::ImageSet(_) => dependencies.device_pixel_ratio_dependent = true,
+            StyleValueData::LightDark(_) => dependencies.color_scheme_dependent = true,
             _ => {}
         }
+        value.for_each_child(&mut |child| collect(child, dependencies));
     }
 
     let mut dependencies = ExternalValueDependencies::default();
@@ -2053,275 +1375,24 @@ pub(crate) fn random_caching_key(sharing: &StyleValueData) -> (&[u16], bool) {
 }
 
 /// Collects the element- or document-cached random sharing nodes reachable through the
-/// recursively absolutized style-value graph. Keep this aligned with new structural variants
-/// and with `absolutize::absolutize`.
+/// recursively absolutized style-value graph.
 pub(crate) fn collect_unfixed_random_sharings_in_value(
     value: &StyleValueData,
     sharings: &mut Vec<*const StyleValueData>,
 ) {
-    fn collect_optional(value: &RetainedStyleValueData, sharings: &mut Vec<*const StyleValueData>) {
-        if let Some(value) = value.optional_data() {
-            collect_unfixed_random_sharings_in_value(value, sharings);
-        }
-    }
-
-    fn collect_list(values: &RetainedStyleValueDataList, sharings: &mut Vec<*const StyleValueData>) {
-        for value in values.as_slice() {
-            collect_optional(value, sharings);
-        }
-    }
-
-    fn collect_grid_entries(
-        entries: &[crate::css::style_value::RetainedGridTrackEntry],
-        sharings: &mut Vec<*const StyleValueData>,
-    ) {
-        for entry in entries {
-            match entry.kind {
-                GridTrackEntryKind::LineNames => {}
-                GridTrackEntryKind::Size => collect_optional(&entry.size_value, sharings),
-                GridTrackEntryKind::MinMax => {
-                    collect_optional(&entry.min_value, sharings);
-                    collect_optional(&entry.max_value, sharings);
-                }
-                GridTrackEntryKind::Repeat => {
-                    collect_grid_entries(entry.repeat_entries(), sharings);
-                    collect_optional(&entry.repeat_count, sharings);
-                }
-            }
-        }
-    }
-
-    let collect_values = |values: &[&RetainedStyleValueData], sharings: &mut Vec<*const StyleValueData>| {
-        for value in values {
-            collect_optional(value, sharings);
-        }
-    };
     match value {
         StyleValueData::Calculated(calculated_payload) => {
             let CalculatedPayload { rust_calculation, .. } = &**calculated_payload;
             crate::css::calc::collect_unfixed_random_sharings(rust_calculation.node(), sharings);
         }
-        StyleValueData::GridTrackSizeList(grid_track_size_list_payload) => {
-            let GridTrackSizeListPayload { entries, .. } = &**grid_track_size_list_payload;
-            collect_grid_entries(entries.as_slice(), sharings);
-        }
-        StyleValueData::Anchor(_) | StyleValueData::AnchorSize(_) => {
-            let (_, _, fallback_value) = value.anchor_name_and_fallback().unwrap();
-            collect_optional(fallback_value, sharings);
-        }
-        StyleValueData::RandomValueSharing(random_value_sharing_payload) => {
-            let RandomValueSharingPayload { fixed_value, .. } = &**random_value_sharing_payload;
-            match fixed_value.optional_data() {
-                Some(fixed_value) => collect_unfixed_random_sharings_in_value(fixed_value, sharings),
-                None => {
-                    if !sharings.contains(&std::ptr::from_ref(value)) {
-                        sharings.push(value);
-                    }
-                }
+        StyleValueData::RandomValueSharing(random_value_sharing_payload)
+            if random_value_sharing_payload.fixed_value.optional_data().is_none() =>
+        {
+            if !sharings.contains(&std::ptr::from_ref(value)) {
+                sharings.push(value);
             }
         }
-        StyleValueData::Ratio(ratio_payload) => {
-            let RatioPayload { numerator, denominator } = &**ratio_payload;
-            collect_values(&[numerator, denominator], sharings);
-        }
-        StyleValueData::Edge { offset, .. } => collect_values(&[offset], sharings),
-        StyleValueData::Ray(ray_payload) => {
-            let RayPayload { angle, position, .. } = &**ray_payload;
-            collect_values(&[angle, position], sharings);
-        }
-        StyleValueData::Function(function) => collect_values(&[&function.value], sharings),
-        StyleValueData::OpenTypeTagged(open_type_tagged) => collect_values(&[&open_type_tagged.value], sharings),
-        StyleValueData::GridTrackPlacement(grid_track_placement) => {
-            collect_values(&[&grid_track_placement.value], sharings);
-        }
-        StyleValueData::OpacityValue { value } | StyleValueData::Filter { value, .. } => {
-            collect_values(&[value], sharings);
-        }
-        StyleValueData::ColorFunction(color_function_payload) => {
-            let ColorFunctionPayload {
-                channel_0,
-                channel_1,
-                channel_2,
-                alpha,
-                origin_color,
-                ..
-            } = &**color_function_payload;
-            collect_values(&[channel_0, channel_1, channel_2, alpha, origin_color], sharings);
-        }
-        StyleValueData::BorderImageSlice(border_image_slice) => collect_values(
-            &[
-                &border_image_slice.top,
-                &border_image_slice.right,
-                &border_image_slice.bottom,
-                &border_image_slice.left,
-            ],
-            sharings,
-        ),
-        StyleValueData::Rect(rect) => collect_values(&[&rect.top, &rect.right, &rect.bottom, &rect.left], sharings),
-        StyleValueData::Content(content_payload) => {
-            let ContentPayload { content, alt_text } = &**content_payload;
-            collect_values(&[content, alt_text], sharings);
-        }
-        StyleValueData::RadialSize(radial_size_payload) => {
-            let RadialSizePayload { value_0, value_1, .. } = &**radial_size_payload;
-            collect_values(&[value_0, value_1], sharings);
-        }
-        StyleValueData::BasicShape { shape } => {
-            let BasicShapeData {
-                v0,
-                v1,
-                v2,
-                v3,
-                v4,
-                points,
-                ..
-            } = shape.as_ref();
-            collect_values(&[v0, v1, v2, v3, v4], sharings);
-            for point in points.as_slice() {
-                collect_values(&point.values(), sharings);
-            }
-        }
-        StyleValueData::Counter(counter_payload) => {
-            let CounterPayload { counter_style, .. } = &**counter_payload;
-            collect_values(&[counter_style], sharings);
-        }
-        StyleValueData::Cursor(cursor_payload) => {
-            let CursorPayload { image, x, y } = &**cursor_payload;
-            collect_values(&[image, x, y], sharings);
-        }
-        StyleValueData::Easing(easing_payload) => {
-            let EasingPayload {
-                linear_stops,
-                x1,
-                y1,
-                x2,
-                y2,
-                number_of_intervals,
-                ..
-            } = &**easing_payload;
-            collect_values(&[x1, y1, x2, y2, number_of_intervals], sharings);
-            for stop in linear_stops.as_slice() {
-                collect_values(&stop.values(), sharings);
-            }
-        }
-        StyleValueData::ImageSet(image_set_payload) => {
-            let ImageSetPayload { options } = &**image_set_payload;
-            for option in options.as_slice() {
-                collect_values(&option.values(), sharings);
-            }
-        }
-        StyleValueData::CounterDefinitions(counter_definitions_payload) => {
-            let CounterDefinitionsPayload { counter_definitions } = &**counter_definitions_payload;
-            for definition in counter_definitions.as_slice() {
-                collect_optional(definition.value(), sharings);
-            }
-        }
-        StyleValueData::LinearGradient(linear_gradient_payload) => {
-            let LinearGradientPayload {
-                direction_value,
-                color_stop_list,
-                color_interpolation_method,
-                ..
-            } = &**linear_gradient_payload;
-            collect_values(&[direction_value, color_interpolation_method], sharings);
-            for stop in color_stop_list.as_slice() {
-                collect_values(&stop.values(), sharings);
-            }
-        }
-        StyleValueData::ConicGradient(conic_gradient_payload) => {
-            let ConicGradientPayload {
-                from_angle,
-                position,
-                color_stop_list,
-                color_interpolation_method,
-                ..
-            } = &**conic_gradient_payload;
-            collect_values(&[from_angle, position, color_interpolation_method], sharings);
-            for stop in color_stop_list.as_slice() {
-                collect_values(&stop.values(), sharings);
-            }
-        }
-        StyleValueData::RadialGradient(radial_gradient_payload) => {
-            let RadialGradientPayload {
-                size,
-                position,
-                color_stop_list,
-                color_interpolation_method,
-                ..
-            } = &**radial_gradient_payload;
-            collect_values(&[size, position, color_interpolation_method], sharings);
-            for stop in color_stop_list.as_slice() {
-                collect_values(&stop.values(), sharings);
-            }
-        }
-        StyleValueData::ColorMix(color_mix_payload) => {
-            let ColorMixPayload {
-                color_interpolation_method,
-                colors,
-                percentages,
-                ..
-            } = &**color_mix_payload;
-            collect_values(&[color_interpolation_method], sharings);
-            collect_values(&colors.as_slice().iter().collect::<Vec<_>>(), sharings);
-            collect_values(&percentages.as_slice().iter().collect::<Vec<_>>(), sharings);
-        }
-        StyleValueData::ContrastColor { color, .. } => collect_values(&[color], sharings),
-        StyleValueData::LightDark(light_dark_payload) => {
-            let LightDarkPayload { light, dark, .. } = &**light_dark_payload;
-            collect_values(&[light, dark], sharings);
-        }
-        StyleValueData::Superellipse { parameter } => collect_values(&[parameter], sharings),
-        StyleValueData::ScrollbarColor(scrollbar_color_payload) => {
-            let ScrollbarColorPayload {
-                thumb_color,
-                track_color,
-            } = &**scrollbar_color_payload;
-            collect_values(&[thumb_color, track_color], sharings);
-        }
-        StyleValueData::FontStyle { angle_value, .. } => collect_values(&[angle_value], sharings),
-        StyleValueData::TextIndent { length_percentage, .. } => collect_values(&[length_percentage], sharings),
-        StyleValueData::OverflowClipMargin { offset, .. } => collect_values(&[offset], sharings),
-        StyleValueData::BackgroundSize(background_size_payload) => {
-            let BackgroundSizePayload { size_x, size_y } = &**background_size_payload;
-            collect_values(&[size_x, size_y], sharings);
-        }
-        StyleValueData::Position(position_payload) => {
-            let PositionPayload { edge_x, edge_y } = &**position_payload;
-            collect_values(&[edge_x, edge_y], sharings);
-        }
-        StyleValueData::Shadow(shadow_payload) => {
-            let ShadowPayload {
-                color,
-                offset_x,
-                offset_y,
-                blur_radius,
-                spread_distance,
-                ..
-            } = &**shadow_payload;
-            collect_values(&[color, offset_x, offset_y, blur_radius, spread_distance], sharings);
-        }
-        StyleValueData::Shorthand(_)
-        | StyleValueData::ValueList { .. }
-        | StyleValueData::Tuple { .. }
-        | StyleValueData::Transformation(_) => collect_list(value.child_values().unwrap(), sharings),
-        StyleValueData::BorderRadiusRect(border_radius_rect_payload) => {
-            let BorderRadiusRectPayload {
-                top_left,
-                top_right,
-                bottom_right,
-                bottom_left,
-            } = &**border_radius_rect_payload;
-            collect_values(&[top_left, top_right, bottom_right, bottom_left], sharings);
-        }
-        StyleValueData::BorderRadius(border_radius_payload) => {
-            let BorderRadiusPayload {
-                horizontal_radius,
-                vertical_radius,
-                ..
-            } = &**border_radius_payload;
-            collect_values(&[horizontal_radius, vertical_radius], sharings);
-        }
-        _ => {}
+        _ => value.for_each_child(&mut |child| collect_unfixed_random_sharings_in_value(child, sharings)),
     }
 }
 
@@ -2576,6 +1647,8 @@ pub(crate) fn value_depends_on_inherited_info_for_property(value: &StyleValueDat
                 || matches!(value, StyleValueData::Keyword { keyword }
                     if matches!(*keyword, keyword::LARGER | keyword::SMALLER | keyword::MATH))
         }
+        prop::_WEBKIT_TEXT_STROKE_WIDTH => matches!(value, StyleValueData::Keyword { keyword }
+            if matches!(*keyword, keyword::THIN | keyword::MEDIUM | keyword::THICK)),
         prop::LINE_HEIGHT => value_contains_percentage(value),
         prop::TEXT_ALIGN => matches!(value, StyleValueData::Keyword { keyword }
             if matches!(*keyword, keyword::MATCH_PARENT | keyword::_LIBWEB_INHERIT_OR_CENTER)),
@@ -3116,42 +2189,29 @@ pub fn map_physical_to_logical_alias(property_id: u16, writing_mode: u8, directi
     }
 }
 
-struct ComputedStoreEntry<'a> {
-    property_id: u16,
-    /// The selected specified value; also the stored value when
-    /// `computed_kind` is `COMPUTED_KIND_UNCHANGED`.
-    data: &'a RetainedStyleValueData,
-    inheritance_dependent: bool,
-    /// The replacement style value when `computed_kind` is
-    /// `COMPUTED_KIND_STYLE_VALUE`.
-    computed_data: Option<RetainedStyleValueData>,
-    /// How Rust constructs the table value: with COMPUTED_KIND_UNCHANGED the
-    /// stored value is `data` itself; the other kinds carry a replacement in
-    /// `value` while `data` remains the specified value for the
-    /// inheritance-dependence bookkeeping.
-    computed_kind: u8,
-    value: f64,
+/// A longhand's computed value, as the drive found it.
+enum NativeValue {
+    /// The specified value is the computed value.
+    Unchanged,
+    Px(f64),
+    Integer(i32),
+    Superellipse(f64),
+    Number(f64),
+    Percentage(f64),
+    /// A font-style value of a font-style keyword code.
+    FontStyle(u8),
+    Keyword(u16),
+    StyleValue(StyleValueArc),
 }
 
-const COMPUTED_KIND_UNCHANGED: u8 = 0;
-/// A pixel length of `value`.
-const COMPUTED_KIND_PX_LENGTH: u8 = 1;
-/// An integer of `value`.
-const COMPUTED_KIND_INTEGER: u8 = 2;
-/// A superellipse with parameter `value`.
-const COMPUTED_KIND_SUPERELLIPSE: u8 = 3;
-/// A number of `value`.
-const COMPUTED_KIND_NUMBER: u8 = 4;
-/// A percentage of `value`.
-const COMPUTED_KIND_PERCENTAGE: u8 = 5;
-/// A font-style value of the font-style keyword code in `value`.
-const COMPUTED_KIND_FONT_STYLE: u8 = 6;
-/// A keyword whose numeric code is carried in `value`.
-const COMPUTED_KIND_KEYWORD: u8 = 8;
-/// A display value encoded as tag | first << 8 | second << 16 | third << 24.
-const COMPUTED_KIND_DISPLAY: u8 = 9;
-/// A complete Rust-owned style value transferred through `computed_data`.
-const COMPUTED_KIND_STYLE_VALUE: u8 = 10;
+struct ComputedStoreEntry<'a> {
+    property_id: u16,
+    /// The selected specified value; also the stored value when `computed` is `NativeValue::Unchanged`, and
+    /// otherwise what the inheritance-dependence bookkeeping reads.
+    data: &'a RetainedStyleValueData,
+    inheritance_dependent: bool,
+    computed: NativeValue,
+}
 
 #[derive(Clone, Copy)]
 #[repr(u8)]
@@ -3381,7 +2441,8 @@ fn property_has_dedicated_compute_rule(property_id: u16) -> bool {
     use crate::css::property_metadata::property_id as prop;
     matches!(
         property_id,
-        prop::ANIMATION_NAME
+        prop::_WEBKIT_TEXT_STROKE_WIDTH
+            | prop::ANIMATION_NAME
             | prop::BACKGROUND_ATTACHMENT
             | prop::BACKGROUND_CLIP
             | prop::BACKGROUND_ORIGIN
@@ -3612,7 +2673,6 @@ fn keyframe_parent_snapshot_of_record(
 }
 
 /// Results of one longhand drive that remain outside the Rust longhand table.
-#[derive(Clone)]
 pub struct LonghandDriverResults {
     /// Longhands whose specified-to-computed evaluation ran in this drive.
     pub longhand_evaluations: u32,
@@ -3813,56 +2873,45 @@ fn retained_new(value: StyleValueData) -> RetainedStyleValueData {
 /// absolute (resolved against this element's font, as inheritance requires).
 fn store_driven_value(writer: &mut GroupValuesWriter<'_>, entry: ComputedStoreEntry) {
     use crate::css::property_metadata::property_id as prop;
-    let inheritance_dependent_value = entry.inheritance_dependent.then(|| {
-        let inherits_computed_value = entry.computed_kind == COMPUTED_KIND_STYLE_VALUE
-            && entry.property_id != prop::COLOR
-            && crate::css::style_value::retained_value_depends_on_current_color(entry.data)
-            && !value_depends_on_inherited_info_for_property(entry.data.data(), entry.property_id);
-        match &entry.computed_data {
-            Some(computed_data) if inherits_computed_value => computed_data.clone(),
-            _ => entry.data.clone(),
+    let inheritance_dependent_value = entry.inheritance_dependent.then(|| match &entry.computed {
+        NativeValue::StyleValue(computed)
+            if entry.property_id != prop::COLOR
+                && crate::css::style_value::retained_value_depends_on_current_color(entry.data)
+                && !value_depends_on_inherited_info_for_property(entry.data.data(), entry.property_id) =>
+        {
+            RetainedStyleValueData::from_arc(computed.clone())
         }
+        _ => entry.data.clone(),
     });
     writer.set_inheritance_dependent_value(entry.property_id, inheritance_dependent_value);
     store_computed_value(writer, entry);
 }
 
 fn store_computed_value(writer: &mut GroupValuesWriter<'_>, entry: ComputedStoreEntry) {
-    let computed = match entry.computed_kind {
-        COMPUTED_KIND_UNCHANGED => {
+    let computed = match entry.computed {
+        NativeValue::Unchanged => {
             writer.set_or_keep_equal(entry.property_id, entry.data);
             return;
         }
-        COMPUTED_KIND_STYLE_VALUE => {
-            let computed = entry
-                .computed_data
-                .expect("a replaced computed value carries its replacement");
-            writer.set_or_keep_equal(entry.property_id, &computed);
+        NativeValue::StyleValue(computed) => {
+            writer.set_or_keep_equal(entry.property_id, &RetainedStyleValueData::from_arc(computed));
             return;
         }
-        COMPUTED_KIND_PX_LENGTH => StyleValueData::Length {
-            value: entry.value,
+        NativeValue::Px(value) => StyleValueData::Length {
+            value,
             unit: px_length_unit(),
         },
-        COMPUTED_KIND_INTEGER => StyleValueData::Integer {
-            value: entry.value as i32,
+        NativeValue::Integer(value) => StyleValueData::Integer { value },
+        NativeValue::Superellipse(value) => StyleValueData::Superellipse {
+            parameter: retained_new(StyleValueData::Number { value }),
         },
-        COMPUTED_KIND_SUPERELLIPSE => StyleValueData::Superellipse {
-            parameter: retained_new(StyleValueData::Number { value: entry.value }),
-        },
-        COMPUTED_KIND_NUMBER => StyleValueData::Number { value: entry.value },
-        COMPUTED_KIND_PERCENTAGE => StyleValueData::Percentage { value: entry.value },
-        COMPUTED_KIND_FONT_STYLE => StyleValueData::FontStyle {
-            font_style: entry.value as u8,
+        NativeValue::Number(value) => StyleValueData::Number { value },
+        NativeValue::Percentage(value) => StyleValueData::Percentage { value },
+        NativeValue::FontStyle(font_style) => StyleValueData::FontStyle {
+            font_style,
             angle_value: RetainedStyleValueData::none(),
         },
-        COMPUTED_KIND_KEYWORD => StyleValueData::Keyword {
-            keyword: entry.value as u16,
-        },
-        COMPUTED_KIND_DISPLAY => StyleValueData::Display {
-            raw: entry.value as u32,
-        },
-        _ => unreachable!("unknown computed longhand store kind"),
+        NativeValue::Keyword(keyword) => StyleValueData::Keyword { keyword },
     };
     writer.set_computed(entry.property_id, computed);
 }
@@ -4085,6 +3134,7 @@ pub(crate) unsafe fn drive_property_computation(
     results: &mut LonghandDriverResults,
     effective_color_scheme: &mut i16,
     coordinate_overflow_keywords: bool,
+    preserve_background_lists: bool,
 ) {
     use crate::css::property_metadata::{
         NUMBER_OF_LONGHAND_PROPERTIES, REQUIRES_COMPUTATION_ALWAYS, REQUIRES_COMPUTATION_CASCADED,
@@ -4184,6 +3234,9 @@ pub(crate) unsafe fn drive_property_computation(
             || (background_image_is_selected && BACKGROUND_LAYER_LONGHANDS.contains(&property_id));
         if !required_driver_input && !property_is_selected && computed_property_words.is_some() {
             continue;
+        }
+        if BACKGROUND_LAYER_LONGHANDS.contains(&property_id) {
+            writer.set_uncoordinated_background_value(property_id, None);
         }
         set_longhand_bit(&mut evaluated_words, property_id);
         results.longhand_evaluations = results
@@ -4550,16 +3603,6 @@ pub(crate) unsafe fn drive_property_computation(
             // The computed value: for properties without a dedicated rule the
             // absolutized value is the computed value; the dedicated rules that
             // have moved into the core run over the absolutized value here.
-            enum NativeValue {
-                Unchanged,
-                Px(f64),
-                Integer(i32),
-                Superellipse(f64),
-                Number(f64),
-                Percentage(f64),
-                FontStyle(u8),
-                StyleValue(StyleValueArc),
-            }
             use crate::css::absolutize::Absolutized;
             use crate::css::property_metadata::property_id as prop;
             let unsupported = || -> ! {
@@ -4579,6 +3622,28 @@ pub(crate) unsafe fn drive_property_computation(
                 })
             };
             let native = match (absolutized, inherited_property_id) {
+                (_, prop::_WEBKIT_TEXT_STROKE_WIDTH) if matches!(value_data, StyleValueData::Keyword { .. }) => {
+                    let StyleValueData::Keyword { keyword } = value_data else {
+                        unreachable!()
+                    };
+                    let multiplier = match *keyword {
+                        keyword::THIN => 1.0,
+                        keyword::MEDIUM => 3.0,
+                        keyword::THICK => 5.0,
+                        _ => unreachable!("a text stroke width keyword is thin, medium or thick"),
+                    };
+                    let context = length_resolution_context.expect("text stroke widths require font metrics");
+                    results.depends_on_viewport_metrics |= context.font_metrics_depend_on_viewport_metrics;
+                    NativeValue::Px(context.font_metrics.font_size * context.zoom * multiplier / 48.0)
+                }
+                (Some(absolutized), prop::_WEBKIT_TEXT_STROKE_WIDTH) => {
+                    absolutized.map_or(NativeValue::Unchanged, NativeValue::Px)
+                }
+                (None, prop::_WEBKIT_TEXT_STROKE_WIDTH) => NativeValue::Px(
+                    crate::css::calc::resolve_calculated_length_without_context(value_data, 0.0)
+                        .expect("a calculated text stroke width resolves to a length"),
+                ),
+
                 (
                     Some(absolutized),
                     prop::BORDER_BOTTOM_WIDTH
@@ -4846,7 +3911,14 @@ pub(crate) unsafe fn drive_property_computation(
                 ) => {
                     // NB: The background properties are coordinated at compute time rather
                     //     than use time, unlike other coordinating list property groups.
-                    let layer_count = background_image_list_length
+                    let declared_count = match value_data {
+                        StyleValueData::ValueList { values, .. } if preserve_background_lists => {
+                            Some(values.as_slice().len())
+                        }
+                        _ => None,
+                    };
+                    let layer_count = declared_count
+                        .or(background_image_list_length)
                         .or_else(|| {
                             writer.get(prop::BACKGROUND_IMAGE).and_then(|value| match value.data() {
                                 StyleValueData::ValueList { values, .. } => Some(values.as_slice().len()),
@@ -4856,21 +3928,29 @@ pub(crate) unsafe fn drive_property_computation(
                         .expect("background-image must be a computed value list");
                     let resolution_context =
                         length_resolution_context.expect("background lists require a length resolution context");
-                    match absolutize_for_rule(value_data, resolution_context, current_effective_color_scheme, results) {
-                        Absolutized::Unchanged => {
-                            match repeat_style_value_list_to_n_elements(value_data, layer_count) {
-                                Some(None) => NativeValue::Unchanged,
-                                Some(Some(value)) => NativeValue::StyleValue(value),
-                                None => unsupported(),
-                            }
-                        }
+                    let full = match absolutize_for_rule(
+                        value_data,
+                        resolution_context,
+                        current_effective_color_scheme,
+                        results,
+                    ) {
+                        Absolutized::Unchanged => match &externally_absolutized {
+                            Some(value) => std::borrow::Cow::Owned(RetainedStyleValueData::from_arc(value.clone())),
+                            None => std::borrow::Cow::Borrowed(value),
+                        },
                         Absolutized::Changed(value) => {
-                            match repeat_style_value_list_to_n_elements(value.data(), layer_count) {
-                                Some(None) => NativeValue::StyleValue(value.into_arc()),
-                                Some(Some(value)) => NativeValue::StyleValue(value),
-                                None => unsupported(),
-                            }
+                            std::borrow::Cow::Owned(RetainedStyleValueData::from_arc(value.into_arc()))
                         }
+                    };
+                    let excess = matches!(full.data(), StyleValueData::ValueList { values, .. } if values.as_slice().len() > layer_count);
+                    writer.set_uncoordinated_background_value(property_id, excess.then(|| full.clone().into_owned()));
+                    match repeat_style_value_list_to_n_elements(full.data(), layer_count) {
+                        Some(None) => match full {
+                            std::borrow::Cow::Borrowed(_) => NativeValue::Unchanged,
+                            std::borrow::Cow::Owned(value) => NativeValue::StyleValue(value.into_arc()),
+                        },
+                        Some(Some(value)) => NativeValue::StyleValue(value),
+                        None => unsupported(),
                     }
                 }
                 (Some(_), prop::ANIMATION_NAME)
@@ -5084,38 +4164,18 @@ pub(crate) unsafe fn drive_property_computation(
                 (NativeValue::Unchanged, Some(value)) => NativeValue::StyleValue(value),
                 (native, _) => native,
             };
-            let (computed_kind, computed_value, computed_data) = match native {
-                NativeValue::Px(px) => (COMPUTED_KIND_PX_LENGTH, px, None),
-                NativeValue::Integer(integer) => (COMPUTED_KIND_INTEGER, integer as f64, None),
-                NativeValue::Superellipse(parameter) => (COMPUTED_KIND_SUPERELLIPSE, parameter, None),
-                NativeValue::Number(number) => (COMPUTED_KIND_NUMBER, number, None),
-                NativeValue::Percentage(percentage) => (COMPUTED_KIND_PERCENTAGE, percentage, None),
-                NativeValue::FontStyle(font_style_keyword) => {
-                    (COMPUTED_KIND_FONT_STYLE, font_style_keyword as f64, None)
-                }
-                NativeValue::StyleValue(value) => (
-                    COMPUTED_KIND_STYLE_VALUE,
-                    0.0,
-                    Some(RetainedStyleValueData::from_arc(value)),
-                ),
-                NativeValue::Unchanged => (COMPUTED_KIND_UNCHANGED, 0.0, None),
-            };
             ComputedStoreEntry {
                 property_id,
                 data: value,
                 inheritance_dependent,
-                computed_data,
-                computed_kind,
-                value: computed_value,
+                computed: native,
             }
         } else {
             ComputedStoreEntry {
                 property_id,
                 data: value,
                 inheritance_dependent,
-                computed_data: None,
-                computed_kind: COMPUTED_KIND_UNCHANGED,
-                value: 0.0,
+                computed: NativeValue::Unchanged,
             }
         };
 
@@ -5134,16 +4194,14 @@ pub(crate) unsafe fn drive_property_computation(
                     .as_mut()
                     .expect("overflow-x must precede overflow-y in computation order");
                 if effective_overflow.changed_x {
-                    debug_assert_eq!(overflow_x_entry.computed_kind, COMPUTED_KIND_UNCHANGED);
-                    overflow_x_entry.computed_kind = COMPUTED_KIND_KEYWORD;
-                    overflow_x_entry.value = effective_overflow.x_keyword as f64;
+                    debug_assert!(matches!(overflow_x_entry.computed, NativeValue::Unchanged));
+                    overflow_x_entry.computed = NativeValue::Keyword(effective_overflow.x_keyword);
                     clear_longhand_bit(&mut important_words, prop::OVERFLOW_X);
                     clear_longhand_bit(&mut inherited_words, prop::OVERFLOW_X);
                 }
                 if effective_overflow.changed_y {
-                    debug_assert_eq!(entry.computed_kind, COMPUTED_KIND_UNCHANGED);
-                    entry.computed_kind = COMPUTED_KIND_KEYWORD;
-                    entry.value = effective_overflow.y_keyword as f64;
+                    debug_assert!(matches!(entry.computed, NativeValue::Unchanged));
+                    entry.computed = NativeValue::Keyword(effective_overflow.y_keyword);
                     clear_longhand_bit(&mut important_words, prop::OVERFLOW_Y);
                     clear_longhand_bit(&mut inherited_words, prop::OVERFLOW_Y);
                 }
@@ -5177,9 +4235,8 @@ pub(crate) unsafe fn drive_property_computation(
                 parent_direction_is_ltr,
             );
             if adjustment.changed {
-                debug_assert_eq!(entry.computed_kind, COMPUTED_KIND_UNCHANGED);
-                entry.computed_kind = COMPUTED_KIND_KEYWORD;
-                entry.value = adjustment.keyword as f64;
+                debug_assert!(matches!(entry.computed, NativeValue::Unchanged));
+                entry.computed = NativeValue::Keyword(adjustment.keyword);
                 clear_longhand_bit(&mut important_words, property_id);
                 clear_longhand_bit(&mut inherited_words, property_id);
                 if adjustment.inherited {
@@ -5799,6 +4856,8 @@ pub(crate) fn font_value_computes_natively(property_id: u16, data: &StyleValueDa
         | prop::FONT_KERNING
         | prop::FONT_LANGUAGE_OVERRIDE
         | prop::FONT_OPTICAL_SIZING
+        | prop::FONT_SYNTHESIS_STYLE
+        | prop::FONT_SYNTHESIS_WEIGHT
         | prop::FONT_VARIANT_ALTERNATES
         | prop::FONT_VARIANT_CAPS
         | prop::FONT_VARIANT_EAST_ASIAN
@@ -7056,6 +6115,7 @@ unsafe fn create_document_style_record(
             force_position_static: false,
             force_symbol_display_inline: false,
             webkit_box_layout_transformation_applies: false,
+            in_top_layer: false,
         },
         color_scheme_input: input.color_scheme_input,
         is_th_element: false,
@@ -7107,6 +6167,7 @@ unsafe fn create_document_style_record(
                     &mut results,
                     &mut effective_color_scheme,
                     true,
+                    false,
                 );
             }
         }
@@ -7169,6 +6230,7 @@ pub(crate) struct AnimationKeyframeLonghands {
 /// from the underlying style, then all of that keyframe's specified values are
 /// cascaded together before its selected properties are evaluated. A custom
 /// property's value is the one `custom_property_values` holds at its index.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_animation_keyframe_longhands(
     underlying_longhands: crate::css::style::ViewLonghands<'_>,
     style_engine: &crate::css::style::StyleEngine,
@@ -7177,8 +6239,8 @@ pub(crate) fn compute_animation_keyframe_longhands(
     environment: &FfiStyleComputationEnvironment,
     length_contexts: &FfiAnimationLengthContexts,
     custom_property_values: &[Option<RetainedStyleValueData>],
+    preserve_background_lists: bool,
 ) -> AnimationKeyframeLonghands {
-    crate::css::ffi_stats::bump(crate::css::ffi_stats::FfiOp::AnimationKeyframeLonghandEntry);
     use crate::css::property_metadata::{
         FIRST_LONGHAND_PROPERTY_ID, LAST_LONGHAND_PROPERTY_ID, NUMBER_OF_LONGHAND_PROPERTIES,
     };
@@ -7332,6 +6394,7 @@ pub(crate) fn compute_animation_keyframe_longhands(
                         &mut results,
                         &mut effective_color_scheme,
                         false,
+                        preserve_background_lists,
                     );
                 }
             }
@@ -7606,6 +6669,7 @@ impl<'a> HostSampledEffects<'a> {
 /// What a sample reads of the element it samples and of the working set it samples over.
 pub(crate) struct AnimationSampleInput<'a> {
     pub(crate) style_node: u32,
+    pub(crate) record_dependencies: bool,
     /// The pseudo-element sampled, or `NO_PSEUDO_ELEMENT` for the element itself.
     pub(crate) pseudo_kind: u8,
     pub(crate) effects: HostSampledEffects<'a>,
@@ -7726,6 +6790,7 @@ impl FfiHostAnimationSample {
         };
         let input = AnimationSampleInput {
             style_node: self.style_node,
+            record_dependencies: true,
             pseudo_kind: self.pseudo_kind,
             effects,
             longhands,
@@ -7750,6 +6815,171 @@ impl FfiHostAnimationSample {
             length_contexts: self.length_contexts,
         };
         (input, callbacks)
+    }
+}
+
+#[repr(C)]
+pub struct FfiReflectedKeyframeProperty {
+    pub keyframe_index: usize,
+    pub property_id: u16,
+    pub value: *const StyleValueData,
+}
+
+/// Compute CSS keyframe declarations without sampling or publishing an effect.
+/// The callback receives underlying values with `keyframe_count` as their index.
+///
+/// # Safety
+/// The input, declarations, resource context, and callback must be live for the call.
+/// No caller may hold a borrow of the style engine.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_compute_css_keyframe_values(
+    input: &FfiHostAnimationSample,
+    read: &crate::render_state::BegunRead,
+    properties: *const FfiReflectedKeyframeProperty,
+    property_count: usize,
+    keyframe_count: usize,
+    resource_context: &FfiStyleSheetResourceContext,
+    context: *mut c_void,
+    emit: unsafe extern "C" fn(*mut c_void, usize, u16, *const StyleValueData),
+) {
+    use crate::css::animation as anim;
+    use crate::css::style::effect_descriptions::{
+        PublishedDeclaration, PublishedEffect, PublishedResourceContext, PublishedValue,
+    };
+    use crate::css::style::engine_calls::{document_host, with_engine};
+
+    // SAFETY: Guaranteed by the caller.
+    let (host, (sample, mut callbacks), properties) = unsafe {
+        (
+            document_host(input.host),
+            input.adopt(),
+            ak::slice_from_raw_parts(properties, property_count),
+        )
+    };
+    let Some(node) = crate::css::style::tree::StyleNodeID::from_raw(sample.style_node) else {
+        return;
+    };
+    let mut frames = vec![Vec::new(); keyframe_count];
+    for property in properties {
+        // SAFETY: Each declaration's value is live for the call.
+        let value = unsafe {
+            RetainedStyleValueData::from_retained_pointer(crate::css::style_value::retain_style_value(property.value))
+        };
+        frames[property.keyframe_index].push(PublishedDeclaration {
+            property_id: property.property_id,
+            value: PublishedValue::Declared(value),
+        });
+    }
+    let resource_context = resource_context.has_value.then(|| PublishedResourceContext {
+        // SAFETY: The resource context's URL is live for the call.
+        base_url: unsafe { ak::slice_from_raw_parts(resource_context.base_url, resource_context.base_url_length) }
+            .into(),
+        origin_clean: resource_context.origin_clean,
+    });
+    let effect = PublishedEffect::for_keyframe_computation(frames, resource_context);
+    let resolved = with_engine(read, host, |engine| {
+        let (writing_mode, direction) = computed_writing_mode_and_direction(sample.longhands);
+        let conversions = std::cell::RefCell::new(anim::KeyframeConversionCache::new(
+            None,
+            sample.stores,
+            sample.custom_property_registration_generation,
+        ));
+        anim::resolve_published_animation_declarations(
+            engine,
+            node,
+            sample.pseudo(),
+            &[anim::SelectedEffect {
+                effect: &effect,
+                current_key: 0.0,
+            }],
+            sample.longhands,
+            sample.stores,
+            writing_mode,
+            direction,
+            &[],
+            &conversions,
+        )
+        .resolved
+    });
+    let length_contexts = callbacks.length_contexts(resolved.container_relative_length_unit_mask);
+    let values = with_engine(read, host, |engine| {
+        let sibling_position = resolved
+            .uses_tree_counting_function
+            .then(|| engine.element_sibling_position(node))
+            .flatten();
+        let random_base_values = resolved
+            .unfixed_random_sharings
+            .iter()
+            .map(|sharing| FfiRandomBaseValue {
+                source: sharing.source.cast(),
+                value: engine.ensure_random_base_value(Some(node), &sharing.name, sharing.element_shared),
+            })
+            .collect::<Vec<_>>();
+        let mut environment = *sample.environment;
+        environment.has_tree_counting_context = sibling_position.is_some();
+        environment.sibling_count = sibling_position.map_or(0, |(count, _)| u64::from(count));
+        environment.sibling_index = sibling_position.map_or(0, |(_, index)| u64::from(index));
+        environment.random_base_values = random_base_values.as_ptr();
+        environment.random_base_value_count = random_base_values.len();
+        compute_animation_keyframe_longhands(
+            sample.longhands,
+            engine,
+            sample.inheritance_parent_record.as_ref(),
+            &resolved.properties,
+            &environment,
+            &length_contexts,
+            &[],
+            true,
+        )
+        .values
+    });
+    for (property, value) in resolved.properties.iter().zip(&values) {
+        let coordinated = sample
+            .longhands
+            .handle(property.physical_property_id)
+            .expect("an animated longhand has an underlying value");
+        let underlying = sample
+            .longhands
+            .uncoordinated_background_value(property.physical_property_id)
+            .unwrap_or(coordinated);
+        let mut reflected = value.clone();
+        // AD-HOC: Computed keyframe values need not have the underlying background list's length. For web
+        // compatibility, reflection preserves underlying layers beyond a shorter keyframe declaration.
+        if BACKGROUND_LAYER_LONGHANDS.contains(&property.physical_property_id)
+            && let StyleValueData::ValueList {
+                values: declared,
+                separator,
+                collapsible,
+            } = value.data()
+            && let StyleValueData::ValueList { values: base, .. } = coordinated.data()
+            && declared.as_slice().len() < base.as_slice().len()
+        {
+            let mut items = declared.as_slice().to_vec();
+            items.extend_from_slice(&base.as_slice()[items.len()..]);
+            reflected = RetainedStyleValueData::from_owned(StyleValueData::ValueList {
+                values: crate::css::style_value::RetainedStyleValueDataList::from_retained_values(items),
+                separator: *separator,
+                collapsible: *collapsible,
+            });
+        }
+        // SAFETY: The callback and underlying value are live for this call.
+        unsafe {
+            emit(
+                context,
+                keyframe_count,
+                property.physical_property_id,
+                underlying.pointer(),
+            );
+        }
+        // SAFETY: The callback is live, and each computed value stays live until it returns.
+        unsafe {
+            emit(
+                context,
+                property.keyframe_index,
+                property.physical_property_id,
+                reflected.pointer(),
+            );
+        };
     }
 }
 
@@ -7778,6 +7008,63 @@ pub unsafe extern "C" fn rust_sample_animation_effects(
     }
     let step = with_engine_and_arena(read, host, |engine, arena| {
         sample_in_engine(&sample, &mut callbacks, engine, arena)
+    });
+    finish_sample_with_host(&sample, &mut callbacks, host, read, step)
+}
+
+/// Sample an isolated effect list at the endpoint-inclusive keys supplied by the host.
+///
+/// # Safety
+/// The inputs and every value in the descriptions must remain live for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rust_sample_animation_effects_for_commit_styles(
+    input: &FfiHostAnimationSample,
+    descriptions: &crate::css::style::bridge::FfiAnimationEffectDescriptions,
+    read: &crate::render_state::BegunRead,
+) -> FfiHostAnimationSampleResult {
+    use crate::css::animation as anim;
+    use crate::css::style::engine_calls::{document_host, with_engine_and_arena};
+
+    // SAFETY: Guaranteed by the caller.
+    let (host, (mut sample, mut callbacks), descriptions) =
+        unsafe { (document_host(input.host), input.adopt(), descriptions.effects()) };
+    sample.record_dependencies = false;
+    let composed = sample
+        .effects
+        .as_slice()
+        .iter()
+        .filter_map(|effect| {
+            let description = descriptions
+                .iter()
+                .find(|description| description.identity == effect.identity)?;
+            if description.keyframes().len() < 2 {
+                return None;
+            }
+            Some(anim::FfiSampledAnimationEffect {
+                effect: anim::FfiAnimationPreparationEffect {
+                    identity: effect.identity,
+                    generation: effect.generation,
+                },
+                current_key: Option::<f64>::from(effect.current_key)?,
+            })
+        })
+        .collect();
+    let step = with_engine_and_arena(read, host, |engine, arena| {
+        let element_box = crate::layout::node_data::NodeSlotId {
+            index: sample.element_box_slot,
+        };
+        let reference_box =
+            crate::painting::ffi::committed_transform_reference_box(&arena.paintable_rows(), element_box);
+        let step = begin_animation_sample(
+            &sample,
+            &mut callbacks,
+            engine,
+            &descriptions,
+            composed,
+            reference_box,
+            Default::default(),
+        );
+        finish_sample_in_engine(&sample, &mut callbacks, engine, reference_box, step)
     });
     finish_sample_with_host(&sample, &mut callbacks, host, read, step)
 }
@@ -7838,7 +7125,7 @@ fn sample_in_engine(
     };
     let reference_box = crate::painting::ffi::committed_transform_reference_box(&arena.paintable_rows(), element_box);
     let composed = host_sampled_effects(input, engine);
-    match begin_animation_sample(
+    let step = begin_animation_sample(
         input,
         host,
         engine,
@@ -7846,7 +7133,18 @@ fn sample_in_engine(
         composed,
         reference_box,
         Default::default(),
-    ) {
+    );
+    finish_sample_in_engine(input, host, engine, reference_box, step)
+}
+
+fn finish_sample_in_engine(
+    input: &AnimationSampleInput,
+    host: &mut dyn AnimationSampleHost,
+    engine: &mut crate::css::style::StyleEngine,
+    reference_box: Option<CssPixelRect>,
+    step: AnimationSampleStep,
+) -> AnimationSampleStep {
+    match step {
         AnimationSampleStep::Resolved(sample) => match engine_length_contexts(input, engine, &sample) {
             Some(length_contexts) => AnimationSampleStep::Sampled(finish_animation_sample(
                 input,
@@ -8160,11 +7458,11 @@ fn finish_animation_sample(
         node,
         composed,
         resolved,
-        custom_properties,
+        mut custom_properties,
         mut result,
     } = sample;
     let table = input.longhands;
-    if input.pseudo_kind == crate::css::cascaded_properties::NO_PSEUDO_ELEMENT {
+    if input.record_dependencies && input.pseudo_kind == crate::css::cascaded_properties::NO_PSEUDO_ELEMENT {
         engine
             .note_keyframes_read_parent_reset_values(node, result.keyframes_inherited_non_inherited_style_groups != 0);
     }
@@ -8216,6 +7514,7 @@ fn finish_animation_sample(
         &environment,
         length_contexts,
         &custom_values,
+        false,
     );
     result.depends_on_viewport_metrics = computed_keyframes.depends_on_viewport_metrics;
     result.font_metrics_depend_on_viewport_metrics = computed_keyframes.font_metrics_depend_on_viewport_metrics;
@@ -8240,7 +7539,7 @@ fn finish_animation_sample(
 
     let has_non_custom_property_animation = resolved.properties.iter().any(|property| property.custom_name_id == 0);
 
-    let custom_results = anim::evaluate_animations(anim::ComputedAnimationBatch {
+    let mut batch = anim::ComputedAnimationBatch {
         context: input.animation_context(Some(&length_contexts.remaining), reference_box),
         device_pixels_per_css_pixel: input.environment.device_pixels_per_css_pixel,
         sampled_effects: &composed,
@@ -8255,7 +7554,9 @@ fn finish_animation_sample(
         overlay: host.overlay_for_mutation(),
         custom_underlying_values: &underlying_values,
         custom_initial_values: &initial_values,
-    });
+    };
+    let mut preparation = anim::prepare_animations(&mut batch);
+    let custom_results = anim::evaluate_prepared_animations(&preparation, &mut batch);
     result.outcome = FfiHostAnimationSampleOutcome::Evaluated;
     if !custom_results.is_empty() {
         let mut retained = custom_results
@@ -8276,19 +7577,33 @@ fn finish_animation_sample(
                 .cast::<crate::css::custom_properties::CustomPropertyStore>()
                 .as_ref()
         };
-        let names_in_a_cycle = engine.custom_properties_in_an_animated_cycle(
+        let cyclic_declarations = engine.check_custom_property_animation_cycles(
             node,
             cycle_pseudo,
             input.stores.base,
             input.stores.inheritance,
             &retained,
+            &mut custom_properties.intervals,
         );
-        for name in names_in_a_cycle {
-            let value = registry.invalid_at_computed_value_time(&name, inherited);
-            match retained.iter_mut().find(|(animated, _)| *animated == name) {
-                Some((_, animated)) => *animated = value,
-                None => retained.push((name, value)),
+        // NB: Preparations containing custom properties are not cached, so this sample owns its preparation.
+        let preparation =
+            std::sync::Arc::get_mut(&mut preparation).expect("custom-property preparations are not shared");
+        if preparation.replace_cyclic_custom_property_endpoints(&custom_properties.intervals, registry, inherited) {
+            retained = anim::evaluate_prepared_animations(preparation, &mut batch)
+                .into_iter()
+                .map(|(custom_name_id, value)| (custom_properties.name(custom_name_id).clone(), value))
+                .collect();
+            // NB: Resolve surviving unset markers to the inherited or initial value. See the AD-HOC comment
+            //     in PreparedAnimationBatch::replace_cyclic_custom_property_endpoints for why this is deferred.
+            for (name, value) in &mut retained {
+                if matches!(value.data(), StyleValueData::Keyword { keyword } if *keyword == keyword::UNSET) {
+                    *value = registry.invalid_at_computed_value_time(name, inherited);
+                }
             }
+        }
+        for name in cyclic_declarations {
+            let value = registry.invalid_at_computed_value_time(&name, inherited);
+            retained.push((name, value));
         }
         // The element's own custom properties that read an animated one move with it, whether or
         // not they resolved to what it inherits.
@@ -8318,6 +7633,23 @@ fn finish_animation_sample(
                 uncached_interval_values_may_need_substitution,
                 input.custom_property_registration_generation,
             );
+        }
+        assert_eq!(
+            custom_properties.registration_generation,
+            engine.custom_property_registration_generation(),
+            "animation sampling preserves custom property registrations"
+        );
+        let registry = engine.custom_property_registry();
+        let current_effects = described_effects(input, engine);
+        for interval in custom_properties.intervals {
+            let sampled_effect = composed[interval.effect_index].effect;
+            let effect = current_effects
+                .iter()
+                .find(|effect| {
+                    effect.identity == sampled_effect.identity && effect.generation == sampled_effect.generation
+                })
+                .expect("a sampled effect remains published with the same generation");
+            effect.update_retained_custom_property_interval_values(interval, registry);
         }
         let rows = retained
             .iter()
@@ -8439,6 +7771,13 @@ fn post_compute_adjusted_values(
         StyleValueData::Keyword { keyword: keyword::NONE },
     );
     adjust(
+        transformation.set_position_absolute,
+        prop::POSITION,
+        StyleValueData::Keyword {
+            keyword: keyword::ABSOLUTE,
+        },
+    );
+    adjust(
         adjusted_display != adjustment.display_before,
         prop::DISPLAY,
         StyleValueData::Display {
@@ -8469,6 +7808,7 @@ fn post_compute_adjusted_values(
     );
     for (changed, property_id) in [
         (transformation.set_float_none, prop::FLOAT),
+        (transformation.set_position_absolute, prop::POSITION),
         (
             transformation.changed_display || element_adjustment.changed_display,
             prop::DISPLAY,

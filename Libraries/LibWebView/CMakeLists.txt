@@ -2,7 +2,7 @@ set(SOURCES
     AccessibilityTreeManager.cpp
     Application.cpp
     ApplyHistoryStep.cpp
-    AudioServerAudibility.cpp
+    AudioServerActivity.cpp
     AudioServerControlClient.cpp
     Autocomplete.cpp
     AutocompleteMuxer.cpp
@@ -10,7 +10,6 @@ set(SOURCES
     AutocompleteService.cpp
     BlobURLStore.cpp
     BrowsingSession.cpp
-    BookmarkStore.cpp
     CanonicalBrowsingContext.cpp
     CanonicalBrowsingContextGroup.cpp
     CanonicalDocument.cpp
@@ -25,10 +24,10 @@ set(SOURCES
     CookieJar.cpp
     CrashReport.cpp
     CrashReportDiagnostics.cpp
+    CrashReportOutbox.cpp
     CrashReportReview.cpp
     CrashReportStore.cpp
     CrashReportSubmission.cpp
-    DownloadPresentation.cpp
     DownloadSegmentation.cpp
     DownloadStore.cpp
     ExternalURLHandler.cpp
@@ -42,18 +41,21 @@ set(SOURCES
     HistoryDebug.cpp
     HistoryStore.cpp
     HSTSStore.cpp
+    ImageDecoderControlClient.cpp
+    ImageDecoderManager.cpp
     LingeringIndicator.cpp
-    Menu.cpp
     NavigationLoader.cpp
     Omnibox.cpp
     OmniboxEngagement.cpp
     NotificationAttribution.cpp
     NotificationFreedesktopArguments.cpp
     NotificationManager.cpp
+    PageBackingStores.cpp
     PageTranslation.cpp
     PictureInPictureManager.cpp
     PictureInPictureWindow.cpp
     PermissionManager.cpp
+    PlatformFeatureDecisions.cpp
     Process.cpp
     ProcessManager.cpp
     ProcessSnapshot.cpp
@@ -68,13 +70,12 @@ set(SOURCES
     RequestServerSiteBindings.cpp
     SearchEngine.cpp
     SessionHistory.cpp
-    SessionHistorySnapshotStorage.cpp
     SessionHistoryTraversalQueue.cpp
-    SessionStore.cpp
     Settings.cpp
     SiteCompatibility.cpp
     StorageAreaRegistry.cpp
     StorageJar.cpp
+    SystemProbeClient.cpp
     TestSpellChecker.cpp
     TestTranslator.cpp
     Translator.cpp
@@ -91,28 +92,29 @@ set(SOURCES
     WebDriverBiDiNetwork.cpp
     WebDriverBrowserConnection.cpp
     WebUI.cpp
-    WebUI/BookmarksUI.cpp
-    WebUI/DownloadsUI.cpp
-    WebUI/HistoryUI.cpp
+    WebUI/ApplicationWebUI.cpp
+    WebUI/CrashReportsUI.cpp
+    WebUI/SupportUI.cpp
     WebUI/SettingsUI.cpp
-    WebUI/VersionUI.cpp
     WebWorkerClient.cpp
-    WorkerProcessManager.cpp
+    WorkerAgentManager.cpp
 )
 
 if (APPLE)
     list(APPEND SOURCES
         CrashReportPOSIX.cpp
-        LaunchURLsMacOS.cpp
-        MicrophoneAuthorizerMacOS.mm
         NotificationBackendMacOS.mm
-        PlatformColorsMacOS.cpp
         ProcessReaper.cpp
         QuarantineMacOS.mm
+        StringConversionsMacOS.mm
     )
-    set_source_files_properties(MicrophoneAuthorizerMacOS.mm NotificationBackendMacOS.mm QuarantineMacOS.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    set_source_files_properties(NotificationBackendMacOS.mm QuarantineMacOS.mm StringConversionsMacOS.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
 elseif (LINUX)
     list(APPEND SOURCES AudioDaemonSocket.cpp CrashReportPOSIX.cpp)
+endif()
+
+if (NOT WIN32)
+    list(APPEND SOURCES TerminalInputParser.cpp TerminalWebView.cpp)
 endif()
 
 if (LINUX OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
@@ -130,6 +132,8 @@ set(GENERATED_SOURCES
     ${GENERATED_SOURCES}
     ../../Services/AudioServer/AudioServerControlClientEndpoint.h
     ../../Services/AudioServer/AudioServerControlEndpoint.h
+    ../../Services/ImageDecoder/ImageDecoderControlClientEndpoint.h
+    ../../Services/ImageDecoder/ImageDecoderControlEndpoint.h
     ../../Services/RequestServer/RequestClientEndpoint.h
     ../../Services/RequestServer/RequestServerEndpoint.h
     ../../Services/VideoDecoderServer/VideoDecoderServerControlClientEndpoint.h
@@ -167,8 +171,8 @@ add_custom_target(generate_build_information DEPENDS ${build_information_stamp})
 
 ladybird_lib(LibWebView webview EXPLICIT_SYMBOL_EXPORT)
 add_dependencies(LibWebView generate_build_information)
-target_link_libraries(LibWebView PUBLIC LibCompositing LibSandbox LibWebCommon)
-target_link_libraries(LibWebView PRIVATE LibCore LibCrypto LibDatabase LibDevTools LibFileSystem LibGfx LibHTTP LibImageDecoderClient LibIPC LibRequests LibMedia LibMediaClient LibUnicode LibURL LibTextCodec LibThreading SDL3::SDL3)
+target_link_libraries(LibWebView PUBLIC LibCompositing LibPlatformFeatures LibSandbox LibWebCommon)
+target_link_libraries(LibWebView PRIVATE LibCore LibCrypto LibDatabase LibDevTools LibFileSystem LibGfx LibHTTP LibImageDecoderClient LibIPC LibRequests LibMedia LibMediaClient LibUnicode LibURL LibTextCodec LibThreading)
 
 if (LINUX)
     # The connect broker asks the audio library where the daemon is before connecting a helper to it.
@@ -180,7 +184,7 @@ if (LINUX)
 endif()
 
 if (APPLE)
-    target_link_libraries(LibWebView PRIVATE "-framework AVFoundation" "-framework Carbon" "-framework CoreServices" "-framework Foundation" "-framework UserNotifications")
+    target_link_libraries(LibWebView PRIVATE "-framework CoreServices" "-framework Foundation" "-framework UserNotifications")
 endif()
 
 if (LINUX OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")

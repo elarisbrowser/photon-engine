@@ -33,14 +33,14 @@ public:
 
     IsPrivate is_private() const { return m_is_private; }
 
+    // No two sessions of the application share an ID.
+    u64 id() const { return m_id; }
+
     // NB: Null for the ordinary session until Application fills these in during startup.
     OwnPtr<CookieJar> cookie_jar;
     OwnPtr<StorageJar> storage_jar;
     OwnPtr<BlobURLStore> blob_url_store;
     OwnPtr<HSTSStore> hsts_store;
-    OwnPtr<FaviconStore> favicon_store;
-    OwnPtr<HistoryStore> history_store;
-    OwnPtr<SessionStore> session_store;
     OwnPtr<PermissionManager> permission_manager;
     OwnPtr<BookmarkStore> owned_bookmark_store;
     OwnPtr<DownloadStore> owned_download_store;
@@ -57,6 +57,7 @@ private:
 
     explicit BrowsingSession(IsPrivate);
 
+    u64 m_id { 0 };
     IsPrivate m_is_private { IsPrivate::No };
 };
 

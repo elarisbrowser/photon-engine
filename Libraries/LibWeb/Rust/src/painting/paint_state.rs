@@ -87,6 +87,7 @@ impl PaintState {
     pub(crate) fn reset_visual_context_state(&mut self) {
         self.visual_context = crate::painting::visual_context::VisualContextState {
             needs_to_refresh_scroll_state: true,
+            trace: self.visual_context.trace.take(),
             ..Default::default()
         };
         self.visual_context
@@ -123,11 +124,10 @@ impl crate::layout::LayoutNodeArena {
         true
     }
 
-    /// Lends the visual context state out of the paint state to `update`, which reads the rest of the arena beside it:
-    /// refreshing the scroll state and the sticky constraints reads the rows while it writes the state.
+    /// Lends the visual context state to `update`, which can read the rows and push paint damage beside it.
     pub(crate) fn with_visual_context_state_lent<T>(
         &mut self,
-        update: impl FnOnce(&Self, &mut crate::painting::visual_context::VisualContextState) -> T,
+        update: impl FnOnce(&mut Self, &mut crate::painting::visual_context::VisualContextState) -> T,
     ) -> T {
         let mut state = std::mem::take(&mut self.paint_state_mut().visual_context);
         let answer = update(self, &mut state);

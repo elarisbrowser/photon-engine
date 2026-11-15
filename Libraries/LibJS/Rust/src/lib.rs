@@ -105,7 +105,6 @@ pub mod fast_hash;
 #[cfg(not(test))]
 pub mod frontend_host;
 #[cfg(any(not(test), target_os = "linux"))]
-pub mod futex;
 #[cfg(not(test))]
 pub mod gc;
 #[cfg(not(test))]
@@ -115,6 +114,8 @@ pub mod host;
 pub mod interpreter;
 #[cfg(all(not(test), feature = "jit"))]
 pub mod jit;
+#[cfg(all(feature = "jit", windows, not(target_arch = "x86_64")))]
+compile_error!("the JIT supports Windows on x86-64 only: build without the jit feature (ENABLE_JS_JIT=OFF)");
 // NB: Without the JIT, the runtime sees the same interface to it, with nothing behind it.
 #[cfg(all(not(test), not(feature = "jit")))]
 #[path = "jit/disabled.rs"]
@@ -148,6 +149,7 @@ pub mod slice_block;
 pub mod source_code;
 #[cfg(not(test))]
 pub mod source_range;
+pub mod source_text;
 #[cfg(not(test))]
 pub mod standard_output;
 pub mod token;

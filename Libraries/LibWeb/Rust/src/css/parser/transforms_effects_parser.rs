@@ -213,7 +213,7 @@ pub(crate) fn parse_transform_function(
     Some(transformation(property_id::TRANSFORM, function as u8, values))
 }
 
-fn non_whitespace(values: &[ComponentValue]) -> Vec<&ComponentValue> {
+fn non_whitespace(values: &[ComponentValue]) -> smallvec::SmallVec<[&ComponentValue; 8]> {
     values.iter().filter(|value| !value.is_whitespace()).collect()
 }
 
@@ -366,7 +366,7 @@ fn easing(
     let [x1, y1, x2, y2] = coordinates.map(|value| value.map_or_else(RetainedStyleValueData::none, retained));
     StyleValueData::Easing(StyleValueBox::new(EasingPayload {
         kind,
-        linear_stops: RetainedLinearEasingStopList::from_retained_elements(linear_stops),
+        linear_stops: RetainedLinearEasingStopList::from_vec(linear_stops),
         x1,
         y1,
         x2,

@@ -7,9 +7,12 @@
 #include "HeadlessTest.h"
 #include <AK/String.h>
 #include <LibCore/EventLoop.h>
+#include <LibRequests/Request.h>
+#include <LibRequests/RequestClient.h>
 #include <LibTest/TestCase.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/Autocomplete.h>
+#include <LibWebView/AutocompleteRanker.h>
 #include <LibWebView/AutocompleteService.h>
 #include <LibWebView/Settings.h>
 #include <stdlib.h>
@@ -29,7 +32,9 @@ public:
     }
 };
 
-class TestApplication : public Test::HeadlessApplication {
+class TestApplication
+    : public Test::HeadlessApplication
+    , public WebView::AutocompleteHost {
     WEB_VIEW_APPLICATION(TestApplication)
 
 public:
@@ -48,6 +53,60 @@ public:
     virtual void resolve_external_url_handler(URL::URL const& url, WebView::ExternalURLHandlerCallback callback) const override
     {
         m_pending_external_url_handler_queries.append({ url, move(callback) });
+    }
+
+    virtual WebView::AutocompleteService& autocomplete_service() override
+    {
+        if (!m_autocomplete_service)
+            m_autocomplete_service = make<WebView::AutocompleteService>(Core::EventLoop::current(), Optional<ByteString> {});
+        return *m_autocomplete_service;
+    }
+
+    virtual WebView::Settings& autocomplete_settings() override { return WebView::Application::settings(); }
+
+    // While set, a test answers the requests for remote suggestions itself.
+    Function<void(Function<void(RemoteResponse)>)> on_fetch_remote_suggestions;
+
+    virtual Function<void()> fetch_remote_suggestions(WebView::SearchEngine const& engine, String const& query, WebView::IsPrivate is_private, Function<void(RemoteResponse)> on_response) override
+    {
+        if (on_fetch_remote_suggestions) {
+            on_fetch_remote_suggestions(move(on_response));
+            return [] { };
+        }
+        auto url = engine.suggestions_url_for_query(query);
+        auto client = WebView::Application::request_server_client(is_private);
+        if (!url.has_value() || client.is_error()) {
+            on_response({ .had_network_error = true, .response_code = {}, .content_type = {}, .body = {} });
+            return [] { };
+        }
+        auto request = client.value()->start_request("GET"sv, *url, HTTP::Cookie::SameSiteContext::same_site());
+        auto request_id = m_next_request_id++;
+        request->set_buffered_request_finished_callback(
+            [this, request_id, on_response = move(on_response)](u64, Requests::RequestTimingInfo const&, Optional<Requests::NetworkError> const& network_error,
+                HTTP::HeaderList const& headers, Optional<u32> response_code, Optional<String> const&, Requests::CacheState, Core::ImmutableBytes payload) {
+                // A canceled request can still finish before its deferred stop runs.
+                if (!m_requests.contains(request_id))
+                    return;
+
+                // A request cannot be destroyed from inside its own callback.
+                Core::deferred_invoke([this, request_id] { m_requests.remove(request_id); });
+                Optional<ByteString> content_type;
+                if (auto value = headers.get("Content-Type"sv); value.has_value())
+                    content_type = *value;
+                on_response({
+                    .had_network_error = network_error.has_value(),
+                    .response_code = response_code,
+                    .content_type = move(content_type),
+                    .body = MUST(ByteBuffer::copy(payload.bytes())),
+                });
+            });
+        m_requests.set(request_id, request.release_nonnull());
+        return [this, request_id] {
+            if (auto request = m_requests.get(request_id); request.has_value()) {
+                Core::deferred_invoke([request = *request] { request->stop(); });
+                m_requests.remove(request_id);
+            }
+        };
     }
 
     size_t pending_external_url_handler_query_count() const { return m_pending_external_url_handler_queries.size(); }
@@ -73,6 +132,9 @@ private:
     };
 
     mutable Vector<PendingExternalURLHandlerQuery> m_pending_external_url_handler_queries;
+    OwnPtr<WebView::AutocompleteService> m_autocomplete_service;
+    HashMap<u64, NonnullRefPtr<Requests::Request>> m_requests;
+    u64 m_next_request_id { 1 };
 };
 
 }
@@ -89,57 +151,30 @@ TEST_CASE(autocomplete)
     auto app = TRY_OR_FAIL(environment.create_application<TestApplication>());
 
     WebView::Application::settings().set_search_engine_settings({});
-    WebView::Application::autocomplete_service().update_bookmarks({ {
-        .url = "https://ladybird.test/"_string,
-        .title = "Ladybird test bookmark"_string,
-        .folder = {},
-        .favicon_png = {},
-    } });
-
     auto saw_bookmark = false;
-    auto saw_bookmark_update = false;
-    auto requested_bookmark_update = false;
-    auto bookmark_update_completed = false;
+    auto bookmark_query_completed = false;
     {
-        WebView::Autocomplete autocomplete { WebView::IsPrivate::No };
-        auto query_returned = false;
+        WebView::Autocomplete autocomplete { *app, WebView::IsPrivate::No };
         autocomplete.on_autocomplete_query_complete = [&](auto, auto const& suggestions, WebView::AutocompleteResultKind kind) {
             VERIFY(kind == WebView::AutocompleteResultKind::Final);
             saw_bookmark |= suggestions.contains([](auto const& suggestion) {
                 return suggestion.text == "https://ladybird.test/"sv;
             });
-            saw_bookmark_update |= suggestions.contains([](auto const& suggestion) {
-                return suggestion.text == "https://ladybird-updated.test/"sv;
-            });
-
-            if (saw_bookmark && !requested_bookmark_update) {
-                requested_bookmark_update = true;
-                WebView::Application::autocomplete_service().update_bookmarks({ {
-                    .url = "https://ladybird-updated.test/"_string,
-                    .title = "Updated test bookmark"_string,
-                    .folder = {},
-                    .favicon_png = {},
-                } });
-            }
-
-            if (!saw_bookmark_update)
-                return;
-            VERIFY(query_returned);
             autocomplete.cancel_pending_query();
-            bookmark_update_completed = true;
+            bookmark_query_completed = true;
         };
 
-        autocomplete.query_autocomplete_engine(1, "lady"_string);
-        query_returned = true;
-        Core::EventLoop::current().spin_until([&]() { return bookmark_update_completed; });
+        Vector<WebView::AutocompleteBookmark> bookmarks;
+        bookmarks.append({ .url = "https://ladybird.test/"_string, .title = "Ladybird test bookmark"_string, .folder = {}, .favicon_png = {} });
+        autocomplete.query_autocomplete_engine(1, "lady"_string, WebView::default_autocomplete_suggestion_limit, WebView::rank_bookmark_suggestions("lady"sv, bookmarks, 32));
+        Core::EventLoop::current().spin_until([&]() { return bookmark_query_completed; });
     }
 
     VERIFY(saw_bookmark);
-    VERIFY(saw_bookmark_update);
 
     auto saw_adaptive_result = false;
     {
-        WebView::Autocomplete autocomplete { WebView::IsPrivate::No };
+        WebView::Autocomplete autocomplete { *app, WebView::IsPrivate::No };
         autocomplete.record_engagement({
             .input = "docs"_string,
             .destination_kind = WebView::OmniboxDestinationKind::URL,
@@ -160,7 +195,7 @@ TEST_CASE(autocomplete)
 
     auto private_read_completed = false;
     {
-        WebView::Autocomplete private_autocomplete { WebView::IsPrivate::Yes };
+        WebView::Autocomplete private_autocomplete { *app, WebView::IsPrivate::Yes };
         private_autocomplete.on_autocomplete_query_complete = [&](auto, auto const& suggestions, WebView::AutocompleteResultKind kind) {
             if (kind != WebView::AutocompleteResultKind::Final)
                 return;
@@ -176,7 +211,7 @@ TEST_CASE(autocomplete)
     }
 
     {
-        WebView::Autocomplete private_autocomplete { WebView::IsPrivate::Yes };
+        WebView::Autocomplete private_autocomplete { *app, WebView::IsPrivate::Yes };
         private_autocomplete.record_engagement({
             .input = "privatealias"_string,
             .destination_kind = WebView::OmniboxDestinationKind::URL,
@@ -187,7 +222,7 @@ TEST_CASE(autocomplete)
 
     auto private_query_completed = false;
     {
-        WebView::Autocomplete autocomplete { WebView::IsPrivate::No };
+        WebView::Autocomplete autocomplete { *app, WebView::IsPrivate::No };
         autocomplete.on_autocomplete_query_complete = [&](auto, auto const& suggestions, WebView::AutocompleteResultKind kind) {
             if (kind != WebView::AutocompleteResultKind::Final)
                 return;
@@ -201,15 +236,9 @@ TEST_CASE(autocomplete)
         Core::EventLoop::current().spin_until([&]() { return private_query_completed; });
     }
 
-    WebView::Application::autocomplete_service().update_bookmarks({ {
-        .url = "https://github.com/LadybirdBrowser/ladybird"_string,
-        .title = "GH"_string,
-        .folder = {},
-        .favicon_png = {},
-    } });
     auto short_bookmark_query_completed = false;
     {
-        WebView::Autocomplete autocomplete { WebView::IsPrivate::No };
+        WebView::Autocomplete autocomplete { *app, WebView::IsPrivate::No };
         autocomplete.on_autocomplete_query_complete = [&](auto, auto const& suggestions, WebView::AutocompleteResultKind kind) {
             if (kind != WebView::AutocompleteResultKind::Final)
                 return;
@@ -225,13 +254,15 @@ TEST_CASE(autocomplete)
             autocomplete.cancel_pending_query();
             short_bookmark_query_completed = true;
         };
-        autocomplete.query_autocomplete_engine(5, "GH"_string);
+        Vector<WebView::AutocompleteBookmark> bookmarks;
+        bookmarks.append({ .url = "https://github.com/LadybirdBrowser/ladybird"_string, .title = "GH"_string, .folder = {}, .favicon_png = {} });
+        autocomplete.query_autocomplete_engine(5, "GH"_string, WebView::default_autocomplete_suggestion_limit, WebView::rank_bookmark_suggestions("GH"sv, bookmarks, 32));
         Core::EventLoop::current().spin_until([&]() { return short_bookmark_query_completed; });
     }
 
     auto choose_search_engine_query_completed = false;
     {
-        WebView::Autocomplete autocomplete { WebView::IsPrivate::No };
+        WebView::Autocomplete autocomplete { *app, WebView::IsPrivate::No };
         autocomplete.on_autocomplete_query_complete = [&](auto, auto const& suggestions, WebView::AutocompleteResultKind kind) {
             if (kind != WebView::AutocompleteResultKind::Final)
                 return;
@@ -254,7 +285,7 @@ TEST_CASE(autocomplete)
     });
     auto whitespace_query_completed = false;
     {
-        WebView::Autocomplete autocomplete { WebView::IsPrivate::No };
+        WebView::Autocomplete autocomplete { *app, WebView::IsPrivate::No };
         autocomplete.on_autocomplete_query_complete = [&](auto, auto const& suggestions, WebView::AutocompleteResultKind kind) {
             if (kind != WebView::AutocompleteResultKind::Final)
                 return;
@@ -271,7 +302,7 @@ TEST_CASE(autocomplete)
 
     auto about_query_completed = false;
     {
-        WebView::Autocomplete autocomplete { WebView::IsPrivate::No };
+        WebView::Autocomplete autocomplete { *app, WebView::IsPrivate::No };
         autocomplete.on_autocomplete_query_complete = [&](auto, auto const& suggestions, WebView::AutocompleteResultKind kind) {
             if (kind != WebView::AutocompleteResultKind::Final)
                 return;
@@ -291,7 +322,7 @@ TEST_CASE(autocomplete)
 
     auto expect_internal_url_suggestion = [&](WebView::AutocompleteQueryID query_id, StringView input) {
         auto query_completed = false;
-        WebView::Autocomplete autocomplete { WebView::IsPrivate::No };
+        WebView::Autocomplete autocomplete { *app, WebView::IsPrivate::No };
         autocomplete.on_autocomplete_query_complete = [&](auto, auto const& suggestions, WebView::AutocompleteResultKind kind) {
             if (kind != WebView::AutocompleteResultKind::Final)
                 return;
@@ -313,7 +344,7 @@ TEST_CASE(autocomplete)
 
     auto telephone_url_query_completed = false;
     {
-        WebView::Autocomplete autocomplete { WebView::IsPrivate::No };
+        WebView::Autocomplete autocomplete { *app, WebView::IsPrivate::No };
         autocomplete.on_autocomplete_query_complete = [&](auto, auto const& suggestions, WebView::AutocompleteResultKind kind) {
             if (kind != WebView::AutocompleteResultKind::Final)
                 return;
@@ -330,10 +361,37 @@ TEST_CASE(autocomplete)
         Core::EventLoop::current().spin_until([&]() { return telephone_url_query_completed; });
     }
 
+    // The app that handles the address stays where Return goes, even though a search for text with a space ranks high.
+    auto spaced_telephone_url_query_completed = false;
+    {
+        WebView::Autocomplete autocomplete { *app, WebView::IsPrivate::No };
+        autocomplete.on_autocomplete_query_complete = [&](auto, auto const& suggestions, WebView::AutocompleteResultKind kind) {
+            if (kind != WebView::AutocompleteResultKind::Final)
+                return;
+            VERIFY(!suggestions.is_empty());
+            VERIFY(suggestions.first().source == WebView::AutocompleteSuggestionSource::LiteralURL);
+            VERIFY(suggestions.first().text == "tel:+1 555 1234"sv);
+            VERIFY(suggestions.first().is_verbatim);
+            VERIFY(suggestions.contains([](auto const& suggestion) {
+                return suggestion.source == WebView::AutocompleteSuggestionSource::Search
+                    && suggestion.text == "tel:+1 555 1234"sv
+                    && !suggestion.is_verbatim
+                    && !suggestion.can_be_automatically_selected;
+            }));
+            autocomplete.cancel_pending_query();
+            spaced_telephone_url_query_completed = true;
+        };
+        autocomplete.query_autocomplete_engine(109, "tel:+1 555 1234"_string);
+        VERIFY(app->pending_external_url_handler_query_count() == 1);
+        VERIFY(app->pending_external_url_handler_query_scheme(0) == "tel"sv);
+        app->complete_next_external_url_handler_query(true);
+        Core::EventLoop::current().spin_until([&]() { return spaced_telephone_url_query_completed; });
+    }
+
     auto external_url_local_query_completed = false;
     auto external_url_query_completed = false;
     {
-        WebView::Autocomplete autocomplete { WebView::IsPrivate::No };
+        WebView::Autocomplete autocomplete { *app, WebView::IsPrivate::No };
         autocomplete.record_engagement({
             .input = "geo:23.4,12.4"_string,
             .destination_kind = WebView::OmniboxDestinationKind::URL,
@@ -374,7 +432,7 @@ TEST_CASE(autocomplete)
 
     auto unavailable_external_url_query_completed = false;
     {
-        WebView::Autocomplete autocomplete { WebView::IsPrivate::No };
+        WebView::Autocomplete autocomplete { *app, WebView::IsPrivate::No };
         autocomplete.on_autocomplete_query_complete = [&](auto, auto const& suggestions, WebView::AutocompleteResultKind kind) {
             if (kind != WebView::AutocompleteResultKind::Final)
                 return;
@@ -396,7 +454,7 @@ TEST_CASE(autocomplete)
 
     auto replacement_query_completed = false;
     {
-        WebView::Autocomplete autocomplete { WebView::IsPrivate::No };
+        WebView::Autocomplete autocomplete { *app, WebView::IsPrivate::No };
         autocomplete.on_autocomplete_query_complete = [&](auto query_id, auto const&, WebView::AutocompleteResultKind kind) {
             VERIFY(query_id != 103);
             if (query_id == 104 && kind == WebView::AutocompleteResultKind::Final) {
@@ -412,7 +470,7 @@ TEST_CASE(autocomplete)
     }
 
     {
-        WebView::Autocomplete autocomplete { WebView::IsPrivate::No };
+        WebView::Autocomplete autocomplete { *app, WebView::IsPrivate::No };
         autocomplete.query_autocomplete_engine(105, "geo:23.4,12.4"_string);
         VERIFY(app->pending_external_url_handler_query_count() == 1);
     }
@@ -431,7 +489,7 @@ TEST_CASE(autocomplete)
         .suggestions = true,
     });
 
-    WebView::Autocomplete autocomplete { WebView::IsPrivate::No };
+    WebView::Autocomplete autocomplete { *app, WebView::IsPrivate::No };
     auto request_completed = false;
     auto query_returned = false;
     autocomplete.on_autocomplete_query_complete = [&](auto, auto const&, WebView::AutocompleteResultKind kind) {
@@ -447,4 +505,99 @@ TEST_CASE(autocomplete)
     Core::EventLoop::current().spin_until([&]() { return request_completed; });
 
     outln("PASS: cancel_pending_query during query completion did not crash");
+
+    // The remote rows for the previous text stay while the search engine has yet to answer for the new text, so that
+    // the list does not shrink at every key press.
+    {
+        Vector<Function<void(WebView::AutocompleteHost::RemoteResponse)>> pending_requests;
+        app->on_fetch_remote_suggestions = [&](auto on_response) { pending_requests.append(move(on_response)); };
+
+        WebView::Autocomplete remote_autocomplete { *app, WebView::IsPrivate::No };
+        Vector<String> remote_rows;
+        size_t deliveries = 0;
+        auto last_kind = WebView::AutocompleteResultKind::Intermediate;
+        remote_autocomplete.on_autocomplete_query_complete = [&](auto, auto const& suggestions, WebView::AutocompleteResultKind kind) {
+            remote_rows.clear();
+            for (auto const& suggestion : suggestions) {
+                if (suggestion.source == WebView::AutocompleteSuggestionSource::Search && !suggestion.is_verbatim)
+                    remote_rows.append(suggestion.text);
+            }
+            last_kind = kind;
+            ++deliveries;
+        };
+        auto query = [&](WebView::AutocompleteQueryID query_id, StringView text) {
+            deliveries = 0;
+            last_kind = WebView::AutocompleteResultKind::Intermediate;
+            remote_autocomplete.query_autocomplete_engine(query_id, MUST(String::from_utf8(text)));
+        };
+        auto wait_for_request = [&] {
+            Core::EventLoop::current().spin_until([&]() { return !pending_requests.is_empty(); });
+        };
+        auto answer = [&](StringView body) {
+            pending_requests.take_first()({
+                .had_network_error = false,
+                .response_code = 200,
+                .content_type = "application/json"sv,
+                .body = MUST(ByteBuffer::copy(body.bytes())),
+            });
+        };
+        auto fail_request = [&] {
+            pending_requests.take_first()({ .had_network_error = true, .response_code = {}, .content_type = {}, .body = {} });
+        };
+        // NB: The rows are final once the local ones have arrived too.
+        auto wait_for_final_rows = [&] {
+            Core::EventLoop::current().spin_until([&]() { return last_kind == WebView::AutocompleteResultKind::Final; });
+        };
+
+        query(200, "gi"sv);
+        wait_for_request();
+        answer(R"(["gi",["gina","gift"]])"sv);
+        wait_for_final_rows();
+        VERIFY(remote_rows == Vector<String> { "gina"_string, "gift"_string });
+
+        // Neither row starts with the new text, and both stay until the answer for it.
+        query(201, "git"sv);
+        Core::EventLoop::current().spin_until([&]() { return deliveries > 0; });
+        VERIFY(last_kind == WebView::AutocompleteResultKind::Intermediate);
+        VERIFY(remote_rows == Vector<String> { "gina"_string, "gift"_string });
+        wait_for_request();
+        answer(R"(["git",["github","gitlab"]])"sv);
+        wait_for_final_rows();
+        VERIFY(remote_rows == Vector<String> { "github"_string, "gitlab"_string });
+
+        // Without an answer, only the rows that still start with the text stay.
+        query(202, "gith"sv);
+        wait_for_request();
+        VERIFY(remote_rows == Vector<String> { "github"_string, "gitlab"_string });
+        fail_request();
+        wait_for_final_rows();
+        VERIFY(remote_rows == Vector<String> { "github"_string });
+
+        // A row that does not start with the new text cannot stand in for the answer, so the final rows are without it.
+        query(203, "gitx"sv);
+        wait_for_request();
+        VERIFY(remote_rows == Vector<String> { "github"_string });
+        VERIFY(last_kind == WebView::AutocompleteResultKind::Intermediate);
+        wait_for_final_rows();
+        VERIFY(remote_rows.is_empty());
+
+        // A late answer makes new final rows.
+        answer(R"(["gitx",["gitxyz"]])"sv);
+        wait_for_final_rows();
+        VERIFY(remote_rows == Vector<String> { "gitxyz"_string });
+
+        // Rows that all start with the new text stand in for the answer in the final rows.
+        query(204, "git"sv);
+        wait_for_request();
+        VERIFY(last_kind == WebView::AutocompleteResultKind::Intermediate);
+        wait_for_final_rows();
+        VERIFY(remote_rows == Vector<String> { "gitxyz"_string });
+        answer(R"(["git",["github","gitlab"]])"sv);
+        wait_for_final_rows();
+        VERIFY(remote_rows == Vector<String> { "github"_string, "gitlab"_string });
+
+        remote_autocomplete.cancel_pending_query();
+        app->on_fetch_remote_suggestions = nullptr;
+        outln("PASS: remote suggestions for the previous text stay until the ones for the new text arrive");
+    }
 }

@@ -17,14 +17,16 @@ pub(crate) mod exports;
 pub(crate) mod memory;
 pub(crate) mod message_record;
 pub(crate) mod reader;
+pub(crate) mod serializable;
 pub(crate) mod transfer_data_holder;
+pub(crate) mod transfer_record;
 pub(crate) mod writer;
 
 use ak::Utf16String;
 use libjs_rust::api::{
     Array, ArrayBuffer, ArrayBufferOrder, ArrayBufferShared, BigIntObject, BooleanObject, ByteLength, DataView, Date,
-    DeferGc, ErrorKind, ErrorType as JsErrorType, Gc, Map, MarkedVec, Must, NumberObject, Object, PrimitiveString,
-    PropertyKey, PropertyKind, Realm, RegExpObject, Set, StringObject, TypedArrayBase, TypedArrayKind, Value, Vm,
+    ErrorKind, ErrorType as JsErrorType, Gc, Map, MarkedVec, Must, NumberObject, Object, PrimitiveString, PropertyKey,
+    PropertyKind, Realm, RegExpObject, Set, StringObject, TypedArrayBase, TypedArrayKind, Value, Vm,
     create_byte_data_block, detach_array_buffer, is_typed_array_out_of_bounds, is_view_out_of_bounds,
     length_of_array_like, make_data_view_with_buffer_witness_record, make_typed_array_with_buffer_witness_record,
     regexp_create,
@@ -36,21 +38,23 @@ use crate::bindings::structured_data::{
     SerializationReader, SerializationWriter, TransferDataReader, TransferDataWriter, Transferable,
 };
 use crate::bindings::{CallContext, Exception, WebIdlResult};
-use crate::crypto::crypto_key;
 use crate::html::image_bitmap::ImageBitmap;
 use crate::html::message_port::MessagePort;
 use crate::html::offscreen_canvas;
 use crate::html::structured_serialize::cpp::{
-    OwnedSerializedTransferRecord, SerializableSteps, SerializedTransferRecord, current_settings_object_agent_cluster,
+    SharedPixelBuffers, current_settings_object_agent_cluster,
     current_settings_object_cross_origin_isolated_capability, data_clone_error_from_serialization_error,
-    deserialize_rust_platform_object, gather_image_bitmap_pixels, is_exposed, is_platform_object, realm_agent_cluster,
-    serializable_interface_name, serializable_interface_storage_identifier, serializable_payload_version,
-    serializable_steps, serialization_steps,
+    gather_image_bitmap_pixels, is_exposed, realm_agent_cluster,
 };
 use crate::html::structured_serialize::memory::{DeserializationMemory, SerializationMemory};
 use crate::html::structured_serialize::message_record::MessageRecord;
 use crate::html::structured_serialize::reader::StructuredSerializeReader;
+use crate::html::structured_serialize::serializable::{
+    SERIALIZABLE_PAYLOAD_VERSION, SerializableSteps, serializable_interface_name,
+    serializable_interface_storage_identifier, serializable_steps,
+};
 use crate::html::structured_serialize::transfer_data_holder::TransferDataHolder;
+use crate::html::structured_serialize::transfer_record::{TransferRecord, TransferRecordRef};
 use crate::html::structured_serialize::writer::StructuredSerializeWriter;
 use crate::streams::readable_stream::ReadableStream;
 use crate::streams::transform_stream::TransformStream;
@@ -456,10 +460,10 @@ fn serialize_array_buffer(
             // 2. If value has an [[ArrayBufferMaxByteLength]] internal slot, then set serialized to { [[Type]]: "GrowableSharedArrayBuffer",
             //           [[ArrayBufferData]]: value.[[ArrayBufferData]], [[ArrayBufferByteLengthData]]: value.[[ArrayBufferByteLengthData]],
             //           [[ArrayBufferMaxByteLength]]: value.[[ArrayBufferMaxByteLength]] }.
-            // To share with a same-process target, stash the source buffer in the side table. The byte copy keeps the
+            // To share with a same-agent target, stash the source buffer in the side table. The byte copy keeps the
             // wire format self-contained for records that cross a process boundary.
             // AD-HOC: A growable SharedArrayBuffer isn't backed by cross-process shared memory (its storage is
-            //         process-local) — so only a same-process target can share it. A record that crosses a process
+            //         process-local) — so only a same-agent target can share it. A record that crosses a process
             //         boundary hands the peer a copy.
             // FIXME: Share it across processes too: a max-sized shared mapping with a shared length word (#11682).
             data_holder.encode_u8(ValueTag::GrowableSharedArrayBuffer as u8);
@@ -470,24 +474,21 @@ fn serialize_array_buffer(
         } else {
             // 3. Otherwise, set serialized to { [[Type]]: "SharedArrayBuffer", [[ArrayBufferData]]: value.[[ArrayBufferData]],
             //           [[ArrayBufferByteLength]]: value.[[ArrayBufferByteLength]] }.
-            // To share (rather than copy) [[ArrayBufferData]] with a same-process target, stash the source buffer in the
-            // record's side table and encode its index. A record that crosses a process boundary arrives with an empty
-            // side table — and shares through the file-descriptor side list below instead, or falls back to a byte copy.
+            // To share (rather than copy) [[ArrayBufferData]] with a target in the same agent, stash the source buffer in
+            // the record's side table and encode its index. A record that leaves the agent arrives with an empty side
+            // table, and names the store below instead, or falls back to a byte copy.
             data_holder.encode_u8(ValueTag::SharedArrayBuffer as u8);
             serialize_agent_cluster(data_holder, allow_shared_array_buffers)?;
             data_holder.encode_u32(data_holder.add_shared_array_buffer(array_buffer));
-            // AD-HOC: When backed by cross-process shared memory and a side list is available (the messaging path),
-            //         transfer the buffer by appending it to shared_buffers, and encoding its index. That lets the file
-            //         descriptor survive structured clone, whose main record is bytes-only, so an agent in another
-            //         process references the same [[ArrayBufferData]]. Without a side list (e.g., serialization for
-            //         storage) or a shared backing (e.g., a zero-length buffer), fall back to copying the bytes.
-            let shared_buffer_index = data_holder.append_shared_memory_of(array_buffer);
-            data_holder.encode_bool(shared_buffer_index.is_some());
-            if let Some(index) = shared_buffer_index {
-                data_holder.encode_u32(index);
-                // Carried beside the index — so the receiving agent can tell this object apart from any other, even
-                // when it maps this same one twice, from two separate messages.
-                data_holder.encode_u64(array_buffer.with_data_block(|data_block| data_block.shared_object_id()));
+            // AD-HOC: On the messaging path, a buffer in a shared store goes by the id of the store, so that an agent on
+            //         another thread of this process references the same [[ArrayBufferData]]. The bytes never leave this
+            //         process: a receiver in another one is not in the agent cluster, and only gets the id. Without the
+            //         messaging path (e.g., serialization for storage) or a store (e.g., a zero-length buffer), fall back
+            //         to copying the bytes.
+            let shared_store_id = data_holder.name_store_of(array_buffer);
+            data_holder.encode_bool(shared_store_id.is_some());
+            if let Some(id) = shared_store_id {
+                data_holder.encode_u64(id);
             } else {
                 data_holder.encode_bytes(&array_buffer.copy_all_to_byte_buffer());
             }
@@ -809,7 +810,7 @@ impl<'memory> Serializer<'_, '_, 'memory> {
                 deep = true;
             }
             // 18. Otherwise, if value has an [[ErrorData]] internal slot and value is not a platform object:
-            else if object.downcast::<libjs_rust::api::Error>().is_some() && !is_platform_object(object) {
+            else if object.downcast::<libjs_rust::api::Error>().is_some() && !object.is_platform_object() {
                 // 1. Let name be ? Get(value, "name").
                 let name = object.get(vm, &vm.names.name)?;
 
@@ -887,7 +888,7 @@ impl<'memory> Serializer<'_, '_, 'memory> {
                 deep = true;
             }
             // 21. Otherwise, if value is a platform object, then throw a "DataCloneError" DOMException.
-            else if is_platform_object(object) {
+            else if object.is_platform_object() {
                 return Err(data_clone_error("Cannot serialize platform objects"));
             }
             // 22. Otherwise, if IsCallable(value) is true, then throw a "DataCloneError" DOMException.
@@ -992,7 +993,6 @@ impl<'memory> Serializer<'_, '_, 'memory> {
                     SerializableSteps::QuotaExceededError => {
                         quota_exceeded_error::serialization_steps(&QuotaExceededErrorFields::of(object), serialized);
                     }
-                    SerializableSteps::CryptoKey => crypto_key::serialization_steps(object, serialized),
                     SerializableSteps::RTCEncodedAudioFrame => {
                         crate::webrtc::rtc_encoded_audio_frame::serialization_steps(
                             object,
@@ -1001,8 +1001,9 @@ impl<'memory> Serializer<'_, '_, 'memory> {
                         )?;
                     }
                     SerializableSteps::Rust => {
-                        let realm = self.realm.unwrap_or_else(|| object.shape().realm());
-                        serialization_steps(
+                        let realm = self.realm.expect("an object is serialized in a realm");
+                        serializable::serialization_steps(
+                            interface_name,
                             &CallContext::new(vm, realm),
                             object,
                             &mut SerializationWriter::new(self),
@@ -1066,7 +1067,7 @@ pub(crate) fn encode_serializable_object_header(
     serialized.encode_u8(ValueTag::SerializableObject as u8);
     serialized.encode_interface_name(interface_name);
     if serialized.serialization_type() == SerializationType::Storage {
-        serialized.encode_u64(serializable_payload_version());
+        serialized.encode_u64(SERIALIZABLE_PAYLOAD_VERSION);
     }
     Ok(())
 }
@@ -1081,7 +1082,7 @@ pub(crate) fn decode_serializable_object_header(
         return Err(data_clone_error("Unexpected serializable object"));
     }
     if serialized.serialization_type() == SerializationType::Storage
-        && serialized.decode_u64()? != serializable_payload_version()
+        && serialized.decode_u64()? != SERIALIZABLE_PAYLOAD_VERSION
     {
         return Err(data_clone_error("Unsupported serializable payload version"));
     }
@@ -1279,15 +1280,11 @@ impl Deserializer<'_, '_, '_> {
 
                 let side_table_index = self.serialized.decode_u32()?;
 
-                // AD-HOC: When the backing was transferred as cross-process shared memory, map it from the side list by
-                //         index — so both agents reference the same bytes.
-                let is_shared_backed = self.serialized.decode_bool()?;
-                if is_shared_backed {
-                    let index = self.serialized.decode_u32()?;
-                    let shared_object_id = self.serialized.decode_u64()?;
-                    value = self
-                        .serialized
-                        .array_buffer_from_shared_memory(vm, index, shared_object_id)?;
+                // AD-HOC: A record on the messaging path names the store, which this agent shares with the sender.
+                let has_shared_store = self.serialized.decode_bool()?;
+                if has_shared_store {
+                    let id = self.serialized.decode_u64()?;
+                    value = self.serialized.array_buffer_from_shared_store(vm, id)?;
                     break 'shared_array_buffer;
                 }
 
@@ -1301,8 +1298,8 @@ impl Deserializer<'_, '_, '_> {
                     break 'shared_array_buffer;
                 }
 
-                // A buffer with no cross-process shared memory to share (a zero-length one, e.g.) whose record crossed a
-                // process boundary arrives with an empty side table — so it's reconstructed from the byte copy.
+                // A buffer with no store to share (a zero-length one, e.g.) whose record left the agent arrives with an
+                // empty side table, so it's reconstructed from the byte copy.
                 value = Value::from_object(array_buffer_from_bytes(vm, realm, bytes, ArrayBufferShared::Yes)?);
             }
 
@@ -1562,7 +1559,7 @@ impl Deserializer<'_, '_, '_> {
                     return Err(data_clone_error("Unsupported type"));
                 }
 
-                if version.is_some_and(|version| version != serializable_payload_version()) {
+                if version.is_some_and(|version| version != SERIALIZABLE_PAYLOAD_VERSION) {
                     return Err(data_clone_error_from_serialization_error(
                         realm,
                         "Unsupported serializable payload version",
@@ -1585,18 +1582,17 @@ impl Deserializer<'_, '_, '_> {
                         let fields = quota_exceeded_error::deserialization_steps(self.serialized)?;
                         Value::from_object(quota_exceeded_error::create(realm, &fields))
                     }
-                    SerializableSteps::CryptoKey => {
-                        Value::from_object(crypto_key::deserialization_steps(realm, self.serialized)?)
-                    }
                     SerializableSteps::RTCEncodedAudioFrame => {
                         Value::from_object(crate::webrtc::rtc_encoded_audio_frame::deserialization_steps(
                             realm,
                             &mut SerializationReader::new(self),
                         )?)
                     }
-                    SerializableSteps::Rust => {
-                        deserialize_rust_platform_object(interface_name, realm, &mut SerializationReader::new(self))?
-                    }
+                    SerializableSteps::Rust => serializable::deserialization_steps(
+                        interface_name,
+                        self.cx,
+                        &mut SerializationReader::new(self),
+                    )?,
                 };
                 self.memory.set(memory_index, value);
                 return Ok(value);
@@ -1691,7 +1687,7 @@ pub(crate) fn structured_serialize_with_transfer(
     cx: &CallContext,
     value: Value,
     transfer_list: &[Gc<Object>],
-) -> WebIdlResult<OwnedSerializedTransferRecord> {
+) -> WebIdlResult<TransferRecordRef> {
     let vm = cx.vm();
 
     // 1. Let memory be an empty map.
@@ -1723,11 +1719,9 @@ pub(crate) fn structured_serialize_with_transfer(
         memory.set(transferable_value, memory.size());
     }
 
-    let result = OwnedSerializedTransferRecord::new();
-
     // 3. Let serialized be ? StructuredSerializeInternal(value, false, memory).
-    // NB: The record may cross a process boundary, so it is a message record, with the memory of its SharedArrayBuffers
-    //     shared on the side. The data holders share the pixels of ImageBitmaps through the same list.
+    // NB: The record may leave the process, so it is a message record, which names the stores of its SharedArrayBuffers.
+    //     The data holders share the pixels of ImageBitmaps through its shared memory.
     let serialized = StructuredSerializeWriter::new_for_message(vm);
     structured_serialize_internal(
         vm,
@@ -1739,6 +1733,8 @@ pub(crate) fn structured_serialize_with_transfer(
         AllowSharedArrayBuffers::CrossOriginIsolatedOnly,
     )?;
 
+    serialized.pin_named_stores();
+
     // AD-HOC: Gather the pixels of the transferred ImageBitmaps in one buffer of shared memory. Without it, as when there
     //         is not enough memory for it, the pixels travel inline.
     let (image_bitmap_pixels, pixels_shared_memory) =
@@ -1748,7 +1744,7 @@ pub(crate) fn structured_serialize_with_transfer(
     }
 
     // 4. Let transferDataHolders be a new empty List.
-    // NB: The record of the result holds the list.
+    let mut transfer_data_holders = Vec::with_capacity(transfer_list.len());
 
     // 5. For each transferable of transferList:
     for transferable in transfer_list {
@@ -1804,7 +1800,7 @@ pub(crate) fn structured_serialize_with_transfer(
         else {
             // 1. Assert: transferable is a platform object that is a transferable object.
             let platform_object = platform_object.expect("transferable is a transferable object");
-            assert!(is_platform_object(*transferable));
+            assert!(transferable.is_platform_object());
 
             // 2. Let interfaceName be the identifier of the primary interface of transferable.
             let interface_name = platform_object.primary_interface();
@@ -1824,15 +1820,15 @@ pub(crate) fn structured_serialize_with_transfer(
         }
 
         // 6. Append dataHolder to transferDataHolders.
-        result.record().append_data_holder(data_holder);
+        transfer_data_holders.push(data_holder.finish());
     }
 
     // 6. Let result be { [[Serialized]]: serialized, [[TransferDataHolders]]: transferDataHolders, [[InterfaceNames]]: an empty ordered set, [[AgentCluster]]: null }.
-    DeferGc::scope(vm, |defer_gc| {
-        result
-            .record()
-            .set_serialized(defer_gc, serialized.finish_message_record(defer_gc));
-    });
+    let result = TransferRecord::create(
+        vm,
+        |defer_gc| serialized.finish_message_record(defer_gc),
+        transfer_data_holders,
+    );
 
     // FIXME: 7. For each object → record of memory:
     //     1. If object is a platform object, then append record.[[Type]] to result.[[InterfaceNames]].
@@ -1854,7 +1850,7 @@ pub(crate) struct DeserializedTransferRecord<'vm> {
 // https://html.spec.whatwg.org/multipage/structured-data.html#structureddeserializewithtransfer
 pub(crate) fn structured_deserialize_with_transfer<'vm>(
     cx: &CallContext<'vm>,
-    serialize_with_transfer_result: SerializedTransferRecord,
+    serialize_with_transfer_result: TransferRecordRef,
 ) -> WebIdlResult<DeserializedTransferRecord<'vm>> {
     let target_realm = cx.realm();
 
@@ -1868,14 +1864,21 @@ pub(crate) fn structured_deserialize_with_transfer<'vm>(
     // 4. Let transferredValues be a new empty List.
     let transferred_values = MarkedVec::new(cx.vm());
 
+    let serialized = serialize_with_transfer_result.serialized.borrow();
+    let serialized = serialized
+        .as_ref()
+        .ok_or_else(|| data_clone_error("Empty transfer record"))?;
+    let shared_pixels = SharedPixelBuffers::new(&serialized.shared_memory);
+
     // 5. For each transferDataHolder of serializeWithTransferResult.[[TransferDataHolders]]:
-    for index in 0..serialize_with_transfer_result.data_holder_count() {
+    let transfer_data_holders = core::mem::take(&mut *serialize_with_transfer_result.data_holders.borrow_mut());
+    for mut transfer_data_holder in transfer_data_holders {
         // NB: The transfer writes no empty data holder.
-        let Some(decoder) = serialize_with_transfer_result.take_data_holder(index) else {
+        if transfer_data_holder.bytes.is_empty() {
             return Err(data_clone_error("Empty transfer data holder"));
-        };
-        // SAFETY: The decoder lives for the loop body.
-        let mut data_holder = unsafe { TransferDataReader::new(decoder.decoder(), target_realm) };
+        }
+        let mut data_holder =
+            TransferDataReader::with_shared_pixels(&mut transfer_data_holder, target_realm, &shared_pixels);
 
         // 1. Let value be an uninitialized value.
         let value = structured_deserialize_with_transfer_internal(cx, &mut data_holder)?;
@@ -1888,20 +1891,10 @@ pub(crate) fn structured_deserialize_with_transfer<'vm>(
     }
 
     // 6. Let deserialized be ? StructuredDeserialize(serializeWithTransferResult.[[Serialized]], targetRealm, memory).
-    let shared_memory = serialize_with_transfer_result.shared_memory();
-    let serialized = StructuredSerializeReader::new_ipc(
-        target_realm,
-        // SAFETY: The caller lends the record for the deserialization.
-        unsafe { serialize_with_transfer_result.serialized() },
-        &shared_memory,
-    );
+    let serialized = StructuredSerializeReader::new_message(target_realm, serialized);
     let deserialized = with_temporary_execution_context(target_realm, || {
         structured_deserialize_internal(cx, &serialized, &memory, false)
     })?;
-
-    // NB: The deserialized values hold their own references to the shared memory they use. The record can outlive its
-    //     delivery, as in a task that awaits garbage collection, so it must not keep that memory alive.
-    serialize_with_transfer_result.clear_shared_buffers();
 
     // 7. Return { [[Deserialized]]: deserialized, [[TransferredValues]]: transferredValues }.
     Ok(DeserializedTransferRecord {
@@ -1986,8 +1979,8 @@ pub(crate) fn structured_deserialize_with_transfer_internal(
 }
 
 // https://html.spec.whatwg.org/multipage/structured-data.html#structuredserialize
-// AD-HOC: For a message that reaches agents in other processes, whose shared-memory-backed SharedArrayBuffers are handed
-//         over beside it. The caller finishes the writer into a MessageRecord.
+// AD-HOC: For a message that reaches agents in other processes, which names the stores of its SharedArrayBuffers. The
+//         caller finishes the writer into a MessageRecord.
 pub(crate) fn structured_serialize_for_message(
     vm: &Vm,
     realm: Gc<Realm>,
@@ -2006,6 +1999,7 @@ pub(crate) fn structured_serialize_for_message(
         &memory,
         AllowSharedArrayBuffers::CrossOriginIsolatedOnly,
     )?;
+    serialized.pin_named_stores();
     Ok(serialized)
 }
 

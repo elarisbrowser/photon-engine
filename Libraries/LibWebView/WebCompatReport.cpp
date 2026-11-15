@@ -10,6 +10,7 @@
 #include <LibCore/BrowserVersion.h>
 #include <LibCore/ImmutableBytes.h>
 #include <LibCore/Promise.h>
+#include <LibURL/Parser.h>
 #include <LibWebCommon/Loader/UserAgent.h>
 #include <LibWebCommon/WebView/PageInfo.h>
 #include <LibWebView/Application.h>
@@ -118,7 +119,7 @@ void WebCompatReport::set_page_dumps(String dumps)
     m_page_dumps = MUST(String::formatted("{}\n(Truncated)\n", StringView { bytes.slice(0, length) }));
 }
 
-ByteString WebCompatReport::diagnostics(IncludePageDumps include_page_dumps) const
+ByteString WebCompatReport::diagnostics(IncludePageDumps include_page_dumps, IncludePlatformFeatures include_platform_features) const
 {
     StringBuilder builder;
     builder.append("Ladybird web compatibility report, format 1\n"sv);
@@ -129,6 +130,9 @@ ByteString WebCompatReport::diagnostics(IncludePageDumps include_page_dumps) con
     builder.appendff("Device pixel ratio: {}\n", m_page.device_pixel_ratio);
     builder.appendff("Zoom level: {}\n", format_zoom_level(m_page.zoom_level));
 
+    if (include_platform_features == IncludePlatformFeatures::Yes && m_platform_features.has_value())
+        builder.append(*m_platform_features);
+
     if (include_page_dumps == IncludePageDumps::Yes && m_page_dumps.has_value())
         builder.appendff("\n{}", *m_page_dumps);
 
@@ -136,7 +140,7 @@ ByteString WebCompatReport::diagnostics(IncludePageDumps include_page_dumps) con
 }
 
 Optional<String> WebCompatReport::send(String const& description, Optional<ByteBuffer> screenshot_png,
-    IncludePageDumps include_page_dumps)
+    IncludePageDumps include_page_dumps, IncludePlatformFeatures include_platform_features)
 {
     VERIFY(!m_submission);
 
@@ -145,7 +149,7 @@ Optional<String> WebCompatReport::send(String const& description, Optional<ByteB
     if (screenshot_png.has_value() && screenshot_png->size() > maximum_screenshot_bytes)
         return "This screenshot is too large to include in a report."_string;
 
-    auto diagnostics_text = diagnostics(include_page_dumps);
+    auto diagnostics_text = diagnostics(include_page_dumps, include_platform_features);
     Vector<ReportSubmission::Attachment> attachments;
     attachments.append({
         .id = diagnostics_reference,
@@ -176,6 +180,8 @@ Optional<String> WebCompatReport::send(String const& description, Optional<ByteB
     contents.add("device_pixel_ratio"sv, "number"sv, m_page.device_pixel_ratio);
     contents.add("zoom_level"sv, "number"sv, m_page.zoom_level);
     contents.add_build_information(platform, architecture, LADYBIRD_COMMIT, build_configuration);
+    if (include_platform_features == IncludePlatformFeatures::Yes && m_platform_features.has_value())
+        contents.add_platform_features(*m_platform_features);
 
     auto manifest = ReportSubmission::build_manifest(contents, attachments);
     m_payload = ReportSubmission::Payload { move(manifest), move(attachments) };
@@ -226,6 +232,27 @@ void WebCompatReport::start_submission()
 
     m_submission = submission;
     submission->start();
+}
+
+URL::URL new_bug_report_url(DisableSandbox disable_sandbox)
+{
+    StringBuilder url;
+    url.append("https://github.com/LadybirdBrowser/ladybird/issues/new?template=bug_report.yml"sv);
+    auto append_field = [&](StringView id, StringView value) {
+        url.appendff("&{}={}", id, URL::percent_encode(value, URL::PercentEncodeSet::Component));
+    };
+
+    // NB: These are the IDs of the fields in .github/ISSUE_TEMPLATE/bug_report.yml, where the architecture is a choice
+    //     of these values.
+    append_field("os"sv, platform);
+    append_field("architecture"sv, architecture == "x86_64"sv || architecture == "AArch64"sv ? architecture : "Other"sv);
+    append_field("commit"sv, LADYBIRD_COMMIT);
+    auto build_flags = ByteString::formatted("Ladybird {}, {}", browser_version, build_configuration);
+    if (disable_sandbox == DisableSandbox::Yes)
+        build_flags = ByteString::formatted("{}, sandbox: off", build_flags);
+    append_field("build-flags"sv, build_flags);
+
+    return URL::Parser::basic_parse(url.string_view()).release_value();
 }
 
 }

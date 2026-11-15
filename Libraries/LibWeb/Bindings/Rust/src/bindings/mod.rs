@@ -30,12 +30,12 @@ pub(crate) mod global_object;
 pub(crate) mod interface;
 pub(crate) mod iterable;
 pub(crate) mod maplike;
+pub(crate) mod new_global_object;
 pub(crate) mod promise;
 pub(crate) mod realm_data;
 pub(crate) mod services;
 pub(crate) mod setlike;
 pub(crate) mod structured_data;
-pub(crate) mod transport;
 
 use core::ptr::NonNull;
 
@@ -101,9 +101,7 @@ pub(crate) enum Exception {
     /// A simple exception with the message, which the bindings create in the current realm.
     TypeError(Utf16String),
     RangeError(Utf16String),
-    /// A DOMException with the name, one of https://webidl.spec.whatwg.org/#dfn-error-names-table, and the message,
-    /// which the bindings create in the realm of the call context, as the C++ bindings create the DOMExceptions of
-    /// the implementations they call.
+    /// A DOMException with the name, one of https://webidl.spec.whatwg.org/#dfn-error-names-table, and the message.
     Dom(&'static str, Utf16String),
 }
 
@@ -128,6 +126,12 @@ impl Exception {
 
     pub(crate) fn syntax_error(message: Utf16String) -> Self {
         Self::Dom("SyntaxError", message)
+    }
+
+    /// https://webidl.spec.whatwg.org/#es-exceptions
+    pub(crate) fn throw_in_current_realm(self, vm: &Vm) -> Throw {
+        let realm = vm.current_realm().expect("a native function runs in a realm");
+        self.throw(&CallContext::new(vm, realm))
     }
 
     pub(crate) fn throw(self, cx: &CallContext) -> Throw {

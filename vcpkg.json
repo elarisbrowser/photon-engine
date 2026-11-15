@@ -289,7 +289,7 @@
     },
     {
       "name": "curl",
-      "version": "8.23.0#1"
+      "version": "8.23.0#2"
     },
     {
       "name": "dav1d",
@@ -327,7 +327,7 @@
     },
     {
       "name": "icu",
-      "version": "78.3#2"
+      "version": "78.3#3"
     },
     {
       "name": "libavif",
@@ -380,7 +380,7 @@
     },
     {
       "name": "mimalloc",
-      "version": "2.2.7#0"
+      "version": "2.2.7#1"
     },
     {
       "name": "mman",
@@ -388,7 +388,7 @@
     },
     {
       "name": "nghttp2",
-      "version": "1.70.0#0"
+      "version": "1.70.0#1"
     },
     {
       "name": "openssl",

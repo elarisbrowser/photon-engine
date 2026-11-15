@@ -40,8 +40,10 @@ struct DecodedFirstFrame {
 class WEB_API ImageCodecPlugin {
 public:
     static ImageCodecPlugin& the();
-    static bool is_initialized();
     static void install(ImageCodecPlugin&);
+
+    // For an agent that goes away, whose pending decodes hold on to its heap. Takes the plugin that was installed with new.
+    static void shut_down();
 
     virtual ~ImageCodecPlugin();
 

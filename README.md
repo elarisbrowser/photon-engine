@@ -12,9 +12,12 @@ For the easiest setup, build Photon from the [main browser repository](https://g
 - [Upstream maintenance and submodules](https://github.com/PhotonBrowser/photon/blob/main/Documentation/Upstream.md)
 - [Contributing](https://github.com/PhotonBrowser/photon/blob/main/CONTRIBUTING.md)
 
-Engine-specific changes belong here; browser UI and application behavior belong in the main Photon repository. The engine exposes `Photon::Runtime` and `Photon::View` through `LibPhotonEmbedder`.
+Ladybird uses a [multi-process architecture](Documentation/ProcessArchitecture.md) with a main UI process,
+WebContent renderer processes, and helper processes for tasks such as networking, image decoding, compositing and media.
 
-## Upstream and license
+Documents from different sites run in separate renderer processes, each sandboxed from the rest of the system.
+Image decoding and network connections are done out of process, separately for each site, to be more robust against
+malicious content.
 
 Photon Engine regularly incorporates changes from Ladybird. Keep downstream changes focused and compatible with upstream wherever possible. Follow the [upstream maintenance guide](https://github.com/PhotonBrowser/photon/blob/main/Documentation/Upstream.md) when syncing or updating the pinned engine revision.
 

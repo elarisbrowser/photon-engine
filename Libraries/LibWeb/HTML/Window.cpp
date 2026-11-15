@@ -13,6 +13,7 @@
 #include <LibGC/Heap.h>
 #include <LibGC/WeakHashSet.h>
 #include <LibIPC/File.h>
+#include <LibJS/HostClassBuilder.h>
 #include <LibJS/Runtime/AbstractOperations.h>
 #include <LibJS/Runtime/Completion.h>
 #include <LibJS/Runtime/Error.h>
@@ -21,6 +22,7 @@
 #include <LibJS/Runtime/NativeFunction.h>
 #include <LibTextCodec/Decoder.h>
 #include <LibURL/Origin.h>
+#include <LibURL/RustIntegration.h>
 #include <LibWeb/Bindings/IdleRequest.h>
 #include <LibWeb/Bindings/Intrinsics.h>
 #include <LibWeb/Bindings/PlatformObject.h>
@@ -64,7 +66,6 @@
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/Location.h>
-#include <LibWeb/HTML/MessageEvent.h>
 #include <LibWeb/HTML/MessagePort.h>
 #include <LibWeb/HTML/Navigation.h>
 #include <LibWeb/HTML/Navigator.h>
@@ -190,11 +191,6 @@ WebIDL::ExceptionOr<void> initialize_window_web_interfaces(HTML::Window& window,
     window_global_mixin.initialize(realm, global_object);
     window_global_mixin.define_unforgeable_attributes(realm, global_object);
 
-    // The interface/unforgeable setup above is realm-scoped and must run for every Window wrapper realm.
-    // WindowOrWorkerGlobalScopeMixin state is impl-scoped and shared by all worlds for this Window.
-    if (&realm == &window.principal_realm())
-        window.WindowOrWorkerGlobalScopeMixin::initialize();
-
     if (window.is_internals_object_exposed())
         Bindings::define_internals_property(realm, window, global_object);
 
@@ -225,13 +221,13 @@ WebIDL::UnsignedLong request_animation_frame(HTML::Window& window, WebIDL::Callb
     //     handler belongs to the window, so the callback lives exactly as long as the window's document. A root here
     //     would keep a callback that never runs (a hidden document gets no animation frames) alive for the life of
     //     the process, and with it the window, its document, and everything the document holds.
-    auto handler = [callback = GC::Ref { callback }](double now) {
+    auto handler = GC::create_function(GC::Heap::the(), GC::captures(GC::Ref { callback }), [](GC::Ref<WebIDL::CallbackType>& callback, double now) {
         auto& callback_realm = callback->callback->shape().realm();
         auto result = WebIDL::invoke_callback(*callback, {}, { { JS::Value(now) } });
         if (result.is_error())
             HTML::report_exception(result, callback_realm);
-    };
-    return window.request_animation_frame(move(handler));
+    });
+    return window.request_animation_frame(handler);
 }
 
 WebIDL::ExceptionOr<WebIDL::UnsignedLong> request_animation_frame(HTML::DedicatedWorkerGlobalScope& scope, WebIDL::CallbackType& callback)
@@ -243,11 +239,11 @@ WebIDL::UnsignedLong request_idle_callback(HTML::Window& window, WebIDL::Callbac
 {
     // NB: A plain GC reference rather than a GC::Root, for the same reason as in request_animation_frame() above: the
     //     window's idle callback lists trace the handler, so the callback lives exactly as long as the window's document.
-    auto handler = [callback = GC::Ref { callback }](GC::Ref<RequestIdleCallback::IdleDeadline> deadline) -> JS::Completion {
+    auto handler = GC::create_function(GC::Heap::the(), GC::captures(GC::Ref { callback }), [](GC::Ref<WebIDL::CallbackType>& callback, GC::Ref<RequestIdleCallback::IdleDeadline> deadline) -> JS::Completion {
         auto& callback_realm = callback->callback->shape().realm();
         return WebIDL::invoke_callback(*callback, {}, { { wrap(host_defined_wrapper_world(callback_realm), callback_realm, deadline) } });
-    };
-    return window.request_idle_callback(move(handler), options);
+    });
+    return window.request_idle_callback(handler, options);
 }
 
 void define_internals_property(JS::Realm& realm, HTML::Window& window, JS::Object& global_object)
@@ -403,7 +399,6 @@ void Window::visit_edges(JS::Cell::Visitor& visitor)
     visitor.visit(m_statusbar);
     visitor.visit(m_toolbar);
     visitor.visit(m_external);
-    m_event_timing_state.visit_edges(visitor);
 }
 
 void Window::finalize()
@@ -574,8 +569,9 @@ WebIDL::ExceptionOr<Window::OpenedWindow> Window::window_open_steps_internal(Utf
                 local_target_navigable->report_opener_browsing_context();
             } else {
                 // NB: That browsing context is in the process hosting targetNavigable, which the UI process asks to set
-                //     it to the one active in sourceDocument's node navigable.
-                source_document.page().client().request_set_opener_of_remote_navigable(as<RemoteNavigable>(*target_navigable), *source_document.navigable());
+                //     it to the one active in sourceDocument's node navigable. The request goes through the page holding
+                //     targetNavigable's tab, which is not sourceDocument's when the two are different tabs.
+                target_navigable->page().client().request_set_opener_of_remote_navigable(as<RemoteNavigable>(*target_navigable), *source_document.navigable());
             }
         }
     }
@@ -654,7 +650,7 @@ CSS::Parser::ValueParserFFI::FfiMediaFeatureValue Window::query_media_feature(CS
         // FIXME: Detect if window is fullscreen
         return ident_media_feature_value(CSS::Keyword::Browser);
     case CSS::MediaFeatureID::DynamicRange:
-        return ident_media_feature_value(CSS::Keyword::Standard);
+        return ident_media_feature_value(page().client().screen_shows_high_dynamic_range() ? CSS::Keyword::High : CSS::Keyword::Standard);
     case CSS::MediaFeatureID::EnvironmentBlending:
         return ident_media_feature_value(CSS::Keyword::Opaque);
     case CSS::MediaFeatureID::ForcedColors:
@@ -742,7 +738,7 @@ CSS::Parser::ValueParserFFI::FfiMediaFeatureValue Window::query_media_feature(CS
     case CSS::MediaFeatureID::VideoColorGamut:
         return ident_media_feature_value(CSS::Keyword::Srgb);
     case CSS::MediaFeatureID::VideoDynamicRange:
-        return ident_media_feature_value(CSS::Keyword::Standard);
+        return ident_media_feature_value(page().client().screen_shows_high_dynamic_range() ? CSS::Keyword::High : CSS::Keyword::Standard);
     case CSS::MediaFeatureID::WebkitTransform3d:
         // https://compat.spec.whatwg.org/#css-media-queries-webkit-transform-3d
         // If the user agent supports 3D transforms, the value will be 1. Otherwise the value is 0.
@@ -930,6 +926,55 @@ void Window::notify_about_user_activation()
     close_watcher_manager()->notify_about_user_activation();
 }
 
+// https://html.spec.whatwg.org/multipage/interaction.html#activation-notification
+void Window::run_activation_notification_steps(DOM::Document& document)
+{
+    // 1. Assert: document is fully active.
+    // AD-HOC: The spec asserts this, but we return instead — so input reaching a document as it's being torn down
+    //         can't crash.
+    if (!document.is_fully_active())
+        return;
+
+    // 2. Let windows be « document's relevant global object ».
+    // NB: That's the window of a fully active document.
+    GC::RootVector<GC::Ref<Window>> windows;
+    windows.append(*document.window());
+
+    // NB: Only the windows of the navigables this page hosts are notified here, and the UI process notifies those that
+    //     other pages host.
+    auto reaches_navigables_other_pages_host = false;
+    auto active_window_of_hosted_navigable = [&](HTML::Navigable& navigable) -> GC::Ptr<Window> {
+        if (auto* local_navigable = as_if<LocalNavigable>(navigable))
+            return local_navigable->active_window();
+        reaches_navigables_other_pages_host = true;
+        return nullptr;
+    };
+
+    // 3. Extend windows with the active window of each of document's ancestor navigables.
+    for (auto& ancestor : document.ancestor_navigables()) {
+        if (auto window = active_window_of_hosted_navigable(ancestor))
+            windows.append(*window);
+    }
+
+    // 4. Extend windows with the active window of each of document's descendant navigables, filtered to include only
+    //    those navigables whose active document's origin is same origin with document's origin.
+    for (auto& descendant : document.descendant_navigables()) {
+        auto window = active_window_of_hosted_navigable(*descendant);
+        if (window && window->associated_document().origin().is_same_origin(document.origin()))
+            windows.append(*window);
+    }
+
+    // 5. For each window in windows:
+    for (auto& window : windows) {
+        // 1. Set window's last activation timestamp to the current high resolution time.
+        // 2. Notify the close watcher manager about user activation given window.
+        window->notify_about_user_activation();
+    }
+
+    if (reaches_navigables_other_pages_host)
+        document.page().client().page_did_notify_about_user_activation(document.id());
+}
+
 // https://html.spec.whatwg.org/multipage/interaction.html#consume-user-activation
 void Window::consume_user_activation()
 {
@@ -972,8 +1017,8 @@ void Window::start_an_idle_period()
 
     // 5. Queue a task on the queue associated with the idle-task task source,
     //    which performs the steps defined in the invoke idle callbacks algorithm with window and getDeadline as parameters.
-    queue_global_task(Task::Source::IdleTask, relevant_global_object(*this), GC::create_function(GC::Heap::the(), [this] {
-        invoke_idle_callbacks();
+    queue_global_task(Task::Source::IdleTask, relevant_global_object(*this), GC::create_function(GC::Heap::the(), GC::captures(*this), [](Window& self) {
+        self.invoke_idle_callbacks();
     }),
         Task::Priority::Idle);
 }
@@ -990,7 +1035,7 @@ void Window::invoke_idle_callbacks()
         // 1. Pop the top callback from window's list of runnable idle callbacks.
         auto callback = m_runnable_idle_callbacks.take_first();
         if (callback->timeout_timer_id().has_value()) {
-            clear_timeout(*callback->timeout_timer_id());
+            cancel_timeout_steps(*callback->timeout_timer_id());
             callback->clear_timeout_timer_id();
         }
         // 2. Let deadlineArg be a new IdleDeadline whose [get deadline time algorithm] is getDeadline.
@@ -1003,8 +1048,8 @@ void Window::invoke_idle_callbacks()
         // 4. If window's list of runnable idle callbacks is not empty, queue a task which performs the steps
         //    in the invoke idle callbacks algorithm with getDeadline and window as a parameters and return from this algorithm
         if (!m_runnable_idle_callbacks.is_empty()) {
-            queue_global_task(Task::Source::IdleTask, relevant_global_object(*this), GC::create_function(GC::Heap::the(), [this] {
-                invoke_idle_callbacks();
+            queue_global_task(Task::Source::IdleTask, relevant_global_object(*this), GC::create_function(GC::Heap::the(), GC::captures(*this), [](Window& self) {
+                self.invoke_idle_callbacks();
             }),
                 Task::Priority::Idle);
         }
@@ -1262,7 +1307,7 @@ void Window::close()
         traversable->set_closing(true);
 
         // 2. Queue a task on the DOM manipulation task source to definitely close thisTraversable.
-        HTML::queue_global_task(HTML::Task::Source::DOMManipulation, relevant_global_object(incumbent_global_object), GC::create_function(GC::Heap::the(), [traversable] {
+        HTML::queue_global_task(HTML::Task::Source::DOMManipulation, relevant_global_object(incumbent_global_object), GC::create_function(GC::Heap::the(), GC::captures(traversable), [](auto& traversable) {
             as<LocalTraversableNavigable>(*traversable).definitely_close_top_level_traversable();
         }));
     }
@@ -1636,128 +1681,72 @@ Optional<Utf16String> Window::prompt(Optional<Utf16String> const& message, Optio
     return result;
 }
 
-WebIDL::ExceptionOr<Window::PreparedPostMessage> Window::prepare_post_message(JS::Realm& realm, JS::Value message, PostMessageOptions const& options)
+extern "C" {
+JSCompletion web_window_post_message(JSVM*, void* realm, void* target, bool remote, JSValue, FlatPtr target_origin, JSObject* const* transfer, size_t count);
+void web_window_queue_posted_message(JSVM*, Window*, SerializedTransferRecord*, URL::FFI::FfiOrigin const* target_origin, URL::FFI::FfiOrigin const* source_origin, WindowProxy* source);
+EnvironmentSettingsObject* web_window_post_message_incumbent_settings();
+void web_window_post_message_settings_origin(EnvironmentSettingsObject*, void*, void (*)(void*, URL::FFI::FfiOrigin const*));
+WindowProxy* web_window_post_message_source(EnvironmentSettingsObject*);
+void web_window_post_message_parse_target_origin(FlatPtr, void*, void (*)(void*, URL::FFI::FfiOrigin const*));
+void* web_window_post_message_realm(Window*);
+void web_window_post_message_document_origin(Window*, void*, void (*)(void*, URL::FFI::FfiOrigin const*));
+}
+
+EnvironmentSettingsObject* web_window_post_message_incumbent_settings()
 {
-    // 2. Let incumbentSettings be the incumbent settings object.
-    auto& incumbent_settings = incumbent_settings_object();
+    return &incumbent_settings_object();
+}
 
-    // 3. Let targetOrigin be options["targetOrigin"].
-    Variant<Utf16String, URL::Origin> target_origin = options.target_origin;
+void web_window_post_message_settings_origin(EnvironmentSettingsObject* settings, void* context, void (*receive)(void*, URL::FFI::FfiOrigin const*))
+{
+    URL::RustIntegration::lend_origin_to_ffi(settings->origin(), [&](auto const& origin) { receive(context, &origin); });
+}
 
-    // 4. If targetOrigin is a single U+002F SOLIDUS character (/), then set targetOrigin to incumbentSettings's origin.
-    if (options.target_origin == u"/"sv) {
-        target_origin = incumbent_settings.origin();
-    }
-    // 5. Otherwise, if targetOrigin is not a single U+002A ASTERISK character (*), then:
-    else if (options.target_origin != u"*"sv) {
-        // 1. Let parsedURL be the result of running the URL parser on targetOrigin.
-        auto parsed_url = DOMURL::parse(options.target_origin.utf16_view());
+WindowProxy* web_window_post_message_source(EnvironmentSettingsObject* settings)
+{
+    return window_proxy_from_global_this_value(settings->realm().global_environment().global_this_value()).ptr();
+}
 
-        // 2. If parsedURL is failure, then throw a "SyntaxError" DOMException.
-        if (!parsed_url.has_value())
-            return Web::throw_completion(
-                realm,
-                WebIDL::SyntaxError::create(Utf16String::formatted("Invalid URL for targetOrigin: '{}'", options.target_origin)));
+void web_window_post_message_parse_target_origin(FlatPtr raw_target_origin, void* context, void (*receive)(void*, URL::FFI::FfiOrigin const*))
+{
+    // DOMURL parsing also resolves blob URL entries, whose stored origin takes precedence over parsing their path.
+    auto target_origin = Utf16String::from_raw(raw_target_origin);
+    if (auto url = DOMURL::parse(target_origin.utf16_view()); url.has_value())
+        URL::RustIntegration::lend_origin_to_ffi(url->origin(), [&](auto const& origin) { receive(context, &origin); });
+}
 
-        // 3. Set targetOrigin to parsedURL's origin.
-        target_origin = parsed_url->origin();
-    }
+void* web_window_post_message_realm(Window* window)
+{
+    return &window->principal_realm();
+}
 
-    // 6. Let transfer be options["transfer"].
-    auto& transfer = options.structured_serialize_options.transfer;
-
-    // 7. Let serializeWithTransferResult be StructuredSerializeWithTransfer(message, transfer). Rethrow any exceptions.
-    auto serialize_with_transfer_result = TRY(structured_serialize_with_transfer(realm, message, transfer));
-
-    // NB: The task queued by step 8 reads incumbentSettings in its steps 2 and 3. Snapshot those values here.
-    // 8.2. Let origin be the incumbentSettings's origin.
-    auto source_origin = incumbent_settings.origin();
-
-    // 8.3. Let source be the WindowProxy object corresponding to incumbentSettings's global object (a Window object).
-    auto source = window_proxy_from_global_this_value(incumbent_settings.realm().global_environment().global_this_value());
-
-    return PreparedPostMessage {
-        .serialize_with_transfer_result = move(serialize_with_transfer_result),
-        .target_origin = move(target_origin),
-        .incumbent_settings_id = incumbent_settings.id,
-        .source_origin = move(source_origin),
-        .source = source,
-    };
+void web_window_post_message_document_origin(Window* window, void* context, void (*receive)(void*, URL::FFI::FfiOrigin const*))
+{
+    URL::RustIntegration::lend_origin_to_ffi(window->document()->origin(), [&](auto const& origin) { receive(context, &origin); });
 }
 
 // https://html.spec.whatwg.org/multipage/web-messaging.html#window-post-message-steps
-WebIDL::ExceptionOr<void> Window::window_post_message_steps(JS::Realm& realm, JS::Value message, PostMessageOptions const& options)
+WebIDL::ExceptionOr<void> Window::window_post_message_steps(JS::Realm& realm, Variant<GC::Ref<Window>, GC::Ref<RemoteNavigable>> target_window, JS::Value message, PostMessageOptions const& options)
 {
-    // 1. Let targetRealm be targetWindow's realm.
-    // NB: Taken from targetWindow when the queued task delivers the message.
-
-    // 2-7.
-    auto prepared = TRY(prepare_post_message(realm, message, options));
-
-    // 8. Queue a global task on the posted message task source given targetWindow to run the following steps:
-    queue_global_task(Task::Source::PostedMessage, relevant_global_object(*this), GC::create_function(GC::Heap::the(), [this, prepared = move(prepared)]() mutable {
-        deliver_posted_message(move(prepared.serialize_with_transfer_result), prepared.target_origin, prepared.source_origin, prepared.source);
-    }));
-
+    auto* target = target_window.visit([](auto target) -> void* { return target.ptr(); });
+    Vector<JSObject*> transfer;
+    for (auto const& object : options.structured_serialize_options.transfer)
+        transfer.append(JS::HostABI::object_to_abi(object.ptr()));
+    TRY(JS::HostABI::completion_from_abi<void>(web_window_post_message(JS::HostABI::vm_to_abi(realm.vm()), &realm, target, target_window.has<GC::Ref<RemoteNavigable>>(), JS::HostABI::value_to_abi(message), options.target_origin.to_raw_leaked(), transfer.data(), transfer.size())));
     return {};
 }
 
-void Window::deliver_posted_message(SerializedTransferRecord serialize_with_transfer_result, Variant<Utf16String, URL::Origin> const& target_origin, URL::Origin const& origin, GC::Ptr<WindowProxy> source)
+void Window::queue_posted_message(SerializedTransferRecord record, Variant<Utf16String, URL::Origin> const& target_origin, URL::Origin const& source_origin, GC::Ptr<WindowProxy> source)
 {
-    // 1. Let targetRealm be targetWindow's realm.
-    auto& target_realm = principal_realm();
-
-    // 1. If the targetOrigin argument is not a single literal U+002A ASTERISK character (*) and targetWindow's
-    //    associated Document's origin is not same origin with targetOrigin, then return.
-    // NOTE: Due to step 4 and 5 above, the only time it's not '*' is if target_origin contains an Origin.
-    if (!target_origin.has<Utf16String>()) {
-        auto const& actual_target_origin = target_origin.get<URL::Origin>();
-        if (!document()->origin().is_same_origin(actual_target_origin))
-            return;
-    }
-
-    // 2. Let origin be the incumbentSettings's origin.
-    // 3. Let source be the WindowProxy object corresponding to incumbentSettings's global object (a Window object).
-    // NB: Both were snapshotted by prepare_post_message().
-    NullableMessageEventSource source_for_event = Empty {};
-    if (source)
-        source_for_event = GC::Ref { *source };
-
-    // 4. Let deserializeRecord be StructuredDeserializeWithTransfer(serializeWithTransferResult, targetRealm).
-    // NB: The execution context must not stay on the stack while the event is dispatched, so that a microtask
-    //     checkpoint can be performed after each listener.
-    auto deserialize_record_or_error = [&] {
-        TemporaryExecutionContext temporary_execution_context { target_realm, TemporaryExecutionContext::CallbacksEnabled::Yes };
-        return structured_deserialize_with_transfer(serialize_with_transfer_result, target_realm);
-    }();
-
-    // If this throws an exception, catch it, fire an event named messageerror at targetWindow, using MessageEvent,
-    // with its origin initialized to origin and the source attribute initialized to source, and then return.
-    if (deserialize_record_or_error.is_exception()) {
-        MessageEventInit message_event_init { {}, JS::js_null(), Utf16String {}, Utf16String {}, {}, source_for_event };
-
-        auto message_error_event = MessageEvent::create(target_realm.global_object(), EventNames::messageerror, message_event_init, origin);
-        dispatch_event(message_error_event);
-        return;
-    }
-
-    // 5. Let messageClone be deserializeRecord.[[Deserialized]].
-    auto deserialize_record = deserialize_record_or_error.release_value();
-    auto message_clone = deserialize_record.deserialized;
-
-    // 6. Let newPorts be a new frozen array consisting of all MessagePort objects in deserializeRecord.[[TransferredValues]],
-    //    if any, maintaining their relative order.
-    // FIXME: Use a FrozenArray
-    auto new_ports = Bindings::message_ports_from_transferred_values(deserialize_record.transferred_values);
-
-    // 7. Fire an event named message at targetWindow, using MessageEvent, with its origin initialized to origin,
-    //    the source attribute initialized to source, the data attribute initialized to messageClone, and the ports
-    //    attribute initialized to newPorts.
-    MessageEventInit message_event_init { {}, message_clone, Utf16String {}, Utf16String {}, move(new_ports), source_for_event };
-
-    auto message_event = MessageEvent::create(target_realm.global_object(), EventNames::message, message_event_init, origin);
-    message_event->set_is_trusted(true);
-    dispatch_event(message_event);
+    URL::RustIntegration::lend_origin_to_ffi(source_origin, [&](auto const& source_origin) {
+        auto queue = [&](URL::FFI::FfiOrigin const* target) {
+            web_window_queue_posted_message(JS::HostABI::vm_to_abi(vm()), this, &record, target, &source_origin, source.ptr());
+        };
+        if (target_origin.has<URL::Origin>())
+            URL::RustIntegration::lend_origin_to_ffi(target_origin.get<URL::Origin>(), [&](auto const& target) { queue(&target); });
+        else
+            queue(nullptr);
+    });
 }
 
 // https://html.spec.whatwg.org/multipage/web-messaging.html#dom-window-postmessage-options
@@ -1765,7 +1754,7 @@ WebIDL::ExceptionOr<void> Window::post_message(JS::Realm& realm, JS::Value messa
 {
     // The Window interface's postMessage(message, options) method steps are to run the window post message steps given
     // this, message, and options.
-    return window_post_message_steps(realm, message, options);
+    return window_post_message_steps(realm, GC::Ref { *this }, message, options);
 }
 
 // https://html.spec.whatwg.org/multipage/web-messaging.html#dom-window-postmessage
@@ -1773,7 +1762,7 @@ WebIDL::ExceptionOr<void> Window::post_message(JS::Realm& realm, JS::Value messa
 {
     // The Window interface's postMessage(message, targetOrigin, transfer) method steps are to run the window post message
     // steps given this, message, and «[ "targetOrigin" → targetOrigin, "transfer" → transfer ]».
-    return window_post_message_steps(realm, message, PostMessageOptions { { .transfer = transfer }, target_origin });
+    return window_post_message_steps(realm, GC::Ref { *this }, message, PostMessageOptions { { .transfer = transfer }, target_origin });
 }
 
 // https://dom.spec.whatwg.org/#dom-window-event
@@ -2180,8 +2169,7 @@ double Window::device_pixel_ratio() const
 WebIDL::UnsignedLong Window::request_animation_frame(AnimationFrameCallbackHandler callback)
 {
     // FIXME: Make this fully spec compliant. Currently implements a mix of 'requestAnimationFrame()' and 'run the animation frame callbacks'.
-    auto handle = animation_frame_callback_driver().add(GC::create_function(GC::Heap::the(), move(callback)));
-    if (photon_frame_trace_enabled()) dbgln("[FrameTrace] requestAnimationFrame window={} handle={} at_ms={:.3f}", reinterpret_cast<FlatPtr>(this), handle, HighResolutionTime::unsafe_shared_current_time());
+    auto handle = animation_frame_callback_driver().add(callback);
     if (Core::StatsLog::the())
         set_rendering_pending(associated_document(), RenderingPendingReason::ScheduledAnimationFrameCallbacks, animation_frame_callback_driver().callback_count());
     page().client().request_frame();
@@ -2229,7 +2217,7 @@ u32 Window::request_idle_callback(IdleCallbackHandler callback, IdleRequestOptio
     auto handle = m_idle_callback_identifier;
 
     // 4. Push callback to the end of window's list of idle request callbacks, associated with handle.
-    auto idle_callback = GC::Heap::the().allocate<IdleCallback>(GC::create_function(GC::Heap::the(), move(callback)), handle);
+    auto idle_callback = GC::Heap::the().allocate<IdleCallback>(callback, handle);
     m_idle_request_callbacks.set(handle, idle_callback);
     main_thread_event_loop().did_request_idle_callback();
 
@@ -2238,18 +2226,17 @@ u32 Window::request_idle_callback(IdleCallbackHandler callback, IdleRequestOptio
     // 6. If the timeout property is present in options and has a positive value:
     if (options.timeout.has_value() && *options.timeout > 0) {
         // 1. Wait for timeout milliseconds.
-        auto timeout = min(*options.timeout, static_cast<u32>(NumericLimits<i32>::max()));
-        auto timeout_timer_id = run_steps_after_a_timeout(static_cast<i32>(timeout), [this, handle] {
+        auto timeout_timer_id = run_steps_after_a_timeout(*options.timeout, GC::create_function(GC::Heap::the(), GC::captures(*this, handle), [](Window& self, u32 handle) {
             // FIXME: 2. Wait until all invocations of this algorithm, whose timeout added to their posted time occurred before this one's, have completed.
             // FIXME: 3. Optionally, wait a further user-agent defined length of time.
 
             // 4. Queue a task on the queue associated with the idle-task task source, which performs the invoke idle callback timeout algorithm, passing handle and window as arguments.
             // NB: A timed-out idle task has normal scheduling priority so that higher-priority work cannot keep it from
             //     running indefinitely. Its task source remains the idle-task task source as required by the specification.
-            queue_global_task(Task::Source::IdleTask, relevant_global_object(*this), GC::create_function(GC::Heap::the(), [this, handle] {
-                invoke_idle_callback_timeout(handle);
+            queue_global_task(Task::Source::IdleTask, relevant_global_object(self), GC::create_function(GC::Heap::the(), GC::captures(self, handle), [](Window& self, u32 handle) {
+                self.invoke_idle_callback_timeout(handle);
             }));
-        });
+        }));
         idle_callback->set_timeout_timer_id(timeout_timer_id);
     }
 
@@ -2269,7 +2256,7 @@ void Window::cancel_idle_callback(u32 handle)
         if (!callback.has_value())
             return;
         if ((*callback)->timeout_timer_id().has_value())
-            clear_timeout(*(*callback)->timeout_timer_id());
+            cancel_timeout_steps(*(*callback)->timeout_timer_id());
     };
     remove_callback(m_idle_request_callbacks);
     remove_callback(m_runnable_idle_callbacks);
@@ -2382,11 +2369,8 @@ GC::OrderedRootHashMap<Utf16FlyString, GC::Ref<Navigable>> Window::document_tree
         //     container's name content attribute. This keeps <iframe name=...> accessible
         //     through parent.frames.name while still excluding names introduced only by a
         //     cross-origin child changing window.name.
-        if (auto container = navigable->container()) {
-            auto container_name = container->name();
-            if (container_name.has_value() && *container_name == name)
-                names.set(name, *navigable);
-        }
+        if (auto container_name = navigable->container_name(); container_name.has_value() && *container_name == name)
+            names.set(name, *navigable);
     }
 
     return names;
@@ -2490,10 +2474,10 @@ Variant<Empty, GC::Ref<WindowProxy>, GC::Ref<DOM::Element>, GC::Ref<DOM::HTMLCol
 
     // 4. Otherwise return an HTMLCollection rooted at window's associated Document,
     //    whose filter matches only named objects of window with the name name. (By definition, these will all be elements.)
-    auto collection = DOM::HTMLCollection::create(mutable_this.associated_document(), DOM::HTMLCollection::Scope::Descendants, [name](auto& element) -> bool {
+    auto collection = DOM::HTMLCollection::create(mutable_this.associated_document(), DOM::HTMLCollection::Scope::Descendants, GC::create_function(heap(), GC::captures(name), [](Utf16FlyString const& name, DOM::Element const& element) -> bool {
         if (is_named_element_by_name(element) && element.name() == name)
             return true;
-        return element.id() == name; }, DOM::HTMLCollection::AttributeInvalidationType::IdOrName);
+        return element.id() == name; }), DOM::HTMLCollection::AttributeInvalidationType::IdOrName);
     return collection;
 }
 

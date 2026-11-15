@@ -136,6 +136,10 @@ pub enum ExitKind {
     /// Something the code depended on stopped holding while it ran other
     /// code (see `Dependency`), so the code was invalidated.
     Invalidated,
+    /// Another thread interrupted the VM, so script has to stop, which the
+    /// interpreter does at once. Or the stack got so deep that calls leave
+    /// compiled code, which is no reason to stop.
+    Interrupted,
     /// Code that a call in an inlined function ran read the legacy
     /// `arguments` of the function's frame, among which were objects the
     /// code never allocated: the runtime created them, and the code exited
@@ -183,10 +187,10 @@ pub struct Site {
     pub kind: SiteKind,
     /// The frames there, innermost first: the frames of the inlined calls
     /// the site is in, and the compiled function's frame.
-    pub frames: Vec<FrameState>,
+    pub frames: Box<[FrameState]>,
     /// The objects the compiled code never allocated, which the frames'
     /// values refer to (as `ValueLocation::VirtualObject`).
-    pub objects: Vec<VirtualObjectDescriptor>,
+    pub objects: Box<[VirtualObjectDescriptor]>,
     /// For a `SiteKind::Call`: the room for the frames of the inlined calls
     /// that the call leaves below its callee's frame (see `Op::CallDirect`).
     pub inlined_frame_bytes: u32,
@@ -219,18 +223,30 @@ pub enum SiteKind {
     Call,
 }
 
-/// An object the compiled code never allocated, which an exit creates: a
-/// plain object of `shape` with the values of its properties in offset
-/// order. Each one is created once per exit, before any is given its
+/// An object the compiled code never allocated, which an exit creates as
+/// `kind` says. Each one is created once per exit, before any is given its
 /// properties, so objects may refer to each other.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VirtualObjectDescriptor {
-    pub shape: CellId,
+    pub kind: VirtualObjectDescriptorKind,
     /// The node index of the allocation the object stands for, which is the
     /// same at every site of the code: the runtime may have created the
     /// object at another site of the same frame already, and then uses that.
     pub allocation: u32,
-    pub properties: Vec<ValueLocation>,
+    /// The values `kind` describes.
+    pub properties: Box<[ValueLocation]>,
+}
+
+/// What kind of object a `VirtualObjectDescriptor` describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtualObjectDescriptorKind {
+    /// A plain object of `shape`, with the values of its properties in
+    /// offset order.
+    Object { shape: CellId },
+    /// A closure like `sample`, the sample of a closure template, with the
+    /// lexical and private environments at the two locations, which are
+    /// `Repr::Pointer`, the latter null for none.
+    Closure { sample: CellId },
 }
 
 /// Set in the return pc (`ExecutionContext::caller_return_pc`) of the frame of
@@ -267,12 +283,12 @@ pub struct FrameState {
     pub mode: ResumeMode,
     /// The value of each frame slot that differs from what the frame already
     /// holds, in slot order.
-    pub values: Vec<(u32, ValueLocation)>,
+    pub values: Box<[(u32, ValueLocation)]>,
     /// The live slots whose value the frame already holds (see
     /// `ir::FrameState::in_frame`), in slot order. Exits clear the registers
     /// and locals listed in neither, except a `ResumeAfter` destination,
     /// which exits never write either.
-    pub in_frame: Vec<u32>,
+    pub in_frame: Box<[u32]>,
     /// See `ir::FrameState::passed_argument_count`.
     pub passed_argument_count: Option<u32>,
     /// The argument slots that the legacy `arguments` of the frame's
@@ -289,7 +305,11 @@ pub enum ValueLocation {
     Register(u8, Repr),
     /// A stack slot at the given offset from the JIT frame.
     Stack(i32, Repr),
-    /// A NaN-boxed constant.
+    /// A slot of the compiled function's frame (an operand) that holds the value wherever compiled code runs, which
+    /// is tagged: one of its arguments or its `this` value register that nothing writes.
+    Frame(u32),
+    /// A NaN-boxed constant, or for the environments of a closure the code never created (see
+    /// `VirtualObjectDescriptorKind::Closure`), the address of a cell the code embeds, or null.
     Constant(u64),
     /// The frame's arguments object, which the compiled code never created:
     /// the runtime creates it from the frame's arguments like
@@ -307,6 +327,7 @@ pub enum Repr {
     Int32,
     Float64,
     Bool,
-    /// The address of a GC cell. Never in frame states.
+    /// The address of a GC cell. In frame states, only as an environment of a
+    /// closure the code never allocated (see `VirtualObjectDescriptorKind`).
     Pointer,
 }

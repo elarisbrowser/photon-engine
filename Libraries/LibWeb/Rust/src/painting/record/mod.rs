@@ -48,6 +48,8 @@ pub(crate) use inputs::RecordingInputs;
 #[derive(Default)]
 pub struct RecordingOutput {
     pub recorded_structural_epoch: u64,
+    /// The visual context tree the recording was recorded against: the frozen frame's.
+    pub visual_context_tree: Option<Arc<crate::painting::visual_context::VisualContextTree>>,
     pub(crate) frame_inputs: FrameInputs,
     // The area the root background painted: the viewport united with the root's overflow. Only
     // the root's background reads it, so a change pushes that producer instead of a new frame.
@@ -65,6 +67,15 @@ pub struct RecordingOutput {
     pub(crate) capture_log: Option<trace::CaptureLog>,
     /// The SVG images whose display lists, which the host rendered, the recording draws, and the ids of those lists.
     pub(crate) vector_image_display_lists: Vec<(vector_images::VectorImageRenderRequest, u64)>,
+    /// What the display list draws besides its tape.
+    pub(crate) resources: crate::painting::display_list_resources::DisplayListResources,
+    /// The display list's id, which a recording that repeats the one published last shares with it.
+    pub display_list_id: u64,
+    /// What the compositor clears the surface with below the display list, for a top-level traversable.
+    pub surface_clear_color: Option<libgfx_rust::Color>,
+    /// What the display list is stamped with for async scrolling, but for the keyboard scroll state, which each frame
+    /// sets.
+    pub async_scrolling_metadata: Option<libcompositing_rust::ipc_types::Compositing_AsyncScrollingMetadata>,
 }
 
 pub(crate) struct RecordingResult {
@@ -225,6 +236,12 @@ impl<O: Observer> PaintRecorder<'_, O> {
             .unwrap_or(self.inputs.image_fallback_color_scheme)
     }
 
+    /// The force-dark settings an SVG image the recording draws renders its content with: the recorder's own, so the
+    /// image darkens along with the page around it, and stays as authored in a mask, where force dark is suspended.
+    pub(crate) fn vector_image_force_dark(&self) -> Option<crate::painting::force_dark::ForceDarkSettings> {
+        self.recorder.force_dark_settings()
+    }
+
     pub(crate) fn paint_vector_image(
         &mut self,
         source: vector_images::VectorImageSource,
@@ -245,6 +262,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
                 geometry.raster_scale,
                 content_identity,
                 self.vector_image_color_scheme(source.owner()),
+                self.vector_image_force_dark(),
             ));
         if compositing_and_blending_operator != CompositingAndBlendingOperator::Normal {
             let dest_device_rect = libgfx_rust::enclosing_int_rect(dest_rect);
@@ -319,7 +337,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
             self.committed_highlight_pseudo_style(HighlightPseudoElement::Selection, node, element_row)
         });
         let answer = Self::highlight_style_answer(committed, || {
-            self.default_selection_style(node, style_source, window_is_focused)
+            self.default_selection_style(style_source, window_is_focused)
         });
         self.scratch.selection_style_cache.insert(key, answer.clone());
         answer
@@ -337,7 +355,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
         let committed =
             self.committed_highlight_pseudo_style(HighlightPseudoElement::Selection, element_row, element_row);
         let answer = Self::highlight_style_answer(committed, || {
-            self.default_selection_style(element_row, element_row, window_is_focused)
+            self.default_selection_style(element_row, window_is_focused)
         });
         self.scratch.selection_style_cache.insert(key, answer.clone());
         answer
@@ -362,9 +380,8 @@ impl<O: Observer> PaintRecorder<'_, O> {
         let committed = self
             .first_non_anonymous_ancestor_row(node)
             .and_then(|element_row| self.committed_highlight_pseudo_style(highlight, node, element_row));
-        let answer = Self::highlight_style_answer(committed, || {
-            self.default_search_text_style(node, style_source, highlight)
-        });
+        let answer =
+            Self::highlight_style_answer(committed, || self.default_search_text_style(style_source, highlight));
         let cache = if is_current {
             &mut self.scratch.search_text_current_style_cache
         } else {
@@ -421,8 +438,8 @@ impl<O: Observer> PaintRecorder<'_, O> {
         answer
     }
 
-    /// A committed style that authored neither color takes the paired default colors and keeps
-    /// its shadows and decorations.
+    /// A committed style that authored neither color takes the paired default colors (the text color among them) and
+    /// keeps its shadows and decorations.
     fn highlight_style_answer(
         committed: Option<Arc<paint::text::SelectionStyleAnswer>>,
         defaults: impl FnOnce() -> paint::text::SelectionStyleAnswer,
@@ -435,6 +452,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
                 defaults.facts = crate::painting::host::FfiSelectionStyleFacts {
                     background_color: defaults.facts.background_color,
                     background_color_is_current_color: defaults.facts.background_color_is_current_color,
+                    text_color: defaults.facts.text_color,
                     wash_color: defaults.facts.wash_color,
                     ..answer.facts
                 };
@@ -492,11 +510,10 @@ impl<O: Observer> PaintRecorder<'_, O> {
 
     fn default_selection_style(
         &self,
-        node: crate::layout::node_data::NodeSlotId,
         style_source: crate::layout::node_data::NodeSlotId,
         window_is_focused: bool,
     ) -> paint::text::SelectionStyleAnswer {
-        let background_color = self.default_selection_background(node, style_source, window_is_focused);
+        let background_color = self.default_selection_background(style_source, window_is_focused);
         paint::text::SelectionStyleAnswer {
             facts: crate::painting::host::FfiSelectionStyleFacts {
                 background_color,
@@ -510,12 +527,11 @@ impl<O: Observer> PaintRecorder<'_, O> {
 
     fn default_search_text_style(
         &self,
-        node: crate::layout::node_data::NodeSlotId,
         style_source: crate::layout::node_data::NodeSlotId,
         highlight: HighlightPseudoElement,
     ) -> paint::text::SelectionStyleAnswer {
         if highlight == HighlightPseudoElement::SearchTextCurrent {
-            let background_color = self.default_selection_background(node, style_source, true);
+            let background_color = self.default_selection_background(style_source, true);
             return paint::text::SelectionStyleAnswer {
                 facts: crate::painting::host::FfiSelectionStyleFacts {
                     background_color,
@@ -541,24 +557,22 @@ impl<O: Observer> PaintRecorder<'_, O> {
 
     fn default_selection_background(
         &self,
-        node: crate::layout::node_data::NodeSlotId,
         style_source: crate::layout::node_data::NodeSlotId,
         window_is_focused: bool,
     ) -> libgfx_rust::Color {
         use crate::css::color_resolution::{PREFERRED_COLOR_SCHEME_DARK, PREFERRED_COLOR_SCHEME_LIGHT};
         let inputs = self.inputs;
-        let (color_scheme, color_scheme_is_normal) =
-            self.source.node_style_if_live(style_source).map_or((0, true), |style| {
-                let ui = style.inherited_ui();
-                (ui.color_scheme, ui.color_schemes.as_slice().is_empty())
-            });
-        let use_palette_for_normal_color_scheme = !self.source.node_is_dom_backed(node)
-            || (color_scheme_is_normal && !inputs.document_has_supported_color_schemes);
         let palette_color_scheme = if inputs.palette_is_dark {
             PREFERRED_COLOR_SCHEME_DARK
         } else {
             PREFERRED_COLOR_SCHEME_LIGHT
         };
+        // NB: The selection takes the element's used color scheme, which is light for `normal` unless the document
+        //     supports other color schemes, whatever the palette's. Without a style to tell, it takes the palette's.
+        let color_scheme = self
+            .source
+            .node_style_if_live(style_source)
+            .map_or(palette_color_scheme, |style| style.inherited_ui().color_scheme);
         let (from_palette, light, dark) = if window_is_focused {
             (
                 inputs.selection_background_from_palette,
@@ -572,7 +586,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
                 inputs.inactive_selection_background_dark,
             )
         };
-        if color_scheme == palette_color_scheme || use_palette_for_normal_color_scheme {
+        if color_scheme == palette_color_scheme {
             from_palette
         } else if color_scheme == PREFERRED_COLOR_SCHEME_DARK {
             dark
@@ -706,10 +720,6 @@ impl<O: Observer> PaintRecorder<'_, O> {
         self.paintable_facts(paintable).visible_for_hit_testing
     }
 
-    fn is_replaced_box(&self, paintable: NodeSlotId) -> bool {
-        crate::painting::style_queries::is_replaced_box(self.source, paintable)
-    }
-
     pub(crate) fn with_context<R>(&mut self, context: ContextRef, paint: impl FnOnce(&mut Self) -> R) -> R {
         let previous_context = self.recorder.accumulated_visual_context();
         self.recorder.set_accumulated_visual_context(context);
@@ -756,14 +766,8 @@ impl<O: Observer> PaintRecorder<'_, O> {
                 height: transform.y_scale(),
             };
         }
-        let tree = self
-            .paint_state
-            .visual_context_tree
-            .as_deref()
-            .expect("recording runs against a visual context tree");
-        tree.accumulated_2d_scale(
+        self.paint_state.unscrolled_world_transforms().accumulated_2d_scale(
             spatial,
-            &[],
             crate::painting::visual_context::IncludeVisualViewportTransform::No,
         )
     }
@@ -783,6 +787,7 @@ impl<O: Observer> PaintRecorder<'_, O> {
             pattern: pattern.index,
             root_transform_bits: root_transform.values.map(f32::to_bits),
             tile_surface_size_bits: [tile_surface_rect.width.to_bits(), tile_surface_rect.height.to_bits()],
+            force_dark: self.recorder.force_dark_settings().is_some(),
         };
         if let Some(records) = self.scratch.pattern_tile_records.get(&key) {
             return records.clone();
@@ -805,4 +810,7 @@ struct PatternTileKey {
     pattern: u32,
     root_transform_bits: [u32; 6],
     tile_surface_size_bits: [u32; 2],
+    // A tile recorded inside a mask, where force dark is suspended, has authored colors, which a tile on the page
+    // can't reuse.
+    force_dark: bool,
 }

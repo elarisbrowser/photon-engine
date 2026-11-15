@@ -53,11 +53,19 @@ pub struct JitResult {
 
 /// `entry(VM*, ExecutionContext* frame)`: the frame is fully built for its executable, at pc 0 with Enter not run yet
 /// (or, for an on-stack replacement entry, at the loop back edge the entry is for).
+#[cfg(not(all(target_arch = "x86_64", windows)))]
 pub type JitEntry = unsafe extern "C" fn(*const Vm, *mut ExecutionContext) -> JitResult;
+#[cfg(all(target_arch = "x86_64", windows))]
+pub type JitEntry = unsafe extern "sysv64" fn(*const Vm, *mut ExecutionContext) -> JitResult;
 
 /// `JitResult trampoline(VM*, ExecutionContext* frame, JitEntry entry)`: how native code calls JIT code (see
 /// `libjs_jit::codegen::generate_entry_trampoline()`), which expects the VM in its pinned register.
+#[cfg(not(all(target_arch = "x86_64", windows)))]
 pub type EntryTrampoline = unsafe extern "C" fn(*const Vm, *mut ExecutionContext, JitEntry) -> JitResult;
+// NB: JIT code uses the System V calling convention on Windows too. Native code that calls it with that convention
+//     keeps the registers that are callee-saved only on Windows, and gets the result in two registers.
+#[cfg(all(target_arch = "x86_64", windows))]
+pub type EntryTrampoline = unsafe extern "sysv64" fn(*const Vm, *mut ExecutionContext, JitEntry) -> JitResult;
 
 /// Where an executable is in its JIT compilation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -453,6 +461,9 @@ pub struct ExecutableJitState {
     /// Whether the executable is refused once its discarded code is detached, because it was refused while frames
     /// still ran that code (see `refuse_jit_compile_once_detached()`).
     refused_once_detached: Cell<bool>,
+    /// Whether the discarded code is discarded because the executable idled (see `flush_idle_jit_code()`), which does
+    /// not count as a discard.
+    discarded_while_idle: Cell<bool>,
     /// The loads and stores of bindings of the environments of the executable's closure (see `jit::snapshot`). The
     /// bytecode never changes, so snapshots find them once.
     pub(crate) captured_binding_accesses: OnceCell<CapturedBindingAccesses>,
@@ -702,6 +713,19 @@ impl Executable {
         self.head.tier_up_budget.set(super::tier_up::recompile_budget(&vm.jit));
     }
 
+    /// Drops the JIT code of an executable that idled long enough (see `bytecode::flushing`), like discard_jit_code()
+    /// but without counting a discard: it says nothing about the code. The executable has to get hot again to be
+    /// compiled again.
+    pub fn flush_idle_jit_code(&self, vm: &Vm) {
+        self.jit_state().discarded_while_idle.set(true);
+        self.discard_jit_code(vm);
+        if self.jit_compile_state() == CompileState::Discarding {
+            self.head
+                .tier_up_budget
+                .set(super::tier_up::initial_tier_up_budget(&vm.jit));
+        }
+    }
+
     /// Drops the JIT code of an executable whose code was discarded if no live frame of the executable is run by JIT
     /// code. Returns whether it did.
     ///
@@ -744,6 +768,14 @@ impl Executable {
         let state = self.jit_state();
         let (table, slot) = self.jit_entry_table_slot(vm).expect("the code is attached");
         table.detach_code(slot);
+        if state.discarded_while_idle.replace(false) && !state.refused_once_detached.get() {
+            vm.jit.count_coverage("flush");
+            self.set_jit_compile_state(CompileState::None);
+            self.head
+                .tier_up_budget
+                .set(super::tier_up::initial_tier_up_budget(&vm.jit));
+            return;
+        }
         vm.jit.count_coverage("discard");
         let discard_count = state.discard_count.get() + 1;
         state.discard_count.set(discard_count);

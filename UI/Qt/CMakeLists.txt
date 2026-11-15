@@ -14,20 +14,30 @@ endif()
 
 add_library(ladybird_impl STATIC
     AllTabsPopover.cpp
+    Actions.cpp
     Application.cpp
+    ApplicationActions.cpp
     Autocomplete.cpp
     BookmarkDialog.cpp
+    BookmarkStore.cpp
     BookmarkPopover.cpp
+    Bookmarks.cpp
     BookmarksBar.cpp
+    BookmarksPage.cpp
+    DownloadPresentation.cpp
+    DownloadsPage.cpp
     BrowserWindow.cpp
     ChromeStyle.cpp
-    CrashReportNotifier.cpp
+    ContextMenus.cpp
     CrashReportReviewWidget.cpp
     DevToolsBanner.cpp
     EventLoopImplementationQt.cpp
     EventLoopImplementationQtEventTarget.cpp
+    FeedbackPopover.cpp
     FindInPageWidget.cpp
     HiddenPageSizing.cpp
+    HistoryPage.cpp
+    HubConnection.cpp
     Icon.cpp
     InputMethodUtils.cpp
     JavaScriptDialog.cpp
@@ -42,21 +52,30 @@ add_library(ladybird_impl STATIC
     PlainText.cpp
     Popover.cpp
     ProcessManagerWindow.cpp
+    RemoteDownloads.cpp
+    RemoteView.cpp
     ReportReview.cpp
     RestoreSessionCard.cpp
+    SandboxOffBar.cpp
     ScreenshotSelectionOverlay.cpp
     ScreenshotViewer.cpp
+    SessionHistorySnapshotStorage.cpp
+    SessionStore.cpp
     SelectDropdown.cpp
     SiteSettingsPopover.cpp
     StringUtils.cpp
+    SuggestionProvider.cpp
     SystemAppearance.cpp
     Tab.cpp
     TabBar.cpp
     Theme.cpp
+    VersionPage.cpp
     WebCompatReportReview.cpp
     WebContentView.cpp
+    WebUIPage.cpp
     WindowCloseCoordinator.cpp
     WindowControlButton.cpp
+    WindowControlsReveal.cpp
     WindowScreenObserver.cpp
     WindowToolbar.cpp
 )
@@ -67,6 +86,7 @@ if (NOT APPLE AND NOT WIN32 AND NOT ANDROID)
 endif()
 
 target_link_libraries(ladybird_impl PUBLIC Qt::Core Qt::Gui Qt::Widgets)
+target_link_libraries(ladybird_impl PRIVATE LibDatabase LibFileSystem LibUnicode)
 
 if (TARGET Qt6::Positioning)
     target_sources(ladybird_impl PRIVATE GeolocationProviderQt.cpp GeolocationProviderQt.h)
@@ -125,11 +145,14 @@ if (APPLE)
         Conversions.mm
         DictionaryLookup.mm
         ExternalURLHandler.mm
+        LaunchURLsMacOS.cpp
         LadybirdAccessibilityElement.mm
         MacWindow.mm
         MacWindowFocus.mm
+        MicrophoneAuthorizerMacOS.mm
         NativeTextEditingBindings.mm
         Menu.mm
+        PlatformColorsMac.mm
         ScrollbarPreferencesMac.mm
         SpellCheckerMac.mm
         SystemAppearanceMac.mm
@@ -137,9 +160,11 @@ if (APPLE)
         WebContentViewAccessibility.mm
         WebContentViewMac.mm
     )
-    target_link_libraries(ladybird_impl PRIVATE Qt::GuiPrivate "-framework ApplicationServices" "-framework Cocoa" "-framework IOSurface" "-framework QuartzCore")
+    target_link_libraries(ladybird_impl PRIVATE Qt::GuiPrivate "-framework ApplicationServices" "-framework AVFoundation" "-framework Carbon" "-framework Cocoa" "-framework CoreServices" "-framework IOSurface" "-framework QuartzCore")
     set_source_files_properties(
         LadybirdAccessibilityElement.mm
+        MicrophoneAuthorizerMacOS.mm
+        PlatformColorsMac.mm
         SpellCheckerMac.mm
         TranslateIconMac.mm
         TranslatorMac.mm

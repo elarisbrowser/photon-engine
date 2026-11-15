@@ -75,6 +75,8 @@ pub trait PortableMacroAssembler: Sized {
     /// What the register allocator may use.
     const ALLOCATABLE_GPRS: GprSet;
     const ALLOCATABLE_FPRS: FprSet;
+    /// The register shifts by a register amount take the amount in, on targets that shift by one register only.
+    const SHIFT_AMOUNT_GPR: Option<Gpr>;
     const STACK_POINTER: Gpr;
     const FRAME_POINTER: Gpr;
 
@@ -283,4 +285,9 @@ pub trait PortableMacroAssembler: Sized {
     fn emit_prologue(&mut self, frame: &MachineFrame);
     /// Tears down `frame` and restores saved registers. Does not return.
     fn emit_epilogue(&mut self, frame: &MachineFrame);
+    /// Moves the stack pointer down by `bytes`, for code that writes to the new stack from its lowest address up. On
+    /// Windows, which commits a thread's stack as code touches its guard pages, this touches the pages on the way.
+    fn allocate_stack(&mut self, bytes: i64) {
+        self.sub64_imm(Self::STACK_POINTER, Self::STACK_POINTER, bytes);
+    }
 }

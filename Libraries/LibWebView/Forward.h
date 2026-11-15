@@ -13,7 +13,6 @@
 
 namespace WebView {
 
-class Action;
 class Application;
 class ApplyHistoryStep;
 class AudioServerControlClient;
@@ -21,7 +20,6 @@ class Autocomplete;
 class AutocompleteService;
 class BlobURLStore;
 class BrowsingSession;
-class BookmarkStore;
 class CanonicalBrowsingContext;
 class CanonicalBrowsingContextGroup;
 class CanonicalDocument;
@@ -44,7 +42,8 @@ class FontService;
 class FontServiceHost;
 class HistoryStore;
 class HSTSStore;
-class Menu;
+class ImageDecoderControlClient;
+class ImageDecoderManager;
 class MicrophoneAuthorizer;
 class NavigationLoader;
 class OutOfProcessWebView;
@@ -59,12 +58,12 @@ class RequestServerInstance;
 class RequestServerManager;
 class RequestServerSiteBindings;
 class PermissionManager;
-class SessionStore;
 class Settings;
 class SettingsUI;
 class SpellChecker;
 class Translator;
 class StorageJar;
+class SystemProbeClient;
 class TraversableSessionHistory;
 class VideoDecoderServerControlClient;
 class ViewImplementation;
@@ -75,7 +74,6 @@ class WebWorkerClient;
 class WebUI;
 
 struct DownloadRecord;
-struct BookmarkItem;
 struct BrowserOptions;
 struct ChangingNavigable;
 struct CookieStorageKey;
@@ -84,8 +82,6 @@ struct HistoryOperation;
 struct SearchEngine;
 struct WebContentOptions;
 class WebContentPage;
-
-enum class SessionLaunchPolicy : u8;
 
 }
 

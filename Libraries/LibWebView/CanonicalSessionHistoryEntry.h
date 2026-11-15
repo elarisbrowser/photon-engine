@@ -47,7 +47,7 @@ public:
     ~CanonicalDocumentState();
 
     Web::HTML::SessionHistoryDocumentStateDescriptor descriptor() const;
-    void save_the_origin_of_the_populated_document();
+    void save_the_state_of_the_populated_document();
 
     // NB: The identity the processes hosting the document state's documents give it.
     Web::HTML::CrossProcessId id;
@@ -67,6 +67,7 @@ public:
     Optional<URL::Origin> origin;
     Optional<URL::URL> about_base_url;
     Web::HTML::DocumentResource resource;
+    HTTP::Cookie::SameSiteStatus navigation_same_site_status { HTTP::Cookie::SameSiteStatus::CrossSite };
     bool reload_pending { false };
     bool reload_bypasses_cache { false };
     bool ever_populated { false };

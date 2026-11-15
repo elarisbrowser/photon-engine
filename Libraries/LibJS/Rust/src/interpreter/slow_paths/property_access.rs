@@ -13,14 +13,15 @@ use ak::Utf16FlyString;
 use libjs_abi::PutKind;
 use libjs_abi::value as nan_box;
 
-use crate::bytecode::encoding::{IdentifierTableIndex, OptionalIndex};
+use super::strict_at;
 use crate::bytecode::executable::{
     Executable, KeyedPropertyLookup, KeyedPropertyLookupCache, ObjectPropertyIteratorCache,
     ObjectPropertyIteratorCacheData, ObjectPropertyIteratorFastPath, PropertyLookupCache, PropertyLookupCacheEntryType,
 };
 use crate::bytecode::op;
+use crate::bytecode::operand::UNCACHED_SITE;
 use crate::bytecode::property_access::{
-    self, GetByIdMode, Strict, base_object_for_get, get_by_value_with_keyed_cache, get_cached_property_value,
+    self, GetByIdMode, base_object_for_get, get_by_value_with_keyed_cache, get_cached_property_value,
     get_with_property_lookup_cache, object_can_cache_property_additions, property_addition_is_cacheable,
     put_by_property_key, throw_if_nullish_put_base,
 };
@@ -48,11 +49,7 @@ use crate::runtime::reference::Reference;
 use crate::runtime::shape::ShapeKey;
 use crate::runtime::typed_array::{Kind, is_valid_integer_index, typed_array_of_object};
 
-fn strict_of(header_strict: bool) -> Strict {
-    if header_strict { Strict::Yes } else { Strict::No }
-}
-
-pub(crate) fn put_kind_from_operand(kind: u32) -> PutKind {
+pub(crate) fn put_kind_from_operand(kind: u8) -> PutKind {
     match kind {
         0 => PutKind::Normal,
         1 => PutKind::Getter,
@@ -67,12 +64,10 @@ fn is_non_negative_int32(value: Value) -> bool {
     value.is_int32() && value.as_i32() >= 0
 }
 
-fn optional_identifier(vm: &Vm, index: &OptionalIndex<IdentifierTableIndex>) -> Option<Utf16FlyString> {
-    let Some(index) = index.get() else {
-        let program_counter = vm.running_execution_context_ref().program_counter.get();
-        return vm.current_executable().base_text_at(program_counter);
-    };
-    Some(vm.current_executable().get_identifier(index).clone())
+/// The source text of the base of the member access that is running, for the error of a null or undefined base.
+fn base_text(vm: &Vm) -> Option<Utf16FlyString> {
+    let program_counter = vm.running_execution_context_ref().program_counter.get();
+    vm.current_executable().base_text_at(program_counter)
 }
 
 fn running_private_environment(vm: &Vm) -> Gc<PrivateEnvironment> {
@@ -136,14 +131,14 @@ pub fn get_by_id(vm: &Vm, pc: u32, instruction: &op::GetById, values: &mut op::G
     let base_value = values.base;
     let executable = vm.current_executable();
     let cache = executable.property_lookup_cache(instruction.cache as usize);
-    let property_key = executable.get_property_key(instruction.property);
+    let property_key = executable.get_property_key(&instruction.property);
     let value = asm_try!(
         vm,
         pc,
         property_access::get_by_id(
             vm,
             GetByIdMode::Normal,
-            || optional_identifier(vm, &instruction.base_identifier),
+            || base_text(vm),
             property_key,
             base_value,
             base_value,
@@ -199,7 +194,7 @@ pub fn get_by_id_with_this(
     let this_value = values.this_value;
     let executable = vm.current_executable();
     let cache = executable.property_lookup_cache(instruction.cache as usize);
-    let property_key = executable.get_property_key(instruction.property);
+    let property_key = executable.get_property_key(&instruction.property);
     let value = asm_try!(
         vm,
         pc,
@@ -221,7 +216,7 @@ pub fn put_by_id(vm: &Vm, pc: u32, instruction: &op::PutById, values: &mut op::P
     let value = values.src;
     let base = values.base;
     let executable = vm.current_executable();
-    let property_key = executable.get_property_key(instruction.property);
+    let property_key = executable.get_property_key(&instruction.property);
     let cache = executable.property_lookup_cache(instruction.cache as usize);
     asm_try!(
         vm,
@@ -231,10 +226,10 @@ pub fn put_by_id(vm: &Vm, pc: u32, instruction: &op::PutById, values: &mut op::P
             base,
             base,
             value,
-            || optional_identifier(vm, &instruction.base_identifier),
+            || base_text(vm),
             property_key,
             put_kind_from_operand(instruction.kind),
-            strict_of(instruction.header.strict),
+            strict_at(vm, pc),
             Some(cache),
             0,
         )
@@ -251,7 +246,7 @@ pub fn put_by_id_with_this(
     let value = values.src;
     let base = values.base;
     let executable = vm.current_executable();
-    let name = executable.get_property_key(instruction.property);
+    let name = executable.get_property_key(&instruction.property);
     let cache = executable.property_lookup_cache(instruction.cache as usize);
     asm_try!(
         vm,
@@ -264,7 +259,7 @@ pub fn put_by_id_with_this(
             || None,
             name,
             put_kind_from_operand(instruction.kind),
-            strict_of(instruction.header.strict),
+            strict_at(vm, pc),
             Some(cache),
             0,
         )
@@ -341,12 +336,7 @@ pub fn get_by_value(
     let object = asm_try!(
         vm,
         pc,
-        base_object_for_get(
-            vm,
-            base_value,
-            || optional_identifier(vm, &instruction.base_identifier),
-            &property_key_value,
-        )
+        base_object_for_get(vm, base_value, || base_text(vm), &property_key_value)
     );
     let property_key = asm_try!(vm, pc, property_key_value.to_property_key(vm));
     if base_value.is_string() {
@@ -391,7 +381,7 @@ pub fn get_by_value_with_this(vm: &Vm, pc: u32, values: &mut op::GetByValueWithT
 }
 
 fn length_property_key(executable: &Executable) -> &PropertyKey {
-    executable.get_property_key(
+    executable.property_key(
         executable
             .length_identifier()
             .expect("an executable that reads a length has the length in its property key table"),
@@ -408,7 +398,7 @@ pub fn get_length(vm: &Vm, pc: u32, instruction: &op::GetLength, values: &mut op
         property_access::get_by_id(
             vm,
             GetByIdMode::Length,
-            || optional_identifier(vm, &instruction.base_identifier),
+            || base_text(vm),
             length_property_key(&executable),
             base_value,
             base_value,
@@ -448,7 +438,7 @@ pub fn get_length_with_this(
 
 pub fn get_method(vm: &Vm, pc: u32, instruction: &op::GetMethod, values: &mut op::GetMethodValues) -> SlowPathControl {
     let executable = vm.current_executable();
-    let property_key = executable.get_property_key(instruction.property);
+    let property_key = executable.get_property_key(&instruction.property);
     let cache = executable.property_lookup_cache(instruction.cache as usize);
     let method = asm_try!(vm, pc, values.object.get_method_with_cache(vm, property_key, cache));
     values.dst = method.map_or(Value::UNDEFINED, Value::from_object);
@@ -469,13 +459,7 @@ pub fn put_by_value(
     asm_try!(
         vm,
         pc,
-        throw_if_nullish_put_base(
-            vm,
-            base,
-            || optional_identifier(vm, &instruction.base_identifier),
-            &property,
-            strict_of(instruction.header.strict),
-        )
+        throw_if_nullish_put_base(vm, base, || base_text(vm), &property, strict_at(vm, pc))
     );
     let property_key = asm_try!(vm, pc, property.to_property_key(vm));
     let cache_key = match site_cache {
@@ -493,10 +477,10 @@ pub fn put_by_value(
                 base,
                 base,
                 value,
-                || optional_identifier(vm, &instruction.base_identifier),
+                || base_text(vm),
                 &property_key,
                 put_kind_from_operand(instruction.kind),
-                strict_of(instruction.header.strict),
+                strict_at(vm, pc),
                 Some(cache),
                 cache_key,
             )
@@ -511,7 +495,7 @@ pub fn put_by_value(
         asm_try!(
             vm,
             pc,
-            put_by_value_with_keyed_store_cache(vm, instruction, base, property, value, &property_key)
+            put_by_value_with_keyed_store_cache(vm, pc, base, property, value, &property_key)
         );
         return SlowPathControl::continue_at(pc + op::PutByValue::LENGTH);
     }
@@ -523,10 +507,10 @@ pub fn put_by_value(
             base,
             base,
             value,
-            || optional_identifier(vm, &instruction.base_identifier),
+            || base_text(vm),
             &property_key,
             put_kind_from_operand(instruction.kind),
-            strict_of(instruction.header.strict),
+            strict_at(vm, pc),
             None,
             0,
         )
@@ -541,7 +525,7 @@ pub fn put_by_value(
 /// to make generically otherwise, so that other puts it cannot make only pay for the lookup.
 fn put_by_value_with_keyed_store_cache(
     vm: &Vm,
-    instruction: &op::PutByValue,
+    pc: u32,
     base: Value,
     key: Value,
     value: Value,
@@ -558,10 +542,10 @@ fn put_by_value_with_keyed_store_cache(
             base,
             base,
             value,
-            || optional_identifier(vm, &instruction.base_identifier),
+            || base_text(vm),
             property_key,
             PutKind::Normal,
-            strict_of(instruction.header.strict),
+            strict_at(vm, pc),
             cache,
             cache_key,
         )
@@ -633,13 +617,7 @@ pub fn put_by_value_with_this(
     asm_try!(
         vm,
         pc,
-        throw_if_nullish_put_base(
-            vm,
-            base,
-            || None,
-            &values.property,
-            strict_of(instruction.header.strict)
-        )
+        throw_if_nullish_put_base(vm, base, || None, &values.property, strict_at(vm, pc))
     );
     let property_key = asm_try!(vm, pc, values.property.to_property_key(vm));
     asm_try!(
@@ -653,7 +631,7 @@ pub fn put_by_value_with_this(
             || None,
             &property_key,
             put_kind_from_operand(instruction.kind),
-            strict_of(instruction.header.strict),
+            strict_at(vm, pc),
             None,
             0,
         )
@@ -682,11 +660,11 @@ pub fn delete_by_id(
     instruction: &op::DeleteById,
     values: &mut op::DeleteByIdValues,
 ) -> SlowPathControl {
-    let property_key = vm.current_executable().get_property_key(instruction.property).clone();
+    let property_key = vm.current_executable().get_property_key(&instruction.property).clone();
     let result = asm_try!(
         vm,
         pc,
-        Reference::with_base_value(values.base, property_key, None, strict_of(instruction.header.strict)).delete_(vm)
+        Reference::with_base_value(values.base, property_key, None, strict_at(vm, pc)).delete_(vm)
     );
     values.dst = Value::from_bool(result);
     SlowPathControl::continue_at(pc + op::DeleteById::LENGTH)
@@ -695,7 +673,7 @@ pub fn delete_by_id(
 pub fn delete_by_value(
     vm: &Vm,
     pc: u32,
-    instruction: &op::DeleteByValue,
+    _instruction: &op::DeleteByValue,
     values: &mut op::DeleteByValueValues,
 ) -> SlowPathControl {
     // NB: delete converts the base to an object before it converts the key to a property key.
@@ -706,7 +684,7 @@ pub fn delete_by_value(
     let result = asm_try!(
         vm,
         pc,
-        Reference::with_base_value(values.base, property_key, None, strict_of(instruction.header.strict)).delete_(vm)
+        Reference::with_base_value(values.base, property_key, None, strict_at(vm, pc)).delete_(vm)
     );
     values.dst = Value::from_bool(result);
     SlowPathControl::continue_at(pc + op::DeleteByValue::LENGTH)
@@ -719,6 +697,9 @@ pub fn copy_object_excluding_properties(
     values: &mut op::CopyObjectExcludingPropertiesValues,
     excluded_names: &[Value],
 ) -> SlowPathControl {
+    let excluded_names = super::operand_list(vm, instruction.excluded_names_are_in_array, excluded_names);
+    let excluded_names = excluded_names.values();
+    let excluded_names = &*excluded_names;
     let realm = vm.current_realm().expect("there is a current realm");
     let from_object = values.from_object;
     let to_object = Object::create(vm, realm, Some(realm.object_prototype()));
@@ -752,9 +733,9 @@ pub fn create_data_property_or_throw(
 pub fn new_object(vm: &Vm, pc: u32, instruction: &op::NewObject, values: &mut op::NewObjectValues) -> SlowPathControl {
     let realm = vm.current_realm().expect("there is a current realm");
 
-    if instruction.cache != u32::MAX {
+    if u32::from(instruction.cache) != UNCACHED_SITE {
         let executable = vm.current_executable();
-        let cache = executable.object_shape_cache(instruction.cache);
+        let cache = executable.object_shape_cache(instruction.cache.into());
         if let Some(cached_shape) = cache.shape.get() {
             values.dst = Value::from_object(Object::create_with_premade_shape(vm, cached_shape));
             return SlowPathControl::continue_at(pc + op::NewObject::LENGTH);
@@ -781,8 +762,11 @@ pub fn cache_object_shape(
     instruction: &op::CacheObjectShape,
     values: &mut op::CacheObjectShapeValues,
 ) -> SlowPathControl {
+    if u32::from(instruction.cache) == UNCACHED_SITE {
+        return SlowPathControl::continue_at(pc + op::CacheObjectShape::LENGTH);
+    }
     let executable = vm.current_executable();
-    let cache = executable.object_shape_cache(instruction.cache);
+    let cache = executable.object_shape_cache(instruction.cache.into());
     if cache.shape.get().is_none() {
         let object = values.object.as_object();
         if !object.shape().is_dictionary() {
@@ -801,7 +785,7 @@ pub fn init_object_literal_property(
     let object = values.object.as_object();
     let value = values.src;
     let executable = vm.current_executable();
-    let cache = executable.object_shape_cache(instruction.shape_cache_index);
+    let cache = executable.object_shape_cache(instruction.shape_cache_index.into());
     let property_slot = instruction.property_slot as usize;
 
     let cached_shape = cache.shape.get();
@@ -814,7 +798,7 @@ pub fn init_object_literal_property(
         return SlowPathControl::continue_at(pc + op::InitObjectLiteralProperty::LENGTH);
     }
 
-    let property_key = executable.get_property_key(instruction.property);
+    let property_key = executable.get_property_key(&instruction.property);
     object.define_direct_property(
         vm,
         property_key,
@@ -848,13 +832,13 @@ pub fn has_private_id(
 
     let private_environment = running_private_environment(vm);
     let private_name =
-        private_environment.resolve_private_identifier(vm.current_executable().get_identifier(instruction.property));
+        private_environment.resolve_private_identifier(vm.current_executable().get_identifier(&instruction.property));
     values.dst = Value::from_bool(base.as_object().private_element_find(&private_name).is_some());
     SlowPathControl::continue_at(pc + op::HasPrivateId::LENGTH)
 }
 
 pub fn add_private_name(vm: &Vm, pc: u32, instruction: &op::AddPrivateName) -> SlowPathControl {
-    let name = vm.current_executable().get_identifier(instruction.name).clone();
+    let name = vm.current_executable().get_identifier(&instruction.name).clone();
     running_private_environment(vm).add_private_name(vm, name);
     SlowPathControl::continue_at(pc + op::AddPrivateName::LENGTH)
 }
@@ -870,7 +854,7 @@ pub fn get_private_by_id(
 
     if !base_value.is_object() {
         asm_try!(vm, pc, base_value.to_object(vm));
-        let private_name = make_private_reference(vm, vm.current_executable().get_identifier(instruction.property));
+        let private_name = make_private_reference(vm, vm.current_executable().get_identifier(&instruction.property));
         let result = asm_try!(vm, pc, get_private_reference_value(vm, base_value, &private_name));
         values.dst = result;
         return SlowPathControl::continue_at(pc + op::GetPrivateById::LENGTH);
@@ -878,7 +862,7 @@ pub fn get_private_by_id(
 
     let private_environment = running_private_environment(vm);
     let private_name =
-        private_environment.resolve_private_identifier(vm.current_executable().get_identifier(instruction.property));
+        private_environment.resolve_private_identifier(vm.current_executable().get_identifier(&instruction.property));
     let result = asm_try!(vm, pc, base_value.as_object().private_get(vm, &private_name));
     values.dst = result;
     SlowPathControl::continue_at(pc + op::GetPrivateById::LENGTH)
@@ -896,7 +880,7 @@ pub fn put_private_by_id(
 
     if !base_value.is_object() {
         let object = asm_try!(vm, pc, base_value.to_object(vm));
-        let private_name = make_private_reference(vm, vm.current_executable().get_identifier(instruction.property));
+        let private_name = make_private_reference(vm, vm.current_executable().get_identifier(&instruction.property));
         asm_try!(
             vm,
             pc,
@@ -907,7 +891,7 @@ pub fn put_private_by_id(
 
     let private_environment = running_private_environment(vm);
     let private_name =
-        private_environment.resolve_private_identifier(vm.current_executable().get_identifier(instruction.property));
+        private_environment.resolve_private_identifier(vm.current_executable().get_identifier(&instruction.property));
     asm_try!(vm, pc, base_value.as_object().private_set(vm, &private_name, value));
     SlowPathControl::continue_at(pc + op::PutPrivateById::LENGTH)
 }
@@ -1459,7 +1443,7 @@ pub fn try_inline_get_by_id_accessor(vm: &Vm, pc: u32, instruction: &op::GetById
         getter_function.inline_call_executable(),
         &[],
         pc + instruction.length(),
-        instruction.dst.0,
+        instruction.dst.0.into(),
         Value::from_object(object),
         None,
         false,
@@ -1475,7 +1459,7 @@ pub fn try_put_by_id_cache(vm: &Vm, instruction: &op::PutById, values: &op::PutB
     }
     let executable = vm.current_executable();
     let cache = executable.property_lookup_cache(instruction.cache as usize);
-    let property_key = executable.get_property_key(instruction.property);
+    let property_key = executable.get_property_key(&instruction.property);
     try_put_by_property_lookup_cache(vm, base.as_object(), values.src, cache, 0, Some(property_key))
 }
 
@@ -1493,7 +1477,7 @@ pub fn try_get_by_id_cache_on_primitive(vm: &Vm, instruction: &op::GetById, valu
         return false;
     }
     let executable = vm.current_executable();
-    let property_key = executable.get_property_key(instruction.property);
+    let property_key = executable.get_property_key(&instruction.property);
     // NB: Strings have own properties for their indices and their length.
     if base.is_string()
         && (property_key.is_number()

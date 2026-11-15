@@ -7,8 +7,8 @@
 #include <AK/HashTable.h>
 #include <AK/QuickSort.h>
 #include <AK/SetUnion.h>
-#include <LibGC/ConservativeVector.h>
 #include <LibGC/RootHashTable.h>
+#include <LibGC/RootVector.h>
 #include <LibWeb/Animations/KeyframeEffect.h>
 #include <LibWeb/CSS/CSSAnimation.h>
 #include <LibWeb/CSS/CSSStyleRule.h>
@@ -40,7 +40,9 @@
 #include <LibWeb/HTML/HTMLImageElement.h>
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLLinkElement.h>
+#include <LibWeb/HTML/HTMLMeterElement.h>
 #include <LibWeb/HTML/HTMLObjectElement.h>
+#include <LibWeb/HTML/HTMLProgressElement.h>
 #include <LibWeb/HTML/HTMLSelectElement.h>
 #include <LibWeb/HTML/HTMLSlotElement.h>
 #include <LibWeb/HTML/HTMLTableCellElement.h>
@@ -820,6 +822,8 @@ private:
     struct AncestorRow {
         GC::Ptr<DOM::Element const> element;
         Inherited inherited;
+
+        void visit_edges(GC::Cell::Visitor& visitor) { visitor.visit(element); }
     };
 
     StyleEngine& m_style_engine;
@@ -829,7 +833,7 @@ private:
     StyleAtomID m_rtl_atom;
     TableByName<ElementKind, 64> m_kinds;
     TableByName<PublishedAttributeName, 32> m_attribute_names;
-    GC::ConservativeVector<AncestorRow, 32> m_elements_to_parent;
+    GC::RootVector<AncestorRow, 32> m_elements_to_parent;
     GC::RootVector<GC::Ref<DOM::Element>> m_elements_asked_their_language;
     Vector<StyleEngineFFI::FfiElementArrivalRow> m_rows;
     Vector<u32, 512> m_atoms;
@@ -847,6 +851,8 @@ static void learn_what_the_engine_reads(StyleEngine& style_engine, Layout::Begun
 struct PendingArrivalRoot {
     GC::Ref<DOM::Node> node;
     bool children_wait { false };
+
+    void visit_edges(GC::Cell::Visitor& visitor) { visitor.visit(node); }
 };
 
 // Every node in the subtrees waiting to arrive, in tree order, takes its identity, and every element records its
@@ -862,8 +868,10 @@ static void record_subtree_arrivals(DOM::Document& document, ReadonlySpan<Pendin
     struct Arrival {
         GC::Ref<DOM::Node> node;
         TreeScopeID tree_scope;
+
+        void visit_edges(GC::Cell::Visitor& visitor) { visitor.visit(node); }
     };
-    GC::ConservativeVector<Arrival, 64> arrivals;
+    GC::RootVector<Arrival, 64> arrivals;
     GC::RootVector<GC::Ref<DOM::Text>, 64> text_arrivals;
     // Elements and text nodes in tree order, which is the order their places in the DOM child sequence can be taken
     // in: each node's previous sibling has taken its place first.
@@ -948,6 +956,8 @@ static void record_subtree_arrivals(DOM::Document& document, ReadonlySpan<Pendin
                 element->set_style_node_id(identity);
                 style_computer.register_style_node(identity, *element);
                 Layout::publish_table_spans(*element);
+                if (auto* frameset = as_if<HTML::HTMLFrameSetElement>(*element))
+                    frameset->publish_layout_data();
                 if (element->is_size_query_container() || element->style_depends_on_size_container_query())
                     element->publish_size_container_query_facts();
             } else {
@@ -978,7 +988,7 @@ static void record_subtree_arrivals(DOM::Document& document, ReadonlySpan<Pendin
                 .relations = relations_of(*element, style_engine, arrival.tree_scope),
             };
             if (publication && element->is_connected()) {
-                style_engine.note_element_awaiting_first_style_computation(*element);
+                style_engine.note_element_awaiting_preparation_for_style_computation(*element);
                 publish_element_arrival(style_engine, *element, *publication, arriving);
             } else {
                 arriving_elements.append(arriving);
@@ -1154,7 +1164,7 @@ static bool collect_pending_style_arrival_roots(DOM::Node& node, Vector<PendingA
 // OPTIMIZATION: The subtrees waiting to arrive, found among the nodes marked since the last take-in rather than along the
 //               marks, which reach every child of each node on the path to one. Answers false, having found nothing,
 //               where the marks have to be walked: a node is in a shadow tree, whose tree order the walk follows.
-static bool take_listed_arrival_roots(DOM::Document& document, GC::RootVector<GC::Ref<DOM::Node>> const& listed, GC::ConservativeVector<PendingArrivalRoot, 16>& roots, HiddenChildArrivalDecision& decision)
+static bool take_listed_arrival_roots(DOM::Document& document, GC::RootVector<GC::Ref<DOM::Node>> const& listed, GC::RootVector<PendingArrivalRoot, 16>& roots, HiddenChildArrivalDecision& decision)
 {
     GC::RootVector<GC::Ref<DOM::Node>> found;
     GC::RootHashTable<GC::Ref<DOM::Node>> seen;
@@ -1219,7 +1229,7 @@ static void take_in_pending_style_arrivals(DOM::Document& document, HiddenChildA
     // NB: Publication can bring another document up to date, as an SVG image's for its natural size, whose own take-in
     //     this says nothing about.
     auto taking_in = style_engine.begin_taking_in_pending_arrivals();
-    GC::ConservativeVector<PendingArrivalRoot, 16> roots;
+    GC::RootVector<PendingArrivalRoot, 16> roots;
     {
         HiddenChildArrivalDecision decision { document, hidden_child_arrivals };
         auto listed = style_engine.take_listed_arrivals();
@@ -1508,6 +1518,7 @@ enum ElementConstructionFact : u32 {
     IsSvgResourceElement = 1 << 7,
     IsSvgGeometryElement = 1 << 8,
     IsHtmlSelectElement = 1 << 9,
+    IsHtmlProgressOrMeterElement = 1 << 10,
     // The layout algorithm a MathML element's tag name selects, as a MathMLLayoutKind in these bits.
     MathMLLayoutKindShift = 16,
     MathMLLayoutKindMask = 0x1f << MathMLLayoutKindShift,
@@ -1735,6 +1746,7 @@ static u32 kind_construction_facts(DOM::Element const& element)
     set(!is_input && html_element && html_element->uses_button_layout(), ElementConstructionFact::UsesButtonLayout);
     set(element.is_svg_geometry_element(), ElementConstructionFact::IsSvgGeometryElement);
     set(is<HTML::HTMLSelectElement>(element), ElementConstructionFact::IsHtmlSelectElement);
+    set(is<HTML::HTMLProgressElement>(element) || is<HTML::HTMLMeterElement>(element), ElementConstructionFact::IsHtmlProgressOrMeterElement);
     facts |= to_underlying(mathml_layout_kind(element)) << ElementConstructionFact::MathMLLayoutKindShift;
     return facts;
 }
@@ -2397,6 +2409,13 @@ void record_element_animation_effect_descriptions(DOM::Element& element, u8 slot
     if (StyleEngineFFI::style_engine_describes_animation_effects(style_engine->host(), element.style_node_id().value(), slot, versions.span()))
         return;
 
+    with_animation_effect_descriptions(effects, [&](auto const& descriptions) {
+        StyleEngineFFI::style_engine_set_element_animation_effect_descriptions(style_engine->host(), element.style_node_id().value(), slot, &descriptions);
+    });
+}
+
+void with_animation_effect_descriptions(ReadonlySpan<GC::Ref<Animations::KeyframeEffect>> effects, Function<void(StyleEngineFFI::FfiAnimationEffectDescriptions const&)> const& callback)
+{
     Vector<StyleEngineFFI::FfiPublishedAnimationEffect> ffi_effects;
     Vector<StyleEngineFFI::FfiPublishedAnimationKeyframe> ffi_keyframes;
     Vector<StyleEngineFFI::FfiPublishedAnimationDeclaration> ffi_declarations;
@@ -2479,14 +2498,20 @@ void record_element_animation_effect_descriptions(DOM::Element& element, u8 slot
         ffi_effects.unchecked_append(row);
     }
 
-    StyleEngineFFI::style_engine_set_element_animation_effect_descriptions(style_engine->host(),
-        element.style_node_id().value(), slot,
-        ffi_effects.data(), ffi_effects.size(),
-        ffi_keyframes.data(), ffi_keyframes.size(),
-        ffi_declarations.data(), ffi_declarations.size(),
-        ffi_custom_declarations.data(), ffi_custom_declarations.size(),
-        ffi_points.data(), ffi_points.size(),
-        base_url_bytes.data(), base_url_bytes.size());
+    callback({
+        .effects = ffi_effects.data(),
+        .effect_count = ffi_effects.size(),
+        .keyframes = ffi_keyframes.data(),
+        .keyframe_count = ffi_keyframes.size(),
+        .declarations = ffi_declarations.data(),
+        .declaration_count = ffi_declarations.size(),
+        .custom_declarations = ffi_custom_declarations.data(),
+        .custom_declaration_count = ffi_custom_declarations.size(),
+        .linear_points = ffi_points.data(),
+        .linear_point_count = ffi_points.size(),
+        .base_url_bytes = base_url_bytes.data(),
+        .base_url_byte_count = base_url_bytes.size(),
+    });
 }
 
 // An element's heading level, which `:heading()` tests. It follows from what the element is plus
@@ -2679,8 +2704,6 @@ bool record_element_presentational_hint_properties(DOM::Element& element, Readon
 
 void record_element_declarations_changed(DOM::Element& element, ElementDeclarationKind kind, bool had_declarations, bool has_declarations)
 {
-    if (element.style_node_id() != no_style_node)
-        StyleEngineFFI::style_engine_note_element_declarations_changed(element.document().style_computer().style_engine().host(), element.style_node_id().value());
     element.document().flush_deferred_style_change_event();
     auto* style_engine = style_engine_for_published(element);
     if (!style_engine)
@@ -2693,7 +2716,6 @@ void record_element_declarations_changed(DOM::Element& element, ElementDeclarati
     // applies the delta.
     style_engine->record_element_declaration_delta({
         .node = element.style_node_id().value(),
-        .kind = kind,
         .old_block = had_declarations ? 1u : 0u,
         .new_block = has_declarations ? 1u : 0u,
     });
@@ -3012,7 +3034,6 @@ static RefPtr<SharedCompiledStyleSheet> shared_compiled_style_sheet_for(StyleShe
     RuleCompilationContext context { style_engine, sheet_id, 0, document, style_computer };
     compile_rules_into(context, *contents);
     contents->evaluate_media_queries(document);
-    contents->load_pending_image_resources(document);
     auto shared_compiled_style_sheet = make_ref_counted<SharedCompiledStyleSheet>(move(key), move(contents), sheet_id);
     shared_compiled_style_sheets.set(shared_compiled_style_sheet->key(), shared_compiled_style_sheet);
     return shared_compiled_style_sheet;

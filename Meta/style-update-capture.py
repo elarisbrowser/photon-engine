@@ -66,7 +66,7 @@ PHASES = {
 }
 
 
-WATCHED_PROCESSES = ("js", "test-web", "test262-runner", "WebContent", "WebWorker", "Ladybird", "WebDriver")
+WATCHED_PROCESSES = ("js", "test-web", "test262-runner", "WebContent", "Ladybird", "WebDriver")
 PS_FORMAT = "pid=,pgid=,rss=,time=,lstart=,comm="
 PS_START_FIELDS = 5
 PS_UNAVAILABLE = False
@@ -294,7 +294,7 @@ def normalize(sample):
 
 def fixture_run(browser, scenario, seed):
     browser.command("url", {"url": "about:blank"})
-    browser.script("internals.resetStyleFfiCounters(); internals.updateStyle();")
+    browser.script("internals.updateStyle();")
     before = browser.resources()
     setup = browser.script(
         FIXTURE.read_text()

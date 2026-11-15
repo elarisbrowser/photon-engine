@@ -10,6 +10,7 @@
 #include <AK/Types.h>
 #include <QColor>
 #include <QString>
+#include <QStringList>
 
 class QAbstractButton;
 class QFont;
@@ -26,12 +27,14 @@ constexpr inline int LOCATION_EDIT_CORNER_RADIUS = 7;
 constexpr inline int LOADING_RING_PERIOD_MS = 900;
 // Before the site responds, the ring turns more slowly, at half opacity.
 constexpr inline int LOADING_RING_WAITING_PERIOD_MS = 1600;
+
 enum class LoadingRingSize : u8 {
     // 20 px, reaching 2 px past a tab's favicon slot.
     Favicon,
     // 23 px, filling a toolbar button.
     ToolbarButton,
 };
+
 enum class LoadingPhase : u8 {
     WaitingForResponse,
     Receiving,
@@ -45,9 +48,13 @@ constexpr qreal drop_shadow_blur_radius(qreal css_blur_radius)
 {
     return css_blur_radius * 2.5;
 }
+
 QColor mix(QColor const& from, QColor const& to, double amount);
 QColor chrome_text(QPalette const&);
 QColor chrome_button_text(QPalette const&);
+QColor chrome_destructive_hover();
+QColor chrome_destructive_text();
+
 enum class WindowActivity : u8 {
     Active,
     Inactive,
@@ -69,9 +76,14 @@ QColor chrome_separator(QPalette const&);
 QColor chrome_window_outline(QPalette const&);
 QColor chrome_accent();
 QColor chrome_muted_text(QPalette const&);
+// The amber dot that tells of waiting crash reports.
+QColor crash_reports_dot_color(QPalette const&);
 QFont chrome_title_font(QFont);
 
 QString style_sheet_color(QColor const&);
+
+// The colors of selected text in the fields the selectors match, for a field on a panel.
+QString panel_text_selection_style_sheet(QStringList const& selectors, QColor const& text);
 
 // The panel outline painted over the panel, for a panel that cannot be partly clear.
 QColor opaque_panel_edge();
@@ -80,7 +92,7 @@ QColor opaque_panel_edge();
 // antialiasing.
 bool shows_opaque_pixels_only(QWidget const&);
 
-QString application_style_sheet(QPalette const&);
+QString menu_zoom_row_style_sheet();
 QString toolbar_container_style_sheet(QPalette const&);
 QString menu_bar_style_sheet(QPalette const&);
 QString location_edit_style_sheet(QPalette const&);
@@ -98,6 +110,7 @@ QString autocomplete_popup_style_sheet(QPalette const&);
 QString downloads_popover_style_sheet(QPalette const&);
 QString message_popover_style_sheet(QPalette const&);
 QString site_settings_popover_style_sheet(QPalette const&);
+QString feedback_popover_style_sheet(QPalette const&);
 QString permission_prompt_style_sheet(QPalette const&);
 QString all_tabs_popover_style_sheet(QPalette const&);
 QString bookmark_popover_style_sheet(QPalette const&);
@@ -122,8 +135,13 @@ struct ControlFrameColors {
 // The corner radius of a button's frame on the chrome.
 constexpr inline qreal CONTROL_FRAME_RADIUS = 6;
 // The colors of a button's frame in the button's current state, or nothing while it shows no frame.
+// The Ladybird and all-tabs buttons sit in a group that moves between the tab strip and the sidebar or the toolbar.
+bool is_in_tab_strip_button_group(QWidget const&);
+
 Optional<ControlFrameColors> control_frame_colors(QAbstractButton const&, ControlFrameStyle = ControlFrameStyle::InteractionOnly);
 void paint_control_frame(QPainter&, QAbstractButton const&, ControlFrameStyle = ControlFrameStyle::InteractionOnly);
+// The frame of a badge over a collapsed sidebar's tab that is not a button, as a button's frame looks at rest.
+void paint_tab_badge_frame(QPainter&, QWidget const&);
 void paint_focus_ring(QPainter&, QRectF const&, qreal radius);
 
 void paint_loading_ring(QPainter&, QPalette const&, QPointF center, LoadingRingSize, LoadingPhase = LoadingPhase::Receiving);

@@ -31,13 +31,14 @@ pub use crate::layout::object::{INDEXED_ELEMENTS_HEADER_SIZE, IndexedStorageKind
 use crate::layout::value::Value;
 use crate::layout_forward::RawNativeFunctionPointer;
 use crate::runtime::abstract_operations::{
-    call, call_function_object, function_object_as_object, validate_and_apply_property_descriptor,
+    call, call_function_object, function_object_as_object, get_prototype_from_constructor,
+    validate_and_apply_property_descriptor,
 };
 use crate::runtime::accessor::Accessor;
 use crate::runtime::array::{ARRAY_OBJECT_METHODS, Array};
 use crate::runtime::class_field_definition::{ClassElementName, ClassFieldDefinition, ClassFieldInitializer};
 use crate::runtime::completion::{Must, ThrowCompletionOr};
-use crate::runtime::ecmascript_function_object::ECMASCRIPT_FUNCTION_OBJECT_METHODS;
+use crate::runtime::ecmascript_function_object::{ECMASCRIPT_FUNCTION_OBJECT_METHODS, as_ecmascript_function_object};
 use crate::runtime::error::{ErrorKind, error_data_of_error};
 use crate::runtime::error_data::ErrorData;
 use crate::runtime::error_types::ErrorType;
@@ -615,7 +616,7 @@ impl Object {
         )
     }
 
-    pub fn new_with_realm_and_prototype(
+    pub fn new_with_prototype(
         vm: &Vm,
         class: &'static Class,
         realm: Gc<Realm>,
@@ -625,20 +626,6 @@ impl Object {
         let mut shape = realm.empty_object_shape();
         if prototype.is_some() && shape.prototype() != prototype {
             shape = shape.create_prototype_transition(vm, prototype);
-        }
-        Self::new_with_shape(class, shape, may_interfere_with_indexed_property_access)
-    }
-
-    #[inline]
-    pub fn new_with_prototype(
-        vm: &Vm,
-        class: &'static Class,
-        prototype: Gc<Object>,
-        may_interfere_with_indexed_property_access: MayInterfereWithIndexedPropertyAccess,
-    ) -> Object {
-        let mut shape = prototype.shape().realm().empty_object_shape();
-        if shape.prototype() != Some(prototype) {
-            shape = shape.create_prototype_transition(vm, Some(prototype));
         }
         Self::new_with_shape(class, shape, may_interfere_with_indexed_property_access)
     }
@@ -661,7 +648,13 @@ impl Object {
             );
             return Self::allocate_plain_object(vm, object, 0);
         }
-        let object = Self::new_with_prototype(vm, Self::CLASS, prototype, MayInterfereWithIndexedPropertyAccess::No);
+        let object = Self::new_with_prototype(
+            vm,
+            Self::CLASS,
+            realm,
+            Some(prototype),
+            MayInterfereWithIndexedPropertyAccess::No,
+        );
         Self::allocate_plain_object(vm, object, 0)
     }
 
@@ -688,15 +681,50 @@ impl Object {
     /// SharedFunctionInstanceData::construct_reserve()).
     pub fn create_for_construct(
         vm: &Vm,
+        realm: Gc<Realm>,
         prototype: Gc<Object>,
         shared_data: Gc<SharedFunctionInstanceData>,
     ) -> Gc<Object> {
-        let mut shape = prototype.shape().realm().empty_object_shape();
+        let mut shape = realm.empty_object_shape();
         if shape.prototype() != Some(prototype) {
             shape = shape.create_prototype_transition(vm, Some(prototype));
         }
         let reserve = shared_data.construct_reserve(shape);
         Self::create_in_size_class(vm, shape, reserve)
+    }
+
+    /// OrdinaryCreateFromConstructor(constructor, "%Object.prototype%") for the `this` of a construction of the
+    /// function with `shared_data` and `constructor` as the new target, in the current realm (see
+    /// create_for_construct()).
+    pub fn create_from_constructor_for_construct(
+        vm: &Vm,
+        constructor: Gc<FunctionObject>,
+        shared_data: Gc<SharedFunctionInstanceData>,
+    ) -> ThrowCompletionOr<Gc<Object>> {
+        let realm = vm.current_realm().expect("a construction runs in a realm");
+        let constructor_object = function_object_as_object(constructor);
+        // OPTIMIZATION: The shape a construct with the constructor gave its object before, while the constructor's
+        //               "prototype" still holds its prototype. Reading the own data property has no side effects.
+        let cache = vm.construct_shape_cache();
+        if let Some(shape) = cache.get(constructor_object, realm) {
+            let reserve = shared_data.construct_reserve(shape);
+            return Ok(Self::create_in_size_class(vm, shape, reserve));
+        }
+        let prototype = get_prototype_from_constructor(
+            vm,
+            constructor,
+            crate::runtime::intrinsics::Intrinsics::object_prototype,
+        )?;
+        let object = Self::create_for_construct(vm, realm, prototype, shared_data);
+        if as_ecmascript_function_object(constructor).is_some()
+            && let Some(metadata) = constructor_object.shape().lookup(&vm.names.prototype)
+            && let value = constructor_object.get_direct(metadata.offset)
+            && value.is_object()
+            && value.as_object() == prototype
+        {
+            cache.set(constructor_object, metadata.offset, object.shape());
+        }
+        Ok(object)
     }
 
     /// Like create_with_premade_shape(), in the size class for at least `reserve` properties, for properties that will
@@ -1917,6 +1945,11 @@ impl Object {
 
     // The internal methods, which dispatch through the object's class.
 
+    /// Whether [[GetPrototypeOf]] of the object is OrdinaryGetPrototypeOf(), which reads the prototype of its shape.
+    pub fn has_ordinary_get_prototype_of(&self) -> bool {
+        self.methods().internal_get_prototype_of.is_none()
+    }
+
     pub fn internal_get_prototype_of(&self, vm: &Vm) -> ThrowCompletionOr<Option<Gc<Object>>> {
         match self.methods().internal_get_prototype_of {
             Some(internal_get_prototype_of) => internal_get_prototype_of(self, vm),
@@ -2082,6 +2115,12 @@ impl Object {
 
     pub fn function_realm(&self) -> Option<Gc<Realm>> {
         (self.methods().function_realm)(self)
+    }
+
+    /// See NativeFunctionMethods::ignores_stack_space_limit.
+    pub fn ignores_stack_space_limit(&self) -> bool {
+        self.native_function_methods()
+            .is_some_and(|methods| methods.ignores_stack_space_limit)
     }
 
     pub fn name_for_call_stack(&self) -> Utf16String {
@@ -2860,7 +2899,7 @@ impl Object {
         // NB: Setting a lazy property of a function must find it.
         if self.is_ecmascript_function_object() && (*property_key == vm.names.length || *property_key == vm.names.name)
         {
-            self.reify_lazy_function_properties(vm);
+            cast_ref::<Object, EcmascriptFunctionObject>(self).reify_length_and_name(vm);
         }
 
         let Some(metadata) = self.shape().lookup(property_key) else {
@@ -3068,6 +3107,9 @@ impl Object {
     pub fn get_without_side_effects(&self, vm: &Vm, property_key: &PropertyKey) -> Value {
         let mut object = Some(self.as_gc());
         while let Some(current) = object {
+            if current.is_ecmascript_function_object() {
+                cast_ref::<Object, EcmascriptFunctionObject>(&current).reify_lazy_property(vm, property_key);
+            }
             if let Some(value_and_attributes) = current.storage_get(vm, property_key) {
                 return value_and_attributes.value;
             }
@@ -3711,19 +3753,21 @@ impl Object {
             .cast_mut()
     }
 
-    /// Puts the property values in front of the existing ones, as `shape` has them.
-    pub(crate) fn prepend_named_properties(&self, shape: Gc<Shape>, values: &[Value]) {
+    /// Puts the property values in front of the existing one in slot `index`, as `shape` has them.
+    pub(crate) fn insert_named_properties(&self, shape: Gc<Shape>, index: u32, values: &[Value]) {
         let existing_count = self.shape().property_count();
+        assert!(index <= existing_count);
         self.ensure_named_storage_capacity(existing_count + values.len() as u32);
-        let named_properties = self.named_properties.get();
-        // SAFETY: The named storage has room for the existing and the new values.
+        // SAFETY: The named storage has room for the existing and the new values, and `index` is at most the number of
+        //         existing values.
         unsafe {
+            let insertion_point = self.named_properties.get().add(index as usize);
             core::ptr::copy(
-                named_properties,
-                named_properties.add(values.len()),
-                existing_count as usize,
+                insertion_point,
+                insertion_point.add(values.len()),
+                (existing_count - index) as usize,
             );
-            core::ptr::copy_nonoverlapping(values.as_ptr(), named_properties, values.len());
+            core::ptr::copy_nonoverlapping(values.as_ptr(), insertion_point, values.len());
         }
         self.shape.set(shape);
     }
@@ -3731,7 +3775,7 @@ impl Object {
     #[inline(always)]
     fn reify_lazy_function_properties(&self, vm: &Vm) {
         if self.is_ecmascript_function_object() {
-            cast_ref::<Object, EcmascriptFunctionObject>(self).reify_length_and_name(vm);
+            cast_ref::<Object, EcmascriptFunctionObject>(self).reify_lazy_properties(vm);
         }
     }
 

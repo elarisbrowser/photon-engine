@@ -112,6 +112,12 @@ struct ComputedFontCacheKey {
     // The tree scope whose @font-feature-values the request reads, or the document's when its
     // font-variant-alternates name no feature values, so that alike requests share one answer.
     TreeScopeID font_feature_values_scope;
+    // The angle of the oblique style font-style asks for, in degrees.
+    double font_oblique_angle { 14 };
+    // Which synthesis the font-synthesis longhands forbid, as the style engine encodes it.
+    u8 font_synthesis { 0 };
+    // The from-font metric lookup ignores size-adjust before choosing a numeric adjustment.
+    bool is_font_size_adjust_probe { false };
 
     [[nodiscard]] bool operator==(ComputedFontCacheKey const& other) const = default;
 };
@@ -174,8 +180,6 @@ public:
 private:
     virtual void visit_edges(Visitor&) override;
 
-    Optional<ByteString> try_load_font_mime_type_essence(Fetch::Infrastructure::ResponseView const&, ByteBuffer const&);
-
     void font_did_load_or_fail(RefPtr<Gfx::Typeface const>);
 
     GC::Ref<FontComputer> m_font_computer;
@@ -202,7 +206,7 @@ public:
     DOM::Document& document() { return *m_document; }
     DOM::Document const& document() const { return *m_document; }
 
-    Gfx::Font const& initial_font() const;
+    static Gfx::Font const& initial_font();
     bool should_defer_initial_paint();
     bool has_completed_initial_paint() const { return m_has_completed_initial_paint; }
     bool initial_paint_had_pending_fonts() const { return m_initial_paint_had_pending_fonts; }

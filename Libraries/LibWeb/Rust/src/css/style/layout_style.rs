@@ -270,6 +270,7 @@ impl LayoutStyle {
             self.payloads.write_group::<InheritedTextValues>(index, |values| {
                 values.color = fade(values.color);
                 values.webkit_text_fill_color = fade(values.webkit_text_fill_color);
+                values.webkit_text_stroke_color.rgba = fade(values.webkit_text_stroke_color.rgba);
             });
         };
         self.changed = true;
@@ -647,6 +648,11 @@ impl StyleEngine {
 
     pub(crate) fn pin_layout_style_record(&mut self, record: u64) {
         self.pin_style_record(record);
+    }
+
+    /// Pins `record` `times` times, as many calls of [`Self::pin_layout_style_record`] would.
+    pub(crate) fn pin_layout_style_record_times(&mut self, record: u64, times: u32) {
+        self.pin_style_record_times(record, times);
     }
 
     pub(crate) fn unpin_layout_style_record(&mut self, record: u64) {

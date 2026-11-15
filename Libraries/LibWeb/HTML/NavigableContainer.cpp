@@ -134,11 +134,11 @@ void NavigableContainer::create_new_child_navigable()
         {
             .local_target_navigable_id = navigable->id(),
             .local_target_entry = history_entry,
-            .on_complete = GC::create_function(heap(), [this, navigable] {
-                if (navigable->has_been_destroyed() || content_navigable() != navigable)
+            .on_complete = GC::create_function(heap(), GC::captures(*this, navigable), [](auto& self, auto& navigable) {
+                if (navigable->has_been_destroyed() || self.content_navigable() != navigable)
                     return;
                 navigable->set_has_session_history_entry_and_ready_for_navigation();
-                this->document().schedule_html_parser_end_check();
+                self.document().schedule_html_parser_end_check();
             }),
         });
 }
@@ -375,7 +375,7 @@ void NavigableContainer::continue_destroying_the_child_navigable(Navigable& navi
 {
     // 6. Queue a global task on the navigation and traversal task source given document's relevant global object to
     //    perform the following steps:
-    queue_a_task(Task::Source::NavigationAndTraversal, nullptr, nullptr, GC::create_function(navigable.heap(), [navigable = GC::Ref { navigable }] {
+    queue_a_task(Task::Source::NavigationAndTraversal, nullptr, nullptr, GC::create_function(navigable.heap(), GC::captures(GC::Ref { navigable }), [](auto& navigable) {
         // 1. If firePageSwapSteps is given, then run firePageSwapSteps.
         // 2. Unload document, passing along newDocument if it is not null.
         // NB: The document of a navigable hosted by another process was unloaded there by the UI process.
@@ -470,15 +470,15 @@ void NavigableContainer::content_navigable_completely_finished_loading()
     // NB: container is this element.
     // 4. If container is an iframe element, then queue an element task on the DOM manipulation task source given container to run the iframe load event steps given container.
     if (is<HTMLIFrameElement>(*this)) {
-        queue_an_element_task(Task::Source::DOMManipulation, [this] {
-            run_iframe_load_event_steps(static_cast<HTMLIFrameElement&>(*this));
-        });
+        queue_an_element_task(Task::Source::DOMManipulation, GC::create_function(heap(), GC::captures(*this), [](NavigableContainer& self) {
+            run_iframe_load_event_steps(static_cast<HTMLIFrameElement&>(self));
+        }));
     }
     // 5. Otherwise, if container is non-null, then queue an element task on the DOM manipulation task source given container to fire an event named load at container.
     else {
-        queue_an_element_task(Task::Source::DOMManipulation, [this] {
-            dispatch_event(DOM::Event::create(EventNames::load, HighResolutionTime::current_high_resolution_time(relevant_global_object(*this))));
-        });
+        queue_an_element_task(Task::Source::DOMManipulation, GC::create_function(heap(), GC::captures(*this), [](NavigableContainer& self) {
+            self.dispatch_event(DOM::Event::create(EventNames::load, HighResolutionTime::current_high_resolution_time(relevant_global_object(self))));
+        }));
     }
 
     // AD-HOC: Finishing a child document can unblock its parent's load-event-delay phase, so wake the parent parser end
@@ -504,25 +504,20 @@ bool NavigableContainer::currently_delays_the_load_event() const
     return m_content_navigable->delays_the_load_event_of_its_container();
 }
 
-// Clips rect to the document's viewport and to every overflow-clipping containing block above layout_node.
+// Clips rect to the document's viewport and to every clipping containing block above layout_node.
 static CSSPixelRect visible_part_in_document_viewport(Layout::Node const& layout_node, CSSPixelRect rect)
 {
     auto visible = rect.intersected(CSSPixelRect { {}, layout_node.document().viewport_rect().size() });
-    for (auto const* ancestor = layout_node.containing_block(); ancestor && Painting::has_committed_box(*ancestor); ancestor = ancestor->containing_block()) {
-        if (ancestor->overflow_x() == CSS::Overflow::Visible && ancestor->overflow_y() == CSS::Overflow::Visible)
-            continue;
-        visible.intersect(Painting::transform_rect_to_viewport(*ancestor, Painting::absolute_padding_box_rect(*ancestor)));
-    }
-    return visible;
+    return Painting::visible_rect_in_containing_blocks(layout_node, visible, Layout::RustFFI::ViewportSpace::VisualViewport);
 }
 
 // The bounding box, in the coordinates of the content box's document, of a rect in that document's viewport.
 static CSSPixelRect transform_rect_to_local(Layout::Node const& layout_node, CSSPixelRect const& rect)
 {
-    auto top_left = Painting::transform_to_local_coordinates(layout_node, rect.top_left());
+    auto top_left = Painting::point_to_local(layout_node, rect.top_left(), Layout::RustFFI::ViewportSpace::VisualViewport);
     auto bottom_right = top_left;
     for (auto corner : { rect.top_right(), rect.bottom_left(), rect.bottom_right() }) {
-        auto local = Painting::transform_to_local_coordinates(layout_node, corner);
+        auto local = Painting::point_to_local(layout_node, corner, Layout::RustFFI::ViewportSpace::VisualViewport);
         top_left = { min(top_left.x(), local.x()), min(top_left.y(), local.y()) };
         bottom_right = { max(bottom_right.x(), local.x()), max(bottom_right.y(), local.y()) };
     }
@@ -560,8 +555,8 @@ void NavigableContainer::report_content_navigable_viewport_rect(Layout::BegunRea
     // above the container. Those place its origin in the viewport of the local root through the viewports of the
     // documents between them, each of which shows only part of it.
     auto content_box = Painting::absolute_rect(*layout_node);
-    auto origin = Painting::transform_rect_to_viewport(*layout_node, { content_box.location(), {} }).location();
-    auto visible = visible_part_in_document_viewport(*layout_node, Painting::transform_rect_to_viewport(*layout_node, content_box));
+    auto origin = Painting::rect_to_viewport(*layout_node, { content_box.location(), {} }, Layout::RustFFI::ViewportSpace::VisualViewport).location();
+    auto visible = visible_part_in_document_viewport(*layout_node, Painting::rect_to_viewport(*layout_node, content_box, Layout::RustFFI::ViewportSpace::VisualViewport));
     Vector<Layout::Node const*> containers { layout_node };
     auto navigable = document().navigable();
     for (; navigable && !navigable->is_local_root();) {
@@ -579,9 +574,9 @@ void NavigableContainer::report_content_navigable_viewport_rect(Layout::BegunRea
         // The content box's origin is the origin of the child's viewport, and the transforms above the container
         // apply to the child as they do to the container.
         auto container_position = Painting::absolute_position(*container_layout_node);
-        origin = Painting::transform_rect_to_viewport(*container_layout_node, { origin.translated(container_position), {} }).location();
-        visible = Painting::transform_rect_to_viewport(*container_layout_node, visible.translated(container_position));
-        auto container_rect = Painting::transform_rect_to_viewport(*container_layout_node, Painting::absolute_rect(*container_layout_node));
+        origin = Painting::rect_to_viewport(*container_layout_node, { origin.translated(container_position), {} }, Layout::RustFFI::ViewportSpace::VisualViewport).location();
+        visible = Painting::rect_to_viewport(*container_layout_node, visible.translated(container_position), Layout::RustFFI::ViewportSpace::VisualViewport);
+        auto container_rect = Painting::rect_to_viewport(*container_layout_node, Painting::absolute_rect(*container_layout_node), Layout::RustFFI::ViewportSpace::VisualViewport);
         visible.intersect(visible_part_in_document_viewport(*container_layout_node, container_rect));
         containers.append(container_layout_node);
         navigable = container->document().navigable();
@@ -635,11 +630,13 @@ ReplicatedContainerState NavigableContainer::replicated_container_state()
     state.document_embedder_policy = document().policy_container()->embedder_policy;
     state.document_permissions_policy = document().permissions_policy();
     state.local_name = local_name();
+    state.name = name();
     state.iframe_referrer_policy = determine_iframe_element_referrer_policy(*this);
     state.container_policy = process_permissions_policy_attributes();
     auto document_policy_container = document().policy_container();
     state.document_insecure_requests_policy = document_policy_container->insecure_requests_policy();
     state.document_upgrade_insecure_navigations_set = document_policy_container->upgrade_insecure_navigations_set();
+    state.document_csp_list = document_policy_container->csp_list.serialize();
     state.used_color_scheme = m_used_color_scheme;
     return state;
 }

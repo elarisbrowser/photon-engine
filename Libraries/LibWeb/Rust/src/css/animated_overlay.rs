@@ -142,6 +142,20 @@ impl AnimatedOverlay {
         &self.entries
     }
 
+    /// A hash of what the overlay animates, which overlays holding the same values hash alike, in whatever order they
+    /// hold them.
+    pub(crate) fn content_hash(&self) -> u64 {
+        use std::hash::Hasher;
+        self.entries.iter().fold(0, |hash: u64, entry| {
+            let mut hasher = crate::css::style::fast_hash::fast_hasher();
+            hasher.write_u16(entry.property);
+            hasher.write_u64(crate::css::style_value::style_value_content_hash(
+                entry.value_handle().optional_data(),
+            ));
+            hash.wrapping_add(hasher.finish())
+        })
+    }
+
     pub(crate) fn get(&self, property: u16) -> Option<&FfiAnimatedOverlayEntry> {
         self.entries.iter().find(|entry| entry.property == property)
     }
@@ -227,19 +241,6 @@ pub extern "C" fn rust_animated_overlay_contains(overlay: &AnimatedOverlay, prop
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_animated_overlay_free(overlay: OwnedBox<AnimatedOverlay>) {
     drop(overlay);
-}
-
-/// Stores or replaces the overlay entry for a longhand, retaining `value`.
-#[unsafe(no_mangle)]
-pub extern "C" fn rust_animated_overlay_set(
-    overlay: &mut AnimatedOverlay,
-    property: u16,
-    value: crate::css::style_value_arc::StyleValueRef<'_>,
-    inherited: bool,
-    result_of_transition: bool,
-) {
-    let retained = RetainedStyleValueData::from_arc(value.to_arc());
-    overlay.set_owned(property, retained, inherited, result_of_transition);
 }
 
 /// Returns the overlay's borrowed entries, valid until its next mutation.

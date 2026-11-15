@@ -20,9 +20,11 @@
 #include <LibWebView/Utilities.h>
 #include <LibWebView/WebContentClient.h>
 #include <UI/Qt/Application.h>
+#include <UI/Qt/ApplicationActions.h>
 #include <UI/Qt/BookmarkPopover.h>
 #include <UI/Qt/BrowserWindow.h>
 #include <UI/Qt/ChromeStyle.h>
+#include <UI/Qt/HubConnection.h>
 #include <UI/Qt/Icon.h>
 #include <UI/Qt/JavaScriptDialog.h>
 #include <UI/Qt/LadybirdButton.h>
@@ -69,6 +71,7 @@
 namespace Ladybird {
 
 static constexpr int HOVER_TEXT_CORNER_RADIUS = 4;
+static constexpr int HOVER_TEXT_VERTICAL_PADDING = 2 + 1;
 
 // The calendar's month buttons get chevrons in the palette's text color, since the style's own arrows stay dark in dark
 // mode.
@@ -171,16 +174,18 @@ private:
     QLabel* m_level { nullptr };
 };
 
-Tab::Tab(BrowserWindow* window, Optional<WebView::CanonicalTraversable&> traversable)
+Tab::Tab(BrowserWindow* window, Optional<u64> hub_view_id)
     : QWidget(window)
+    , WebView::SettingsObserver(Application::settings())
     , m_window(window)
 {
     create_tab_shell();
-    initialize(traversable);
+    initialize(hub_view_id);
 }
 
 Tab::Tab(BrowserWindow* window, DeferredTab deferred_tab)
     : QWidget(window)
+    , WebView::SettingsObserver(Application::settings())
     , m_window(window)
     , m_title(deferred_tab.title)
     , m_favicon(favicon_with_rounded_corners(deferred_tab.favicon, TAB_FAVICON_SIZE))
@@ -199,7 +204,7 @@ void Tab::create_tab_shell()
     create_tab_context_menu();
 }
 
-void Tab::initialize(Optional<WebView::CanonicalTraversable&> traversable)
+void Tab::initialize(Optional<u64> hub_view_id)
 {
     auto* tab_layout = static_cast<QBoxLayout*>(layout());
 
@@ -207,10 +212,12 @@ void Tab::initialize(Optional<WebView::CanonicalTraversable&> traversable)
         .is_private = m_window->is_private(),
         .maximum_frames_per_second = m_window->refresh_rate(),
         .display_id = m_window->display_id(),
-        .owner_view = nullptr,
+        .screen_shows_high_dynamic_range = m_window->screen_shows_high_dynamic_range(),
+        .owner_view_id = {},
+        .is_tab = true,
     };
 
-    m_view = new WebContentView(this, traversable, AK::move(view_initial_state));
+    m_view = new WebContentView(this, hub_view_id, AK::move(view_initial_state));
     // The window reports its geometry to its tabs as it is moved and resized, so a tab opened later has to be told
     // where the window stands now.
     m_view->set_window_position({ m_window->x(), m_window->y() });
@@ -224,6 +231,7 @@ void Tab::initialize(Optional<WebView::CanonicalTraversable&> traversable)
     // The window's toolbar holds the address field while it shows this tab.
     m_location_edit = new LocationEdit(this, m_window->is_private());
     m_location_edit->hide();
+    m_location_edit->installEventFilter(this);
 
     m_view->installEventFilter(this);
 
@@ -231,14 +239,6 @@ void Tab::initialize(Optional<WebView::CanonicalTraversable&> traversable)
     m_hover_label->hide();
     m_hover_label->setContentsMargins(4, 2, 4, 2);
     m_hover_label->setAutoFillBackground(true);
-
-    QObject::connect(m_hover_label, &HyperlinkLabel::mouse_entered, [this] {
-        update_hover_label();
-    });
-
-    auto* focus_location_editor_action = new QAction("Edit Location", this);
-    focus_location_editor_action->setShortcuts({ QKeySequence("Ctrl+L"), QKeySequence("Alt+D") });
-    addAction(focus_location_editor_action);
 
     tab_layout->addWidget(m_view);
 
@@ -248,7 +248,8 @@ void Tab::initialize(Optional<WebView::CanonicalTraversable&> traversable)
     m_content_blocking_update_timer->setSingleShot(true);
     m_content_blocking_update_timer->setInterval(100);
     QObject::connect(m_content_blocking_update_timer, &QTimer::timeout, this, [this] {
-        if (m_site_settings_popover && m_site_settings_popover->isVisible())
+        // NB: A page that is not from a website has no content blocking settings to show.
+        if (m_site_settings_popover && m_site_settings_popover->isVisible() && m_site_settings_popover_origin.has_value())
             m_site_settings_popover->set_content_blocking(view().content_blocking_snapshot());
     });
     view().on_content_blocking_change = [this](auto const&) {
@@ -263,7 +264,7 @@ void Tab::initialize(Optional<WebView::CanonicalTraversable&> traversable)
     m_location_edit->set_trailing_action(bookmark_action);
     m_location_edit->set_zoom_action(create_application_action(*m_location_edit, view().reset_zoom_action(), IncludeActionIcon::No));
     // The translate button shows the page's translation menu, rather than translating the page at once.
-    m_translate_action = create_application_action(*m_location_edit, view().page_translation().translate_action());
+    m_translate_action = create_application_action(*m_location_edit, view().translate_action());
     m_location_edit->set_translate_action(m_translate_action);
 
     view().on_performance_stats = [this](WebView::TabPerformanceStats const& stats) {
@@ -328,7 +329,6 @@ void Tab::initialize(Optional<WebView::CanonicalTraversable&> traversable)
 
     view().on_link_hover = [this](auto const& url) {
         m_hover_text = qstring_from_ak_string(url.to_byte_string());
-        m_hover_text_is_on_right = false;
         update_hover_label();
     };
 
@@ -341,6 +341,9 @@ void Tab::initialize(Optional<WebView::CanonicalTraversable&> traversable)
     };
     view().on_load_start = [this] {
         m_window->on_tab_load_start(*this);
+    };
+    view().on_load_from_user_input = [this] {
+        m_window->on_tab_navigated_by_user(*this);
     };
     set_loading(view().is_loading());
 
@@ -518,7 +521,7 @@ void Tab::initialize(Optional<WebView::CanonicalTraversable&> traversable)
         m_permission_prompts.ignore_all();
     };
 
-    view().on_request_external_url_confirmation = [this](auto const& url, auto const& initiator_origin, auto const& handler, auto on_complete) {
+    view().on_request_external_url_confirmation = [this](auto const& url, auto const& initiator_origin, String const& handler_name, auto on_complete) {
         if (m_javascript_dialog->is_open() || m_color_picker_dialog || m_external_url_confirmation_dialog) {
             on_complete(false);
             return;
@@ -527,11 +530,11 @@ void Tab::initialize(Optional<WebView::CanonicalTraversable&> traversable)
         hide_hover_label();
 
         auto initiator = initiator_origin.is_opaque() ? "This page"_string : initiator_origin.serialize();
-        auto application_name = handler.application_name().is_empty() ? "another application"sv : handler.application_name().bytes_as_string_view();
-        auto title = handler.application_name().is_empty() ? "Open external application?"_string : MUST(String::formatted("Open {}?", application_name));
+        auto application_name = handler_name.is_empty() ? "another application"sv : handler_name.bytes_as_string_view();
+        auto title = handler_name.is_empty() ? "Open external application?"_string : MUST(String::formatted("Open {}?", application_name));
         auto message = MUST(String::formatted("{} wants to open a {} link with {}.", initiator, url.scheme(), application_name));
         auto details = MUST(String::formatted("URL: '{}'", url));
-        auto open_button_text = handler.application_name().is_empty() ? "Open"_string : MUST(String::formatted("Open {}", application_name));
+        auto open_button_text = handler_name.is_empty() ? "Open"_string : MUST(String::formatted("Open {}", application_name));
 
         auto* dialog = new QMessageBox(&view());
         m_external_url_confirmation_dialog = dialog;
@@ -568,7 +571,8 @@ void Tab::initialize(Optional<WebView::CanonicalTraversable&> traversable)
             view().did_show_permission_prompt(request);
         };
         popover->on_open_settings = [] {
-            Application::the().microphone_authorizer().open_system_settings();
+            if (auto* authorizer = Application::the().microphone_authorizer())
+                authorizer->open_system_settings();
         };
         return popover;
     };
@@ -583,13 +587,22 @@ void Tab::initialize(Optional<WebView::CanonicalTraversable&> traversable)
         m_permission_prompts.cancel(request);
     };
 
+    view().on_state_change = [this](Hub::ViewState const& previous_state) {
+        if (previous_state.page_mute_state != view().page_mute_state())
+            emit audio_state_changed(tab_index());
+    };
+
     view().on_tab_indicator_change = [this](WebView::TabIndicator indicator, bool visible) {
         switch (indicator) {
         case WebView::TabIndicator::PlayingAudio:
-            emit playing_audio_indicator_changed(tab_index());
+            emit audio_state_changed(tab_index());
             break;
         case WebView::TabIndicator::UsingLocation:
             m_location_edit->set_location_in_use(visible);
+            break;
+        case WebView::TabIndicator::UsingMicrophone:
+            m_location_edit->set_microphone_in_use(visible);
+            emit microphone_in_use_changed();
             break;
         }
     };
@@ -822,8 +835,6 @@ void Tab::initialize(Optional<WebView::CanonicalTraversable&> traversable)
         m_find_in_page->update_result_label(current_match_index, total_match_count);
     };
 
-    QObject::connect(focus_location_editor_action, &QAction::triggered, this, [this] { focus_location_editor(); });
-
     view().on_restore_window = [this]() {
         m_window->showNormal();
     };
@@ -845,11 +856,16 @@ void Tab::initialize(Optional<WebView::CanonicalTraversable&> traversable)
     };
 
     view().on_fullscreen_window = [this]() {
+        // NB: Only the tab on display goes full screen. A request from another tab came after the user moved on.
+        if (m_window->current_tab() != this) {
+            view().deny_fullscreen_window();
+            return;
+        }
         m_window->fullscreen_mode().enter(this);
     };
 
     view().on_exit_fullscreen_window = [this]() {
-        m_window->fullscreen_mode().exit(FullscreenMode::ExitInitiatedBy::WebContent);
+        m_window->fullscreen_mode().exit(FullscreenMode::ExitInitiatedBy::WebContent, this);
     };
 
     view().on_screen_wake_lock_state_changed = [this](auto wake_lock_state) {
@@ -859,7 +875,7 @@ void Tab::initialize(Optional<WebView::CanonicalTraversable&> traversable)
 
 void Tab::create_tab_context_menu()
 {
-    auto& application = WebView::Application::the();
+    auto& application = ApplicationActions::the();
 
     auto* duplicate_tab_action = new QAction("&Duplicate Tab", this);
     QObject::connect(duplicate_tab_action, &QAction::triggered, this, [this]() {
@@ -876,15 +892,13 @@ void Tab::create_tab_context_menu()
 
     auto* new_tab_to_the_right_action = new QAction("New Tab to the &Right", this);
     QObject::connect(new_tab_to_the_right_action, &QAction::triggered, this, [this]() {
-        m_window->new_tab_from_url(WebView::Application::settings().new_tab_page_url(), Web::HTML::ActivateTab::Yes, BrowserWindow::TabLocation::after_tab(*this));
+        m_window->new_tab_from_url(Application::settings().new_tab_page_url(), Web::HTML::ActivateTab::Yes, BrowserWindow::TabLocation::after_tab(*this));
     });
 
     auto* mute_tab_action = new QAction("&Mute Tab", this);
     QObject::connect(mute_tab_action, &QAction::triggered, this, [this]() {
-        if (is_loaded()) {
+        if (is_loaded())
             view().toggle_page_mute_state();
-            m_window->update_tab_audio_button(*this);
-        }
     });
 
     auto* move_to_new_window_action = new QAction("Move to New &Window", this);
@@ -986,7 +1000,7 @@ void Tab::ensure_loaded()
 
     Optional<WebView::SessionHistorySnapshot> history;
     if (m_session_tab_id.has_value())
-        history = m_window->session().session_store->load_tab_history(*m_session_tab_id);
+        history = m_window->session().load_tab_history(*m_session_tab_id);
     if (!history.has_value() || view().restore_session_history_from_snapshot(history.release_value()).is_error())
         navigate(deferred_url);
 }
@@ -998,7 +1012,7 @@ URL::URL Tab::url() const
     return view().url();
 }
 
-Optional<WebView::SessionTabId> Tab::session_tab_id() const
+Optional<SessionTabId> Tab::session_tab_id() const
 {
     // A loaded tab's view holds the ID it reports its state under.
     if (is_loaded())
@@ -1006,7 +1020,7 @@ Optional<WebView::SessionTabId> Tab::session_tab_id() const
     return m_session_tab_id;
 }
 
-void Tab::set_session_tab_id(WebView::SessionTabId session_tab_id)
+void Tab::set_session_tab_id(SessionTabId session_tab_id)
 {
     m_session_tab_id = session_tab_id;
     if (is_loaded())
@@ -1076,6 +1090,7 @@ void Tab::location_edit_return_pressed(String input, Optional<URL::URL> fallback
 
     view().set_next_history_visit_transition(WebView::HistoryVisitTransition::Omnibox);
     if (destination_kind == WebView::OmniboxDestinationKind::Search) {
+        m_window->on_tab_navigated_by_user(*this);
         if (fallback_url.has_value())
             view().load(*fallback_url);
         else
@@ -1106,7 +1121,7 @@ QString Tab::title() const
     // A blank page is what a new tab shows, so it is called a new tab.
     if (!m_fixed_title.has_value() && is_loaded() && view().url() == URL::about_blank() && (title.isEmpty() || title == QStringLiteral("about:blank")))
         title = "New Tab";
-    if (!is_loaded() || !WebView::Application::settings().config_variable_as_bool(WebView::ConfigVariableID::ShowWebContentProcessIDInTabTitle))
+    if (!is_loaded() || !Application::settings().config_variable_as_bool(WebView::ConfigVariableID::ShowWebContentProcessIDInTabTitle))
         return title;
 
     return QString("%1 [%2]").arg(title).arg(view().web_content_pid());
@@ -1280,6 +1295,7 @@ void Tab::update_hover_label()
 {
     if (m_hover_text.isEmpty())
         return;
+    m_hover_text_is_on_right = hover_text_belongs_on_right(m_view->mapFromGlobal(QCursor::pos()));
     auto text = QFontMetrics(m_hover_label->font()).elidedText(m_hover_text, Qt::ElideRight, width() / 2 - 10);
 
     // NB: Where the view can stack the text above the page itself, it stays inside the window and costs the page
@@ -1288,28 +1304,22 @@ void Tab::update_hover_label()
     auto size = image.deviceIndependentSize().toSize();
     QPoint position { m_hover_text_is_on_right ? m_view->width() - size.width() : 0, m_view->height() - size.height() };
     if (m_view->show_image_over_page(image, position)) {
-        m_hover_text_rect_over_page = { position, size };
+        m_hover_text_is_over_page = true;
         m_hover_label->hide();
         return;
     }
-    if (!m_hover_text_rect_over_page.isEmpty()) {
+    if (m_hover_text_is_over_page) {
         m_view->hide_image_over_page();
-        m_hover_text_rect_over_page = {};
+        m_hover_text_is_over_page = false;
     }
 
+    update_chrome_style();
     m_hover_label->setText(text);
-    m_hover_label->setCursor(view().cursor());
-    m_hover_label->resize(m_hover_label->sizeHint());
-
-    auto hover_label_height = height() - m_hover_label->height();
-
-    auto left_position = mapToGlobal(QPoint { 0, hover_label_height });
-
-    if (m_hover_label->underMouse() && m_hover_label->pos() == left_position)
-        m_hover_label->move(mapToGlobal(QPoint { width() - m_hover_label->width(), hover_label_height }));
-    else
-        m_hover_label->move(left_position);
-
+    // NB: The label adds room of its own around the text, so only its size hint is wide enough for the whole text.
+    size = m_hover_label->sizeHint();
+    position = { m_hover_text_is_on_right ? m_view->width() - size.width() : 0, m_view->height() - size.height() };
+    m_hover_label->resize(size);
+    m_hover_label->move(m_view->mapToGlobal(position));
     m_hover_label->raise();
     m_hover_label->show();
 }
@@ -1317,11 +1327,22 @@ void Tab::update_hover_label()
 void Tab::hide_hover_label()
 {
     m_hover_text = {};
-    if (!m_hover_text_rect_over_page.isEmpty()) {
+    if (m_hover_text_is_over_page) {
         m_view->hide_image_over_page();
-        m_hover_text_rect_over_page = {};
+        m_hover_text_is_over_page = false;
     }
     m_hover_label->hide();
+}
+
+// NB: This looks only at the pointer and not at the width of the text, so that links with URLs of different lengths
+//     all put the text on the same side. The text is at most half as wide as the tab, so it stays clear of the
+//     pointer.
+bool Tab::hover_text_belongs_on_right(QPoint pointer) const
+{
+    // NB: Text on the right returns only when the pointer is clearly away, so it can't flip at the edge of the strip.
+    auto text_height = QFontMetrics { m_hover_label->font() }.height() + 2 * HOVER_TEXT_VERTICAL_PADDING;
+    auto strip_height = m_hover_text_is_on_right ? 2 * text_height : text_height;
+    return pointer.y() >= m_view->height() - strip_height && pointer.x() < m_view->width() / 2;
 }
 
 // Paints the hover text the way the hover label's style sheet does. It sits in a bottom corner of the page, and only
@@ -1329,10 +1350,9 @@ void Tab::hide_hover_label()
 QImage Tab::render_hover_text(QString const& text) const
 {
     static constexpr int horizontal_padding = 4 + 1;
-    static constexpr int vertical_padding = 2 + 1;
 
     QFontMetrics metrics { m_hover_label->font() };
-    QSize size { metrics.horizontalAdvance(text) + 2 * horizontal_padding, metrics.height() + 2 * vertical_padding };
+    QSize size { metrics.horizontalAdvance(text) + 2 * horizontal_padding, metrics.height() + 2 * HOVER_TEXT_VERTICAL_PADDING };
     auto device_pixel_ratio = devicePixelRatioF();
     QImage image { size * device_pixel_ratio, QImage::Format_ARGB32_Premultiplied };
     image.setDevicePixelRatio(device_pixel_ratio);
@@ -1385,17 +1405,18 @@ bool Tab::event(QEvent* event)
 
 bool Tab::eventFilter(QObject* watched, QEvent* event)
 {
-    // NB: The hover text over the page lets the pointer through, so it moves aside when the pointer comes over it.
-    if (watched == m_view && event->type() == QEvent::MouseMove && m_hover_text_rect_over_page.contains(static_cast<QMouseEvent*>(event)->position().toPoint())) {
-        m_hover_text_is_on_right = !m_hover_text_is_on_right;
+    // NB: The hover text lets the pointer through, so it moves aside when the pointer comes near it.
+    if (watched == m_view && event->type() == QEvent::MouseMove && !m_hover_text.isEmpty()
+        && hover_text_belongs_on_right(static_cast<QMouseEvent*>(event)->position().toPoint()) != m_hover_text_is_on_right)
         update_hover_label();
-    }
     if (watched == m_view && (event->type() == QEvent::Resize || event->type() == QEvent::Move)) {
         if (m_find_in_page->isVisible())
             m_find_in_page->reposition();
         if (m_restore_session_card)
             m_restore_session_card->reposition();
     }
+    if (watched == m_location_edit && event->type() == QEvent::DynamicPropertyChange && static_cast<QDynamicPropertyChangeEvent*>(event)->propertyName() == "autocompleteOpen")
+        m_view->set_suggestions_over_page(m_location_edit->property("autocompleteOpen").toBool());
     return QWidget::eventFilter(watched, event);
 }
 
@@ -1407,8 +1428,11 @@ void Tab::update_chrome_style()
     auto hover_surface = ChromeStyle::style_sheet_color(ChromeStyle::chrome_surface(Theme::chrome_palette(*this)));
     auto hover_border = ChromeStyle::style_sheet_color(ChromeStyle::chrome_border(Theme::chrome_palette(*this)));
     auto hover_text = ChromeStyle::style_sheet_color(ChromeStyle::chrome_text(Theme::chrome_palette(*this)));
-    m_hover_label->setStyleSheet(qformatted("background: {}; color: {}; border: 1px solid {}; border-top-right-radius: {}px;",
-        hover_surface, hover_text, hover_border, HOVER_TEXT_CORNER_RADIUS));
+    // NB: Only the corner toward the page is rounded. Setting a style sheet repolishes the label, even if unchanged.
+    auto hover_label_style = qformatted("background: {}; color: {}; border: 1px solid {}; border-top-{}-radius: {}px;",
+        hover_surface, hover_text, hover_border, m_hover_text_is_on_right ? "left" : "right", HOVER_TEXT_CORNER_RADIUS);
+    if (m_hover_label->styleSheet() != hover_label_style)
+        m_hover_label->setStyleSheet(hover_label_style);
     m_is_updating_chrome_style = false;
 }
 
@@ -1419,13 +1443,13 @@ void Tab::recreate_location_edit_icons()
         action->setIcon(create_chrome_icon(engaged ? ChromeIcon::StarFilled : ChromeIcon::Star, Theme::chrome_palette(*this), ChromeStyle::window_activity(*this)));
     }
     if (m_translate_action)
-        m_translate_action->setIcon(create_translate_icon(Theme::chrome_palette(*this), view().page_translation().is_translated()));
+        m_translate_action->setIcon(create_translate_icon(Theme::chrome_palette(*this), view().is_translated()));
 }
 
 void Tab::show_translation_menu()
 {
     if (!m_translation_menu)
-        m_translation_menu = create_application_menu(*this, view().page_translation().translation_menu());
+        m_translation_menu = create_application_menu(*this, view().translation_menu());
     auto& button = m_location_edit->translate_button();
     m_translation_menu->popup(button.mapToGlobal(QPoint { 0, button.height() }));
 }
@@ -1456,7 +1480,7 @@ void Tab::show_zoom_popover()
 
 void Tab::show_bookmark_popover()
 {
-    auto& store = WebView::Application::bookmark_store();
+    auto& store = Application::bookmark_store();
     auto just_added = BookmarkPopover::JustAdded::No;
     auto bookmark = store.find_bookmark_by_url(view().url());
     if (!bookmark.has_value()) {
@@ -1494,22 +1518,32 @@ void Tab::close_popovers()
     }
 }
 
+// Settings are kept for websites, so a page that is not from one says why it has none.
+static QString explanation_for_page_without_site(URL::URL const& url)
+{
+    if (url.scheme() == "about"sv)
+        return QStringLiteral("Ladybird pages have no site settings.");
+    if (url.scheme() == "file"sv)
+        return QStringLiteral("Files on this computer have no site settings.");
+    // NB: A page from a website can still have no origin of its own to keep settings for, for example when its
+    //     Content-Security-Policy sandboxes it.
+    if (url.scheme().is_one_of("http"sv, "https"sv))
+        return QStringLiteral("This page has no site settings.");
+    return QStringLiteral("Pages that are not from a website have no site settings.");
+}
+
 void Tab::show_site_settings_popover()
 {
-    auto url = view().url();
-    // A page on an inherited about:blank has its opener's origin and no host of its own; the panel is for it too.
     auto origin = view().permission_origin();
-    if (!url.host().has_value() && origin.is_opaque())
-        return;
 
     if (!m_site_settings_popover) {
-        m_site_settings_popover = new SiteSettingsPopover(this, WebView::Application::settings());
+        m_site_settings_popover = new SiteSettingsPopover(this, Application::settings());
         m_location_edit->follow_site_settings_popover(*m_site_settings_popover);
         m_site_settings_popover->on_content_blocking_toggle = [this](bool enabled) {
             auto snapshot = view().content_blocking_snapshot();
             if (!snapshot.site.has_value() || !snapshot.can_toggle())
                 return;
-            if (WebView::Application::settings().set_content_blocker_enabled_for_site(*snapshot.site, enabled).is_error())
+            if (Application::settings().set_content_blocker_enabled_for_site(*snapshot.site, enabled).is_error())
                 return;
             view().reload();
         };
@@ -1517,7 +1551,7 @@ void Tab::show_site_settings_popover()
             m_window->new_tab_from_url(URL::Parser::basic_parse("about:settings#permissions"sv).release_value(), Web::HTML::ActivateTab::Yes, BrowserWindow::TabLocation::after_current_tab());
         };
         m_site_settings_popover->on_report_broken_site = [] {
-            WebView::Application::the().report_website_issue_action().activate();
+            ApplicationActions::the().report_website_issue_action().activate();
         };
         m_site_settings_popover->on_open_filter_lists = [this] {
             m_window->new_tab_from_url(URL::Parser::basic_parse("about:settings#blocking"sv).release_value(), Web::HTML::ActivateTab::Yes, BrowserWindow::TabLocation::after_current_tab());
@@ -1534,25 +1568,29 @@ void Tab::show_site_settings_popover()
         };
     }
 
-    m_site_settings_popover_origin = origin;
     m_site_settings_popover->update_chrome_style(palette());
-    m_site_settings_popover->set_site({
-        .host = url.host().has_value() ? MUST(String::from_utf8(url.serialized_host())) : origin.host().serialize(),
-        .force_dark_host = view().force_dark_host(),
-        .is_private = view().is_private() == WebView::IsPrivate::Yes,
-        .is_secure = (url.host().has_value() ? url.scheme() : origin.scheme().value_or({})) == "https"sv,
-        .favicon = m_favicon,
-        .content_blocking = view().content_blocking_snapshot(),
-        .permissions = view().site_permission_rows(),
-    });
+    if (origin.is_opaque()) {
+        // NB: The popover no longer shows the site it was last opened for.
+        m_site_settings_popover_origin = {};
+        m_site_settings_popover->set_page_without_site(title(), explanation_for_page_without_site(url()), m_favicon);
+    } else {
+        m_site_settings_popover_origin = origin;
+        m_site_settings_popover->set_site({
+            .origin = AK::move(origin),
+            .host_for_settings = view().current_host_for_settings(),
+            .is_private = view().is_private() == WebView::IsPrivate::Yes,
+            .favicon = m_favicon,
+            .content_blocking = view().content_blocking_snapshot(),
+            .permissions = view().site_permission_rows(),
+        });
+    }
     move_popover_below(*m_site_settings_popover, site_settings_anchor(), PopoverAlignment::Leading);
     m_site_settings_popover->show();
     move_popover_below(*m_site_settings_popover, site_settings_anchor(), PopoverAlignment::Leading);
     m_site_settings_popover->raise();
 }
 
-// What the popovers about a site hang from: the site settings button, or the field for a page with no host, which has no
-// such button.
+// What the popovers about a site hang from: the site settings button, or the field before the button is first shown.
 QWidget& Tab::site_settings_anchor() const
 {
     auto& button = m_location_edit->site_settings_button();
@@ -1563,7 +1601,7 @@ QWidget& Tab::site_settings_anchor() const
 // instead, since its rows would be the new site's.
 void Tab::refresh_site_settings_popover()
 {
-    if (!m_site_settings_popover)
+    if (!m_site_settings_popover || !m_site_settings_popover_origin.has_value())
         return;
     if (!view().permission_origin().is_same_origin(*m_site_settings_popover_origin)) {
         m_site_settings_popover->close();
@@ -1645,9 +1683,8 @@ void Tab::request_close()
     m_preserve_close_retry_state_on_dialog_dismissal = false;
 
     if (!view().needs_beforeunload_check()) {
-        auto request_close = view().prepare_for_immediate_close();
-        if (m_window->definitely_close_tab(tab_index()))
-            Core::deferred_invoke(AK::move(request_close));
+        view().prepare_for_immediate_close();
+        m_window->definitely_close_tab(tab_index());
         return;
     }
 

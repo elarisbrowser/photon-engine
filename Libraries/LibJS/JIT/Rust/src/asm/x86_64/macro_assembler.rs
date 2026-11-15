@@ -144,6 +144,11 @@ impl BranchGroups for MacroAssembler {
 }
 
 impl MacroAssembler {
+    /// The bytes the prologue of `frame` moves the stack pointer down by after saving the general purpose registers.
+    fn reserved_frame_bytes(frame: &MachineFrame) -> u32 {
+        frame.locals_size + 8 * frame.saved_fprs.len() as u32
+    }
+
     /// `dst = lhs op rhs` for a commutative operation.
     fn commutative(&mut self, op: AluOp, width: Width, dst: Gpr, lhs: Gpr, rhs: Gpr) {
         if dst == lhs {
@@ -209,7 +214,8 @@ impl MacroAssembler {
         self.assembler.shift_ri(op, width, dst, amount);
     }
 
-    /// Shifts by a register amount, which x86 needs in CL.
+    /// Shifts by a register amount, which x86 needs in CL. The register allocator puts the amounts of shift nodes there
+    /// (see `SHIFT_AMOUNT_GPR`), and other amounts go through the scratch registers.
     fn shift_register(&mut self, op: ShiftOp, width: Width, dst: Gpr, src: Gpr, amount: Gpr) {
         if amount == RCX && dst != RCX {
             self.mov_if_needed(width, dst, src);
@@ -357,6 +363,7 @@ impl PortableMacroAssembler for MacroAssembler {
     const SCRATCH_FPRS: FprSet = FprSet::of(&[FP_SCRATCH]);
     const ALLOCATABLE_GPRS: GprSet = GprSet::of(&[RAX, RCX, RDX, RBX, RSI, RDI, R8, R9, R12, R13, R14, R15]);
     const ALLOCATABLE_FPRS: FprSet = FprSet(0x7fff);
+    const SHIFT_AMOUNT_GPR: Option<Gpr> = Some(RCX);
     const STACK_POINTER: Gpr = RSP;
     const FRAME_POINTER: Gpr = RBP;
 
@@ -1117,13 +1124,20 @@ impl PortableMacroAssembler for MacroAssembler {
         for register in frame.saved_gprs.iter() {
             self.assembler.push(register);
         }
-        let reserved = frame.locals_size + 8 * frame.saved_fprs.len() as u32;
+        let reserved = Self::reserved_frame_bytes(frame);
         if reserved != 0 {
             self.assembler.sub_ri(W64, RSP, reserved as i32);
         }
+        // NB: The saved registers are within a page of the pushes, which touched the stack.
         for (i, register) in frame.saved_fprs.iter().enumerate() {
             let offset = frame.locals_size + 8 * i as u32;
             self.assembler.movsd_mr(&Address::new(RSP, offset as i32), register);
+        }
+        let reserved = reserved as i32;
+        if needs_stack_probes(reserved) {
+            // NB: The pushes touched the stack down to where the reserved part starts.
+            self.assembler.lea(W64, SCRATCH, &Address::new(RSP, reserved));
+            self.assembler.probe_stack(SCRATCH, RSP, Some(reserved));
         }
     }
 
@@ -1132,7 +1146,7 @@ impl PortableMacroAssembler for MacroAssembler {
             let offset = frame.locals_size + 8 * i as u32;
             self.assembler.movsd_rm(register, &Address::new(RSP, offset as i32));
         }
-        let reserved = frame.locals_size + 8 * frame.saved_fprs.len() as u32;
+        let reserved = Self::reserved_frame_bytes(frame);
         if reserved != 0 {
             self.assembler.add_ri(W64, RSP, reserved as i32);
         }
@@ -1140,5 +1154,21 @@ impl PortableMacroAssembler for MacroAssembler {
             self.assembler.pop(register);
         }
         self.assembler.pop(RBP);
+    }
+
+    fn allocate_stack(&mut self, bytes: i64) {
+        if PROBES_STACK {
+            // NB: The prologue may have moved the stack pointer without touching where it ended up.
+            self.assembler.mov_rm(W32, SCRATCH, &Address::new(RSP, 0));
+            let bytes = i32::try_from(bytes).expect("stack allocations are smaller than 2 GiB");
+            if needs_stack_probes(bytes) {
+                self.assembler.mov_rr(W64, SCRATCH2, RSP);
+                self.assembler.lea(W64, SCRATCH, &Address::new(RSP, -bytes));
+                self.assembler.probe_stack(SCRATCH2, SCRATCH, Some(bytes));
+                self.assembler.mov_rr(W64, RSP, SCRATCH);
+                return;
+            }
+        }
+        self.sub64_imm(RSP, RSP, bytes);
     }
 }

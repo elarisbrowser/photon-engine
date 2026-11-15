@@ -19,6 +19,7 @@
 #include <LibIPC/Decoder.h>
 #include <LibIPC/Encoder.h>
 #include <LibIPC/Message.h>
+#include <LibIPC/RawAttachment.h>
 #include <LibJS/Forward.h>
 #include <LibJS/Runtime/Object.h>
 #include <LibWeb/Bindings/IntrinsicDefinitions.h>
@@ -35,40 +36,7 @@ class HostObject;
 
 namespace Web::HTML {
 
-// A received data holder, whose bytes Rust reads. The values that have attachments C++ decodes for it, at the offset
-// that Rust has read to.
-class WEB_API TransferDataDecoder {
-    AK_ALLOC_WITH_KMALLOC;
-
-public:
-    explicit TransferDataDecoder(TransferDataEncoder&&);
-
-    ReadonlyBytes bytes() const { return m_buffer.data().span(); }
-
-    // Decodes a value at the offset, and sets the offset to the end of the value.
-    template<typename T>
-    ErrorOr<T> decode_at(size_t& offset)
-    {
-        TRY(m_stream.seek(offset, SeekMode::SetPosition));
-        auto value = TRY(m_decoder.decode<T>());
-        offset = TRY(m_stream.tell());
-        return value;
-    }
-
-    // The shared memory of the record that this transfer data belongs to, for transfer-receiving steps that map theirs.
-    void set_shared_buffers(Vector<Core::AnonymousBuffer> const& shared_buffers) { m_shared_buffers = &shared_buffers; }
-    Vector<Core::AnonymousBuffer> const* shared_buffers() const { return m_shared_buffers; }
-
-private:
-    IPC::MessageBuffer m_buffer;
-
-    FixedMemoryStream m_stream;
-    Queue<IPC::Attachment> m_attachments;
-
-    IPC::Decoder m_decoder;
-
-    Vector<Core::AnonymousBuffer> const* m_shared_buffers { nullptr };
-};
+using TransferAttachment = IPC::RawAttachment;
 
 struct StructuredSerializeOptions {
     GC::RootVector<GC::Ref<JS::Object>> transfer;
@@ -90,7 +58,7 @@ enum class AllowSharedArrayBuffers : u8 {
 };
 
 // The SharedArrayBuffers that a record produced in this process aliases instead of copying.
-WEB_API ReadonlySpan<GC::Root<JS::ArrayBuffer>> same_process_shared_array_buffers(IPCSerializationRecord const&);
+WEB_API ReadonlySpan<GC::Root<JS::ArrayBuffer>> same_agent_shared_array_buffers(IPCSerializationRecord const&);
 IPCSerializationRecord create_ipc_serialization_record(ReadonlyBytes data, Vector<GC::Root<JS::ArrayBuffer>> shared_array_buffers);
 
 WEB_API WebIDL::ExceptionOr<IPCSerializationRecord> structured_serialize(JS::VM&, JS::Value);
@@ -109,45 +77,9 @@ struct SerializableRegistryEntry {
     StringView identifier;
 };
 
-WEB_API ReadonlySpan<SerializableRegistryEntry> serializable_storage_registry();
-
-template<typename T>
-WebIDL::ExceptionOr<void> encode_or_throw_data_clone_error(JS::Realm& realm, TransferDataEncoder& encoder, T const& value)
-{
-    auto result = encoder.encode(value);
-    if (result.is_error())
-        return data_clone_error_from_serialization_error(realm, result.release_error());
-    return {};
-}
+WEB_API Vector<SerializableRegistryEntry> serializable_storage_registry();
 
 WEB_API WebIDL::ExceptionOr<SerializedTransferRecord> structured_serialize_with_transfer(JS::Realm&, JS::Value, ReadonlySpan<GC::Ref<JS::Object>> transfer_list);
 WEB_API WebIDL::ExceptionOr<DeserializedTransferRecord> structured_deserialize_with_transfer(SerializedTransferRecord&, JS::Realm&);
-
-}
-
-namespace Web::Bindings {
-
-class RustInterfaceCell;
-
-// A platform object that is a serializable object: an implementation object of an interface implemented in C++, whose
-// steps run in Rust over its fields, or the cell of an object of an interface implemented in Rust, whose steps the Rust
-// bindings run.
-struct SerializablePlatformObject {
-    GC::Ptr<RustInterfaceCell> rust_object { nullptr };
-    InterfaceName interface_name;
-    GC::Ptr<JS::Realm> realm;
-
-    // NB: The record that the steps write is the Rust SerializationWriter that the serialization passes on.
-    WebIDL::ExceptionOr<void> serialization_steps(void* serialized, bool for_storage) const;
-};
-
-WEB_API Optional<SerializablePlatformObject> serializable_from_object(JS::Object&);
-WEB_API bool is_platform_object(JS::Object const&);
-
-// The deserialization steps of an interface implemented in Rust create its object from what they read, rather than
-// fill in an object that was created before them. The record that they read is the Rust SerializationReader that the
-// deserialization passes on.
-WEB_API bool serializable_interface_is_implemented_in_rust(InterfaceName);
-WEB_API WebIDL::ExceptionOr<GC::Ref<JS::HostObject>> deserialize_rust_platform_object(InterfaceName, JS::Realm&, void* serialized);
 
 }

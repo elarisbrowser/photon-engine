@@ -10,15 +10,45 @@
 #include <AK/DistinctNumeric.h>
 #include <AK/Variant.h>
 #include <LibCompositing/Forward.h>
+#include <LibCore/Forward.h>
 #include <LibGC/Forward.h>
 #include <LibGfx/Forward.h>
+#include <LibHTTP/Forward.h>
 #include <LibIPC/Forward.h>
 #include <LibJS/Forward.h>
+#include <LibURL/Forward.h>
 #include <LibWeb/Bindings/Forward.h>
 #include <LibWeb/CSS/StyleEngineIdentifiers.h>
 #include <LibWeb/CSS/StyleRecordID.h>
 #include <LibWeb/Export.h>
 #include <LibWebCommon/Forward.h>
+
+namespace Gfx {
+
+class Typeface;
+
+}
+
+namespace Web::Fetch::Engine {
+
+class FetchBodyDeliveryGate;
+class FetchByteChannel;
+class FetchEngineRecord;
+class WholeBodyTransport;
+
+}
+
+// NB: The fetch engine can't include LibGC, so these are declared here. A whole-body transport keeps the callbacks
+//     that fetch gives it, which hold the cells they use in roots.
+GC_UNTRACED_CAPTURE(Web::Fetch::Engine::FetchBodyDeliveryGate);
+GC_UNTRACED_CAPTURE(Web::Fetch::Engine::FetchByteChannel);
+GC_UNTRACED_CAPTURE(Web::Fetch::Engine::FetchEngineRecord);
+GC_UNTRACED_CAPTURE_WITH_ROOTED_CALLBACKS(Web::Fetch::Engine::WholeBodyTransport);
+GC_UNTRACED_CAPTURE(Gfx::Typeface);
+GC_UNTRACED_CAPTURE(HTTP::HeaderList);
+GC_UNTRACED_CAPTURE(HTTP::MemoryCache);
+GC_UNTRACED_CAPTURE(URL::URL);
+GC_UNTRACED_CAPTURE(URL::Origin);
 
 namespace Web {
 
@@ -49,7 +79,6 @@ class CompositorConnection;
 class CompositorContextHandle;
 class CompositorHost;
 class NavigablePresenter;
-struct CompositorFrame;
 
 }
 
@@ -187,7 +216,6 @@ class SFrameTransformErrorEvent;
 namespace Web::Clipboard {
 
 class Clipboard;
-class ClipboardItem;
 
 }
 
@@ -215,10 +243,7 @@ class CookieStore;
 
 namespace Web::CredentialManagement {
 
-class Credential;
 class CredentialsContainer;
-class FederatedCredential;
-class PasswordCredential;
 
 }
 
@@ -349,7 +374,6 @@ enum class LayoutTreeRebuildRoot : u8;
 enum class MediaFeatureID : u8;
 enum class PropertyID : u16;
 enum class ValueType : u8;
-enum class AnimatedPropertyResultOfTransition : u8;
 
 enum class AbsoluteSize : u8;
 enum class AnchorSize : u8;
@@ -410,7 +434,6 @@ struct ColorResolutionStyle;
 struct ComputationContext;
 struct CustomPropertyRegistration;
 struct LogicalAliasMappingContext;
-struct NormalGap;
 struct RequiredInvalidationAfterStyleChange;
 
 // https://drafts.css-houdini.org/css-typed-om-1/#typedefdef-cssnumberish
@@ -539,9 +562,7 @@ class FileSystemEntry;
 
 namespace Web::EventTiming {
 
-class EventCounts;
 class PerformanceEventTiming;
-struct WindowEventTimingState;
 
 }
 
@@ -561,6 +582,12 @@ class FetchBodyDeliveryGate;
 class FetchByteChannel;
 class NetworkTransportHandle;
 class WholeBodyTransport;
+
+}
+
+namespace Web::Fetch::Engine::Event {
+
+struct NetworkActivity;
 
 }
 
@@ -658,6 +685,7 @@ class DataTransfer;
 class DataTransferItem;
 class DataTransferItemList;
 class DecodedImageData;
+class DedicatedWorkerThreadLink;
 class DocumentState;
 class DOMParser;
 class DOMStringList;
@@ -757,6 +785,7 @@ class HTMLUListElement;
 class HTMLUnknownElement;
 class HTMLVideoElement;
 class ImageBitmap;
+class ImageBitmapRenderingContext;
 class ImageData;
 class ImageRequest;
 class ListOfAvailableImages;
@@ -796,7 +825,7 @@ class RadioNodeList;
 class RemoteNavigable;
 class RemoteWindow;
 class Sanitizer;
-struct SanitizerConfiguration;
+class SanitizerConfiguration;
 class ScriptRegistry;
 class SessionHistoryEntry;
 class SharedResourceRequest;
@@ -813,13 +842,13 @@ class Timer;
 class TimeRanges;
 class ToggleEvent;
 class TrackEvent;
-class TransferDataDecoder;
 class UserActivation;
 class UserScrollGestureHold;
 class ValidityState;
 class VideoPlaybackQuality;
 class VideoTrack;
 class VideoTrackList;
+class VisibilityStateEntry;
 class Window;
 class WindowEnvironmentSettingsObject;
 class WindowProxy;
@@ -848,6 +877,7 @@ enum class RequireWellFormed;
 enum class SelectionDirection : u8;
 
 struct Agent;
+class ScriptAbortHandle;
 struct DeserializedTransferRecord;
 struct Environment;
 struct EnvironmentSettingsObject;
@@ -892,6 +922,7 @@ class IntersectionObserverEntry;
 namespace Web::Layout::RustFFI {
 
 struct BegunRead;
+enum class FfiTextCaretMovement : u8;
 
 }
 
@@ -943,9 +974,7 @@ namespace Web::MimeSniff {
 
 namespace Web::NavigationTiming {
 
-class PerformanceNavigation;
 class PerformanceNavigationTiming;
-class PerformanceTiming;
 
 }
 
@@ -978,8 +1007,6 @@ class DocumentPaintState;
 namespace Web::PerformanceTimeline {
 
 class PerformanceEntry;
-class PerformanceObserver;
-class PerformanceObserverEntryList;
 
 }
 
@@ -1050,16 +1077,7 @@ using WorkerType = Bindings::WorkerType;
 
 namespace Web::Speech {
 
-class SpeechGrammar;
-class SpeechGrammarList;
-class SpeechRecognition;
-class SpeechRecognitionAlternative;
-class SpeechRecognitionEvent;
-class SpeechRecognitionResult;
-class SpeechRecognitionResultList;
 class SpeechSynthesis;
-class SpeechSynthesisUtterance;
-class SpeechSynthesisVoice;
 
 }
 
@@ -1137,6 +1155,7 @@ class SVGPatternElement;
 class SVGPolygonElement;
 class SVGPolylineElement;
 class SVGRectElement;
+class SVGResourceDocument;
 class SVGScriptElement;
 class SVGSetElement;
 class SVGSVGElement;
@@ -1144,6 +1163,7 @@ class SVGSwitchElement;
 class SVGSymbolElement;
 class SVGTitleElement;
 class SVGTransformList;
+class SVGUseElement;
 class SVGViewElement;
 class TimeEvent;
 
@@ -1167,13 +1187,6 @@ class UIEvent;
 namespace Web::DOMURL {
 
 class URLSearchParams;
-
-}
-
-namespace Web::UserTiming {
-
-class PerformanceMark;
-class PerformanceMeasure;
 
 }
 
@@ -1248,9 +1261,7 @@ struct InputState;
 namespace Web::WebLocks {
 
 class Lock;
-class LockData;
 class LockManager;
-class LockRequest;
 class NavigatorLocks;
 
 }
@@ -1271,10 +1282,7 @@ class VTTRegion;
 namespace Web::XHR {
 
 class FormData;
-class ProgressEvent;
 class XMLHttpRequest;
-class XMLHttpRequestEventTarget;
-class XMLHttpRequestUpload;
 
 struct FormDataEntry;
 

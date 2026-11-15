@@ -25,7 +25,8 @@ GC_DEFINE_ALLOCATOR(RemoteNavigable);
 
 HashTable<GC::RawRef<RemoteNavigable>>& all_remote_navigables()
 {
-    static NeverDestroyed<HashTable<GC::RawRef<RemoteNavigable>>> set;
+    // NB: Worker agents have no navigables, and these are cells of the window agent's heap.
+    static thread_local NeverDestroyed<HashTable<GC::RawRef<RemoteNavigable>>> set;
     return *set;
 }
 
@@ -95,21 +96,15 @@ void RemoteNavigable::replace_child(Navigable& child, GC::Ref<Navigable> replace
     m_children[*index] = replacement;
 }
 
+// The WindowProxy of a navigable hosted by another process answers every access on the cross-origin path, so it
+// belongs to no realm.
 GC::Ptr<WindowProxy> RemoteNavigable::active_window_proxy()
 {
-    // The WindowProxy of a navigable hosted by another process answers every access on the cross-origin path. It lives
-    // in the realm of the script asking for it.
-    return active_window_proxy_in_realm_of(current_window());
-}
-
-// Outside script, the caller gives the window it hands the WindowProxy to.
-GC::Ref<WindowProxy> RemoteNavigable::active_window_proxy_in_realm_of(Window& window)
-{
     if (!m_window_proxy) {
-        m_window_proxy = WindowProxy::create(relevant_realm(window));
+        m_window_proxy = WindowProxy::create(vm().empty_realm());
         m_window_proxy->set_window(active_window());
     }
-    return *m_window_proxy;
+    return m_window_proxy;
 }
 
 GC::Ptr<WindowProxy> RemoteNavigable::active_browsing_context_opener_window_proxy() const

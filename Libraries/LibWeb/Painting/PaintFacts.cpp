@@ -14,6 +14,7 @@
 #include <LibWeb/HTML/HTMLInputElement.h>
 #include <LibWeb/HTML/HTMLMapElement.h>
 #include <LibWeb/HTML/HTMLVideoElement.h>
+#include <LibWeb/HTML/ImageBitmapRenderingContext.h>
 #include <LibWeb/HTML/LocalNavigable.h>
 #include <LibWeb/HTML/NavigableContainer.h>
 #include <LibWeb/HTML/RemoteNavigable.h>
@@ -62,13 +63,25 @@ void push_form_control_paint_facts(HTML::HTMLInputElement& input)
 
 static void queue_canvas_paint_facts(HTML::HTMLCanvasElement const& canvas)
 {
+    // NB: The output bitmap of an ImageBitmapRenderingContext is painted as the image of the canvas.
+    if (auto const* bitmap_renderer = canvas.canvas_bitmap_renderer_context()) {
+        Layout::RustFFI::FfiReplacedImagePaintFacts image_facts {};
+        if (auto const* frame = bitmap_renderer->frame()) {
+            image_facts.content.kind = Layout::RustFFI::FfiImageContentKind::Raster;
+            image_facts.content.frame = frame;
+        }
+        queue_element_paint_facts(canvas, [&](auto* host, u32 element) {
+            Layout::RustFFI::render_state_set_element_image_paint_facts(host, element, image_facts);
+        });
+        return;
+    }
+
     Layout::RustFFI::FfiCanvasPaintFacts facts {};
     if (auto content_size = canvas.canvas_surface_content_size(); content_size.has_value()) {
         facts.has_content = true;
         facts.content_width = content_size->width();
         facts.content_height = content_size->height();
         facts.canvas_id = canvas.canvas_id().value().value();
-        facts.content_generation = canvas.content_generation();
     }
     // Where the facts changed, the canvas's paint cache goes with them.
     queue_element_paint_facts(canvas, [&](auto* host, u32 element) {
@@ -215,9 +228,12 @@ template<typename Queue>
 static void with_replaced_image_paint_facts(Layout::ImageProvider const& image_provider, Queue queue)
 {
     Optional<Gfx::DecodedImageFrame> current_frame;
+    auto preserve_aspect_ratio = image_provider.preserve_aspect_ratio();
     Layout::RustFFI::FfiReplacedImagePaintFacts facts {
         .natural = natural_size_facts(image_provider.intrinsic_width(), image_provider.intrinsic_height(), image_provider.intrinsic_aspect_ratio()),
         .content = image_content_facts(image_provider.decoded_image_data(), current_frame),
+        .preserve_aspect_ratio_align = static_cast<u8>(to_underlying(preserve_aspect_ratio.align)),
+        .preserve_aspect_ratio_meet_or_slice = static_cast<u8>(to_underlying(preserve_aspect_ratio.meet_or_slice)),
     };
     queue(facts);
 }

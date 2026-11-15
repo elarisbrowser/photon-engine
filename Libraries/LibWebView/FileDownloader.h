@@ -20,6 +20,7 @@
 #include <AK/Time.h>
 #include <AK/WeakPtr.h>
 #include <AK/Weakable.h>
+#include <LibHTTP/Cookie/Cookie.h>
 #include <LibHTTP/Forward.h>
 #include <LibRequests/CacheState.h>
 #include <LibRequests/Forward.h>
@@ -93,7 +94,7 @@ public:
     u64 download_file(IsPrivate, ByteString profile_identity, URL::URL const&, LexicalPath, MayReplaceDestination = MayReplaceDestination::No);
     using ResponseFinished = Function<void(u64 decoded_body_size, Requests::RequestTimingInfo const*,
         Optional<StringView> error)>;
-    u64 adopt_download(IsPrivate, ByteString profile_identity, URL::URL const&, LexicalPath, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ReadonlyBytes initial_data = {}, ResponseFinished = {});
+    u64 adopt_download(IsPrivate, ByteString profile_identity, URL::URL const&, LexicalPath, Optional<u64> total_size, HTTP::Cookie::SameSiteContext, int request_server_client_id, u64 request_server_request_id, int owner_client_id, ReadonlyBytes initial_data = {}, ResponseFinished = {});
     u64 start_download(IsPrivate, ByteString profile_identity, URL::URL const&, LexicalPath, Optional<u64> total_size = {}, MayReplaceDestination = MayReplaceDestination::No);
     bool has_active_downloads() const;
     bool has_unresumable_downloads() const;

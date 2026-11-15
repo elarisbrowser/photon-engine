@@ -56,9 +56,10 @@ impl GeneratingFunction {
 
     pub fn bytecode_executable(self, vm: &Vm) -> Gc<Executable> {
         match self {
+            // NB: The generating function runs, so its executable is not flushed.
             GeneratingFunction::Ecmascript(function) => function
                 .bytecode_executable()
-                .expect("a generating function is compiled before it is called"),
+                .expect("a generating function is compiled while it runs"),
             GeneratingFunction::NativeJavaScriptBacked(function) => function.bytecode_executable(vm).must(),
         }
     }
@@ -189,13 +190,7 @@ impl GeneratorObject {
         execute: GeneratorExecuteFunction,
     ) -> GeneratorObject {
         GeneratorObject {
-            base: Object::new_with_realm_and_prototype(
-                vm,
-                class,
-                realm,
-                prototype,
-                MayInterfereWithIndexedPropertyAccess::No,
-            ),
+            base: Object::new_with_prototype(vm, class, realm, prototype, MayInterfereWithIndexedPropertyAccess::No),
             execution_context: GcRefCell::new(Some(execution_context)),
             generating_executable: Cell::new(None),
             yield_continuation: Cell::new(ExecutionContext::NO_YIELD_CONTINUATION),
@@ -251,6 +246,14 @@ impl GeneratorObject {
             .as_ref()
             .expect("a live generator has its execution context")
             .as_non_null()
+    }
+
+    /// The Realm of [[GeneratorContext]], until the generator completes.
+    pub fn realm_of_context(&self) -> Option<Gc<Realm>> {
+        self.execution_context
+            .borrow()
+            .as_ref()
+            .and_then(|context| context.realm.get())
     }
 
     /// Once a generator enters the completed state it never leaves it and its associated execution context is never

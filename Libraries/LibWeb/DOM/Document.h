@@ -139,9 +139,7 @@ enum class StyleEnvironmentChange : u8 {
 AK_ENUM_BITWISE_OPERATORS(StyleEnvironmentChange);
 
 #define ENUMERATE_INVALIDATE_LAYOUT_TREE_REASONS(X) \
-    X(InternalsFullRebuildComparison)               \
-    X(BackgroundTabMemoryReclamation)                \
-    X(TopLayerElementStillRenderedAfterRemoval)
+    X(InternalsFullRebuildComparison)
 
 enum class InvalidateLayoutTreeReason {
 #define ENUMERATE_INVALIDATE_LAYOUT_TREE_REASON(e) e,
@@ -157,6 +155,7 @@ enum class InvalidateLayoutTreeReason {
 // when it reads geometry as well, and neither is anything that mutates. False is the conservative
 // answer, and is what every reason whose call sites have not been checked keeps.
 #define ENUMERATE_UPDATE_LAYOUT_REASONS(X)          \
+    X(AnimationCommitStyles, false)                 \
     X(AutoScrollSelection, false)                   \
     X(ChildDocumentStyleUpdate, false)              \
     X(CursorLineNavigation, true)                   \
@@ -192,6 +191,7 @@ enum class InvalidateLayoutTreeReason {
     X(EventHandlerPointerCaptureEvents, false)      \
     X(EventHandlerRunActivationBehavior, false)     \
     X(EventHandlerShowContextMenu, false)           \
+    X(EventHandlerTargetNodeAtPosition, false)      \
     X(FontFaceSetReady, false)                      \
     X(HTMLElementGetTheTextSteps, false)            \
     X(HTMLElementOffsetHeight, true)                \
@@ -223,6 +223,7 @@ enum class InvalidateLayoutTreeReason {
     X(ResolvedCSSStyleDeclarationProperty, false)   \
     X(SVGDecodedImageDataRender, false)             \
     X(ScrollCursorIntoView, false)                  \
+    X(ScrollTimelineSource, false)                  \
     X(ProcessScreenshot, false)                     \
     X(SVGGraphicsElementGetBBox, true)              \
     X(SVGGraphicsElementGetCTM, false)              \
@@ -230,6 +231,7 @@ enum class InvalidateLayoutTreeReason {
     X(SVGLengthValue, false)                        \
     X(SVGPathLength, false)                         \
     X(SVGTextContentElementTextQuery, true)         \
+    X(ViewTimelineSource, false)                    \
     X(ViewTransitionCapture, false)                 \
     X(ViewTransitionPseudoElementStyles, false)     \
     X(WindowScroll, false)
@@ -256,8 +258,7 @@ enum class UpdateLayoutReason {
 
 #define ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_REASONS(X) \
     X(AnchorNamesUnregisteredByElementRemoval)       \
-    X(AnchorNamesUnregisteredByStyleChange)          \
-    X(ViewportPropagationSourceChangedByStyleChange)
+    X(AnchorNamesUnregisteredByStyleChange)
 
 enum class PartialRelayoutEscapeReason {
 #define ENUMERATE_PARTIAL_RELAYOUT_ESCAPE_REASON(e) e,
@@ -295,6 +296,14 @@ struct DocumentUnloadTimingInfo {
     HighResolutionTime::DOMHighResTimeStamp unload_event_end_time { 0 };
 };
 
+// The times are unsafe shared current times, as the document they are relative to is created after the unload.
+struct UnloadOfReplacedDocument {
+    URL::Origin origin;
+    HTML::CanUseCrossOriginIsolatedAPIs cross_origin_isolated_capability { HTML::CanUseCrossOriginIsolatedAPIs::No };
+    HighResolutionTime::DOMHighResTimeStamp unload_event_start_time { 0 };
+    HighResolutionTime::DOMHighResTimeStamp unload_event_end_time { 0 };
+};
+
 using PolicyControlledFeature = PermissionsPolicy::PolicyControlledFeature;
 
 struct PendingFullscreenEvent {
@@ -304,6 +313,8 @@ struct PendingFullscreenEvent {
     } type;
     GC::Ref<Element> element;
     Fullscreen::RequestType request_type;
+
+    void visit_edges(GC::Cell::Visitor&) const;
 };
 
 class WEB_API Document
@@ -347,7 +358,7 @@ public:
     // a counter style arriving, or another untracked environment input changing. A record taken under one version
     // answers for nothing once it moves.
     u64 style_environment_version() const { return m_style_environment_version; }
-    void bump_style_environment_version() { ++m_style_environment_version; }
+    void bump_style_environment_version();
     u64 next_counter_style_environment_identity()
     {
         auto identity = m_next_counter_style_environment_identity++;
@@ -638,13 +649,9 @@ public:
     void update_layout(UpdateLayoutReason, ThrottledAnimationSamplingScope);
     void update_style_and_layout_once(Layout::BegunRead const&, UpdateLayoutReason, ThrottledAnimationSamplingScope);
     void update_layout_if_needed_for_node(Node const&, UpdateLayoutReason);
-    [[nodiscard]] u64 partial_layout_count() const;
-    [[nodiscard]] u64 full_layout_count() const;
     [[nodiscard]] bool layout_is_up_to_date() const;
     [[nodiscard]] bool layout_is_known_stale() const;
     void clear_devtools_layout_inspection_data();
-    void prepare_for_rendering(Layout::BegunRead const& read);
-    void update_paint_and_hit_testing_properties_if_needed();
     void sample_animation_effects_needing_style_update();
     void update_style_computer_viewport_rect();
     bool needs_animated_style_update() const { return m_needs_animated_style_update; }
@@ -659,8 +666,8 @@ public:
     [[nodiscard]] bool is_running_update_layout() const;
 
     // The selection changed, or lost its range, so the selection states of the boxes it paints through are stale. They
-    // are found again at the next read of the paint state: the selection may change beside a frame in flight, which
-    // holds the boxes.
+    // are found again before the next recording: the selection may change beside a frame in flight, which holds the
+    // boxes.
     void note_selection_changed();
     // Writes the selection and find-in-page match states left stale to the paint state.
     void update_highlight_states_if_needed(Layout::BegunRead const&);
@@ -686,11 +693,8 @@ public:
     Painting::DocumentPaintState const& paint_state() const;
     // Whether the last layout committed a box whose `content-visibility` is `auto`.
     bool has_boxes_with_auto_content_visibility() const;
-    Compositing::AccumulatedVisualContextTree visual_context_tree() const;
 
     PaintTiming::DocumentPaintTimingState& paint_timing_state() { return m_paint_timing_state; }
-
-    Compositing::ScrollStateSnapshot const& scroll_state_snapshot() const;
 
     GC::Ref<NodeList> get_elements_by_name(Utf16View);
 
@@ -1171,6 +1175,8 @@ public:
         GC::Ref<EventTarget> event_target;
         Utf16FlyString event_type;
         bool operator==(PendingScrollEvent const&) const = default;
+
+        void visit_edges(GC::Cell::Visitor&) const;
     };
     bool append_pending_scroll_event(PendingScrollEvent);
     Vector<PendingScrollEvent>& pending_scroll_events() { return m_pending_scroll_events; }
@@ -1202,7 +1208,6 @@ public:
 
     // https://html.spec.whatwg.org/multipage/document-lifecycle.html#destroy-a-document
     void destroy();
-    void destroy_if_dropped_before_activation();
     // https://html.spec.whatwg.org/multipage/document-lifecycle.html#destroy-a-document-and-its-descendants
     void destroy_a_document_and_its_descendants(GC::Ptr<GC::Function<void()>> after_all_destruction = {});
 
@@ -1212,7 +1217,9 @@ public:
     void abort_a_document_and_its_descendants();
 
     // https://html.spec.whatwg.org/multipage/document-lifecycle.html#unload-a-document
-    void unload(GC::Ptr<Document> new_document = nullptr);
+    void unload(GC::Ptr<Document> new_document = nullptr, Optional<UnloadOfReplacedDocument>* unload_of_replaced_document = nullptr);
+    void take_unload_timing_of_replaced_document(UnloadOfReplacedDocument const&);
+    void set_window_is_taken_over_after_unload() { m_window_is_taken_over_after_unload = true; }
 
     // https://html.spec.whatwg.org/multipage/dom.html#active-parser
     GC::Ptr<HTML::HTMLParser> active_parser() const;
@@ -1236,7 +1243,7 @@ public:
         Yes,
     };
     WebIDL::ExceptionOr<bool> exec_command(Utf16FlyString const& command, bool show_ui, TrustedTypes::TrustedHTMLOrString const& value);
-    WebIDL::ExceptionOr<bool> exec_command_internal(Utf16FlyString const& command, bool show_ui, Utf16View value, DispatchInputEvent, Optional<Utf16FlyString> const& user_input_type = {}, GC::Ptr<StaticRange> deletion_range = nullptr);
+    WebIDL::ExceptionOr<bool> exec_command_internal(Utf16FlyString const& command, bool show_ui, Utf16View value, DispatchInputEvent, Optional<Utf16FlyString> const& user_input_type = {}, GC::Ptr<StaticRange> deletion_range = nullptr, GC::Ptr<DocumentFragment> pasted_fragment = nullptr);
     WebIDL::ExceptionOr<bool> query_command_enabled(Utf16FlyString const& command);
     WebIDL::ExceptionOr<bool> query_command_indeterm(Utf16FlyString const& command);
     WebIDL::ExceptionOr<bool> query_command_state(Utf16FlyString const& command);
@@ -1378,6 +1385,9 @@ public:
 
     HashMap<HTML::SharedResourceRequest::Key, GC::Ptr<HTML::SharedResourceRequest>>& shared_resource_requests();
     HashMap<HTML::SharedResourceRequest::Key, GC::Ptr<HTML::SharedResourceRequest>> const& shared_resource_requests() const;
+    HashMap<URL::URL, GC::Ref<SVG::SVGResourceDocument>>& svg_resource_documents() { return m_svg_resource_documents; }
+    GC::Ptr<Document> svg_resource_document_owner() const { return m_svg_resource_document_owner; }
+    void set_svg_resource_document_owner(GC::Ref<Document> owner) { m_svg_resource_document_owner = owner; }
     CSS::ImageStyleValueResource* css_image_resource(URL::URL const&);
     CSS::ImageStyleValueResource& create_css_image_resource(CSS::ImageStyleValueResourceKey, GC::Ref<HTML::SharedResourceRequest>);
     void remove_css_image_resource_if_unused(CSS::ImageStyleValueResourceKey const&);
@@ -1415,6 +1425,8 @@ public:
         GC::Ref<Animations::Animation> animation;
         GC::Ref<DOM::EventTarget> target;
         Optional<double> scheduled_event_time;
+
+        void visit_edges(GC::Cell::Visitor&) const;
     };
     void append_pending_animation_event(PendingAnimationEvent const&);
     void update_animations_and_send_events(double timestamp);
@@ -1463,43 +1475,16 @@ public:
 
     void set_needs_animated_style_update(Animations::KeyframeEffect&);
 
-    // Test-only counters for observing style invalidation and recomputation work. See Internals.idl.
-    struct StyleInvalidationCounters {
+    // What the style updates of the document measured, for the style update capture tools, and how often a style
+    // update stopped at its pass guard.
+    struct StyleUpdateStatistics {
         // A run consumes one non-empty semantic reaction batch. The element count includes derived
         // inheritance reactions; the published count names reactions emitted at the transaction
         // boundary before that propagation.
         u64 style_engine_reaction_batch_runs { 0 };
         u64 style_engine_reaction_elements { 0 };
         u64 style_engine_published_reactions { 0 };
-        u64 layout_style_record_publications { 0 };
-        // Animation frames that rebuilt only the groups the animated properties write, against
-        // frames that had to rebuild the whole style.
-        u64 animation_frame_pump_requests { 0 };
-        u64 animation_style_skip_cache_hits { 0 };
-        u64 animation_style_skip_cache_misses { 0 };
-        u64 animation_timeline_synchronizations { 0 };
-        u64 animation_timeline_associated_animation_updates { 0 };
-        u64 compositor_visual_animation_updates { 0 };
-        u64 compositor_visual_animation_timing_anchor_updates { 0 };
-        u64 compositor_keyframe_value_resolutions { 0 };
-        u64 style_stabilization_epochs { 0 };
-        u64 style_stabilization_feedback_epochs { 0 };
-        u64 provisional_style_passes { 0 };
-        u64 style_stabilization_round_guard_hits { 0 };
         u64 style_update_pass_guard_hits { 0 };
-        // What sorting animations in tree order asked of the tree itself, rather than of the document's tree positions.
-        u64 composite_order_document_position_compares { 0 };
-        u64 exact_stabilization_passes { 0 };
-        u64 style_stabilization_bound_failures { 0 };
-        u64 provisional_animation_events { 0 };
-        u64 committed_animation_events { 0 };
-        u64 provisional_transition_decisions { 0 };
-        u64 superseded_provisional_transition_decisions { 0 };
-        u64 committed_transition_actions { 0 };
-        u64 committed_transitions_started { 0 };
-        u64 media_rule_evaluations { 0 };
-        u64 registered_properties_cache_rebuilds { 0 };
-        u64 style_query_container_scans { 0 };
         u64 style_engine_transaction_setups { 0 };
         u64 style_engine_transaction_setup_microseconds { 0 };
         // Exclusive intervals within style_update_microseconds. Rust phases subdivide bridge.
@@ -1507,21 +1492,15 @@ public:
         u64 style_update_bridge_microseconds { 0 };
         u64 style_update_apply_microseconds { 0 };
         u64 style_update_remainder_microseconds { 0 };
-        u64 relayouts_performed { 0 };
         u64 style_update_microseconds { 0 };
     };
-    StyleInvalidationCounters& style_invalidation_counters() const { return m_style_invalidation_counters; }
-    void reset_style_invalidation_counters(Layout::BegunRead const& read) const;
-
-    // Confinement report of the most recent layout tree build, for tests observing whether a
-    // partial rebuild stayed inside its rebuilt subtrees.
-    [[nodiscard]] Layout::RustFFI::FfiLayoutCounts layout_counts() const;
+    StyleUpdateStatistics& style_update_statistics() const { return m_style_update_statistics; }
 
     enum class AccumulatedVisualContextUpdateScope : u8 {
         Values,
         Structure,
     };
-    void set_needs_accumulated_visual_contexts_update(bool);
+    void set_needs_accumulated_visual_contexts_update();
     void set_image_map_areas_need_publication() { m_image_map_areas_need_publication = true; }
     [[nodiscard]] bool take_image_map_areas_need_publication() { return exchange(m_image_map_areas_need_publication, false); }
     void note_svg_paint_resources_changed();
@@ -1602,12 +1581,7 @@ public:
     void remove_an_element_from_the_top_layer_immediately(GC::Ref<Element>);
     void process_top_layer_removals();
 
-    void set_top_layer_needs_layout_zone_rebuild() { m_top_layer_needs_layout_zone_rebuild = true; }
-
     OrderedHashTable<GC::Ref<Element>> const& top_layer_elements() const { return m_top_layer_elements; }
-    // Only a member of the top layer, or an element whose membership changed since the top layer boxes were built, can
-    // have a box placed in the top layer.
-    bool may_have_boxes_placed_in_top_layer() const { return !m_top_layer_elements.is_empty() || !m_elements_with_pending_top_layer_membership_change.is_empty(); }
     bool top_layer_pending_removals_contains(GC::Ref<Element> element) const { return m_top_layer_pending_removals.contains(element); }
 
     // AD-HOC: These lists are managed dynamically instead of being generated as needed.
@@ -1660,6 +1634,8 @@ public:
 
     i64 cursor_blink_cycle_start_time_ns() const { return m_cursor_blink_cycle_start_time_ns; }
 
+    URL::Origin site_for_cookies() const;
+
     // Back-pointer to the navigable whose active document is this document.
     // Maintained by LocalNavigable when it sets/clears its active document.
     GC::Ptr<HTML::LocalNavigable> navigable() const;
@@ -1673,8 +1649,9 @@ public:
         set_needs_repaint(should_invalidate_display_list);
     }
 
-    // Records the document's display list in step with the host, once a recording in flight has been taken in.
-    RefPtr<Compositing::DisplayList> record_display_list(Layout::BegunRead const& read, HTML::PaintConfig, Compositing::DisplayListResourceStorage&, Painting::PaintCommandCacheMode);
+    // Records the document's display list in step with the host, once a recording in flight has been taken in, and
+    // answers whether it had a box to record.
+    bool record_display_list(Layout::BegunRead const& read, HTML::PaintConfig, Painting::PaintCommandCacheMode);
     // Starts recording the document's display list as the document is now, beside the event loop where `blocker` is
     // none, taking `flight`, if any, to present its frame with, and makes the display list of a recording that has
     // landed.
@@ -1682,22 +1659,17 @@ public:
     // Commits the navigable's next frame, a recording of the document, to the render owner, which presents it with
     // `presentation` beside the event loop.
     Painting::DisplayListRecording commit_display_list_recording(Layout::BegunRead const& read, HTML::PaintConfig, Compositor::FlightPresentation&& presentation);
-    RefPtr<Compositing::DisplayList> finish_display_list_recording(Layout::BegunRead const& read, Painting::DisplayListRecording const&, Compositing::DisplayListResourceStorage&, Painting::HitTestListStands = Painting::HitTestListStands::Yes);
-    // Takes in `display_list`, which `recording` published: the paint command cache source, and the hit-test list it made,
-    // read in `hit_test_list_read`, where that still stands for the document's boxes. Where none does, nothing is read.
-    Painting::HitTestListAdoption adopt_published_recording(Optional<Layout::BegunRead const&> hit_test_list_read, Painting::DisplayListRecording const&, NonnullRefPtr<Compositing::DisplayList>, Function<Compositing::DisplayListResourceSet()> const& referenced_resources);
+    void finish_display_list_recording(Layout::BegunRead const& read, Painting::DisplayListRecording const&, Painting::HitTestListStands = Painting::HitTestListStands::Yes);
+    // Takes in the hit-test list `recording` made, read in `hit_test_list_read`, where that still stands for the
+    // document's boxes. Where none does, nothing is read.
+    Painting::HitTestListAdoption adopt_published_recording(Optional<Layout::BegunRead const&> hit_test_list_read, Painting::DisplayListRecording const&);
     // Indicates whether a query of the hit test list would require a synchronous update to it.
     [[nodiscard]] bool hit_test_display_list_is_current(Layout::BegunRead const& read);
     // Where a visual animation sample time is given, the hit test reads the compositor's animations at that time, as a
     // frame of the compositor's shows them.
     Optional<Painting::HitTestQuery> prepare_hit_test_query(Layout::BegunRead const& read, Optional<i64> visual_animation_sample_time_nanoseconds = {});
     Optional<Painting::HitTestResult> hit_test(Layout::BegunRead const& read, CSSPixelPoint, Optional<i64> visual_animation_sample_time_nanoseconds = {});
-    Optional<Painting::CaretPosition> caret_position_from_point(Layout::BegunRead const& read, CSSPixelPoint);
-    Optional<Painting::CaretPosition> caret_position_from_point_for_selection_start(Layout::BegunRead const& read, CSSPixelPoint);
-    Optional<Painting::CaretPosition> caret_position_from_point_for_selection(Layout::BegunRead const& read, CSSPixelPoint, GC::Ptr<Node const> constraint_scope = nullptr);
-    Optional<Painting::CaretPosition> caret_position_at_line_edge(Layout::BegunRead const& read, Node const&, size_t offset, TextAffinity, Painting::CaretLineEdge);
-    Optional<Painting::CaretPosition> caret_position_on_adjacent_line(Layout::BegunRead const& read, Node const&, size_t offset, TextAffinity, Painting::CaretLineDirection, CSSPixels inline_coordinate, Node const& scope);
-    Optional<CSSPixels> caret_line_block_coordinate(Layout::BegunRead const& read, Node const&, size_t offset, TextAffinity);
+    Optional<Painting::CaretPosition> caret_position_from_point(Layout::BegunRead const& read, CSSPixelPoint, GC::Ptr<Node const> constraint_scope = nullptr);
     using CaretPositionFromPointOptions = Bindings::CaretPositionFromPointOptions;
     GC::Ptr<CaretPosition> caret_position_from_point(double x, double y, CaretPositionFromPointOptions const&);
     TraversalDecision hit_test_all(Layout::BegunRead const& read, CSSPixelPoint, Function<TraversalDecision(Painting::HitTestResult)> const&);
@@ -1860,7 +1832,7 @@ public:
     void for_each_registered_custom_property(Function<void(CSS::CustomPropertyRegistration const&)> const&) const;
     size_t custom_property_registration_generation() const { return m_custom_property_registration_generation; }
     void const* rust_custom_property_registry() const { return m_rust_custom_property_registry; }
-    void did_change_custom_property_registrations(Optional<Utf16FlyString> registered_property_set_change = {});
+    void did_change_custom_property_registrations();
 
     CSS::StyleScope const& style_scope() const { return m_style_scope; }
     CSS::StyleScope& style_scope() { return m_style_scope; }
@@ -1901,6 +1873,8 @@ protected:
 private:
     bool update_is_fully_active() const;
     bool compute_is_fully_active() const;
+
+    void queue_a_new_visibility_state_entry(HTML::VisibilityState, HighResolutionTime::DOMHighResTimeStamp timestamp);
 
     // Records the document's viewport for the host to publish, or, given `committed`, commits the recording.
     Optional<Painting::DisplayListRecording> start_recording(Layout::BegunRead const&, HTML::PaintConfig, Painting::PaintCommandCacheMode, Optional<Compositor::FlightPresentation>&& committed);
@@ -1945,6 +1919,7 @@ private:
     void collect_boxes_with_auto_content_visibility(Layout::BegunRead const& read);
     bool needs_style_update_after_layout(Layout::BegunRead const& read);
     Layout::RustFFI::FfiLayoutUpdateHostCallbacks layout_update_host_callbacks();
+    Layout::RustFFI::FfiPaintPreparationHostCallbacks paint_preparation_host_callbacks();
 
     void process_pending_list_item_renumbers();
     bool reconcile_stale_list_item_counters_after_tree_build(ReadonlySpan<Layout::RustFFI::FfiNodeIdentity> rebuilt_roots);
@@ -2163,6 +2138,8 @@ private:
     GC::Ptr<Element> m_current_script;
 
     u32 m_ignore_destructive_writes_counter { 0 };
+    size_t m_document_write_depth { 0 };
+    bool m_document_write_limit_reached { false };
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#unload-counter
     u32 m_unload_counter { 0 };
@@ -2188,6 +2165,8 @@ private:
 
     // https://html.spec.whatwg.org/multipage/browsing-the-web.html#concept-document-salvageable
     bool m_salvageable { true };
+
+    bool m_window_is_taken_over_after_unload { false };
 
     // https://html.spec.whatwg.org/multipage/document-lifecycle.html#page-showing
     bool m_page_showing { false };
@@ -2417,6 +2396,12 @@ private:
     RefPtr<HTML::SessionHistoryEntry> m_latest_entry;
 
     HashMap<HTML::SharedResourceRequest::Key, GC::Ptr<HTML::SharedResourceRequest>> m_shared_resource_requests;
+
+    // The documents that use elements of this document refer to, by URL.
+    HashMap<URL::URL, GC::Ref<SVG::SVGResourceDocument>> m_svg_resource_documents;
+
+    // For a document that a use element's reference loaded, the document whose resource documents it shares.
+    GC::Ptr<Document> m_svg_resource_document_owner;
     HashMap<URL::URL, OwnPtr<CSS::ImageStyleValueResource>> m_css_image_resources;
     // NB: The resources of url() values with request modifiers. m_css_image_resources holds those without any, which
     //     most url() values are.
@@ -2476,7 +2461,6 @@ private:
 
     bool m_design_mode_enabled { false };
 
-    bool m_needs_accumulated_visual_contexts_update { false };
     bool m_image_map_areas_need_publication { false };
 
     HashMap<Web::AsyncScrollNodeStableID, Compositing::SnappedAreas> m_scroll_container_snapped_areas;
@@ -2500,7 +2484,7 @@ private:
     // the next recording. Rotated only by cache-read-write recordings; survives display list invalidation.
     Optional<CSSPixelRect> m_caret_hit_test_debug_rect;
 
-    mutable StyleInvalidationCounters m_style_invalidation_counters;
+    mutable StyleUpdateStatistics m_style_update_statistics;
 
     mutable GC::Ptr<WebIDL::ObservableArray> m_adopted_style_sheets;
 
@@ -2545,7 +2529,6 @@ private:
     OrderedHashTable<GC::Ref<Element>> m_top_layer_elements;
     OrderedHashTable<GC::Ref<Element>> m_top_layer_pending_removals;
     Vector<GC::Ref<Element>> m_elements_with_pending_top_layer_membership_change;
-    bool m_top_layer_needs_layout_zone_rebuild { false };
 
     Vector<GC::Ref<HTML::HTMLElement>> m_showing_auto_popover_list;
     Vector<GC::Ref<HTML::HTMLElement>> m_showing_hint_popover_list;

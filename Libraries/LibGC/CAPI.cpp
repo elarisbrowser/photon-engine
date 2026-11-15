@@ -5,7 +5,6 @@
  */
 
 #include <AK/StdLibExtras.h>
-#include <LibCore/AnonymousBuffer.h>
 #include <LibCore/System.h>
 #include <LibGC/BlockAllocator.h>
 #include <LibGC/CAPI.h>
@@ -14,6 +13,7 @@
 #include <LibGC/HeapRegion.h>
 #include <LibGC/PrimitiveStorage.h>
 #include <LibGC/Root.h>
+#include <LibGC/Rootable.h>
 #include <LibGC/Weak.h>
 
 namespace GC {
@@ -70,36 +70,13 @@ public:
         : CellAllocatorDescriptorBase(type_info, class_name, foreign_type)
     {
     }
-};
 
-class RootGatheringVisitor final : public Cell::Visitor {
-public:
-    explicit RootGatheringVisitor(HashMap<Cell*, HeapRoot>& roots)
-        : m_roots(roots)
+    ~CAPICellAllocator()
     {
+        // NB: The address of a descriptor without a foreign type names the type of its blocks, so it may never be reused.
+        VERIFY(foreign_type());
+        release_index();
     }
-
-    virtual void visit_possible_values(ReadonlyBytes) override
-    {
-        // NB: Roots are gathered precisely; a conservative range belongs in a ConservativeRangeProvider.
-        VERIFY_NOT_REACHED();
-    }
-
-private:
-    virtual void visit_impl(Cell& cell) override
-    {
-        m_roots.set(&cell, HeapRoot { .type = HeapRoot::Type::VM });
-    }
-
-    virtual void visit_impl(ReadonlySpan<NanBoxedValue> values) override
-    {
-        for (auto const& value : values) {
-            if (value.is_cell())
-                visit_impl(value.as_cell());
-        }
-    }
-
-    HashMap<Cell*, HeapRoot>& m_roots;
 };
 
 struct CAPI {
@@ -156,7 +133,7 @@ struct CAPI {
     static_assert(sizeof(RawPtr<Cell>) == sizeof(Cell*));
     static_assert(offsetof(CellAllocator::LocalFreeCells, free_list) == 0);
     static_assert(sizeof(FlatPtr) == sizeof(void*));
-    static CellAllocator::LocalFreeCells* local_free_cells(Heap& heap, CellAllocatorDescriptorBase& descriptor) { return descriptor.for_heap(heap).local_free_cells({}); }
+    static CellAllocator::LocalFreeCells* local_free_cells(Heap& heap, CellAllocatorDescriptorBase& descriptor) { return heap.cell_allocator_for(descriptor).local_free_cells({}); }
     static void set_foreign_context(Heap& heap, void* context) { heap.m_foreign_context = context; }
     static void* foreign_context(Heap& heap) { return heap.m_foreign_context; }
     static void defer_gc(Heap& heap) { heap.defer_gc(); }
@@ -227,14 +204,14 @@ uintptr_t gc_primitive_storage_cage_base(void)
     return js_primitive_storage_cage_base;
 }
 
-GCHeap* gc_heap_create(GCGatherRootsCallback gather_roots, void* context, bool become_process_default)
+GCHeap* gc_heap_create(GCGatherRootsCallback gather_roots, void* context, bool become_thread_default)
 {
     auto* heap = new Heap(
         [gather_roots, context](HashMap<Cell*, HeapRoot>& roots) {
-            RootGatheringVisitor visitor { roots };
+            Detail::RootGatheringVisitor visitor { roots, HeapRoot::Type::VM };
             gather_roots(context, reinterpret_cast<GCVisitor*>(static_cast<Cell::Visitor*>(&visitor)));
         },
-        become_process_default ? Heap::BecomeProcessDefault::Yes : Heap::BecomeProcessDefault::No);
+        become_thread_default ? Heap::BecomeThreadDefault::Yes : Heap::BecomeThreadDefault::No);
     CAPI::set_foreign_context(*heap, context);
     return reinterpret_cast<GCHeap*>(heap);
 }
@@ -254,6 +231,11 @@ void gc_heap_collect_garbage(GCHeap* heap, int collection_type, bool print_repor
 bool gc_heap_is_collecting_everything(GCHeap const* heap)
 {
     return as_heap(heap).is_collecting_everything();
+}
+
+bool gc_heap_is_marking_for_collection(GCHeap const* heap)
+{
+    return as_heap(heap).is_marking_for_collection();
 }
 
 void gc_heap_defer_gc(GCHeap* heap)
@@ -429,11 +411,6 @@ void gc_visitor_visit_ephemeron(GCVisitor* visitor, GCCell* key, uint64_t const*
     as_visitor(visitor).visit_ephemeron(*from_gc_cell(key), *reinterpret_cast<NanBoxedValue const*>(value));
 }
 
-void gc_visitor_visit_possible_values(GCVisitor* visitor, uint8_t const* data, size_t size)
-{
-    as_visitor(visitor).visit_possible_values(ReadonlyBytes { data, size });
-}
-
 bool gc_primitive_storage_allocate(size_t size, bool zero_fill, GCPrimitiveStorageHandle* out_handle, GCPrimitiveStorageLayout* out_layout)
 {
     auto& storage = PrimitiveStorage::the();
@@ -444,12 +421,6 @@ bool gc_primitive_storage_reserve(size_t size, size_t capacity, bool zero_fill, 
 {
     auto& storage = PrimitiveStorage::the();
     return store_created_primitive_storage(storage, storage.try_reserve(size, capacity, as_zero_fill_new_bytes(zero_fill), guard_size), out_handle, out_layout);
-}
-
-bool gc_primitive_storage_adopt_shared_fd(int fd, size_t size, GCPrimitiveStorageHandle* out_handle, GCPrimitiveStorageLayout* out_layout)
-{
-    auto& storage = PrimitiveStorage::the();
-    return store_created_primitive_storage(storage, storage.try_adopt_shared_fd(fd, size), out_handle, out_layout);
 }
 
 bool gc_primitive_storage_resize(GCPrimitiveStorageHandle handle, size_t new_size, bool zero_fill, GCPrimitiveStorageLayout* out_layout)
@@ -506,50 +477,5 @@ size_t gc_primitive_storage_committed_size(GCPrimitiveStorageHandle handle)
 uint8_t* gc_primitive_storage_data(GCPrimitiveStorageHandle handle)
 {
     return PrimitiveStorage::the().data(decode_primitive_storage_handle(handle));
-}
-
-bool gc_shared_memory_create(size_t size, int* out_fd)
-{
-    *out_fd = -1;
-    auto buffer = Core::AnonymousBuffer::create_with_size(size);
-    if (buffer.is_error())
-        return false;
-    // NB: The buffer closes its descriptor and unmaps its own view of the memory when it goes away; the caller gets a
-    //     duplicate of the descriptor.
-    auto fd = Core::System::dup(buffer.value().fd());
-    if (fd.is_error())
-        return false;
-    *out_fd = fd.value();
-    return true;
-}
-
-struct GCSharedMemoryViewOutsideCage {
-    AK_ALLOC_WITH_KMALLOC;
-
-    Core::AnonymousBuffer buffer;
-};
-
-GCSharedMemoryViewOutsideCage* gc_shared_memory_view_outside_cage_create(int fd, size_t size)
-{
-    if (size == 0)
-        return nullptr;
-    auto duplicate_fd = Core::System::dup(fd);
-    if (duplicate_fd.is_error())
-        return nullptr;
-    // NB: The buffer owns the duplicate from here on, and closes it if mapping fails.
-    auto buffer = Core::AnonymousBuffer::create_from_anon_fd(duplicate_fd.value(), size);
-    if (buffer.is_error() || buffer.value().validate_backing_size().is_error())
-        return nullptr;
-    return new GCSharedMemoryViewOutsideCage { buffer.release_value() };
-}
-
-uint8_t* gc_shared_memory_view_outside_cage_data(GCSharedMemoryViewOutsideCage* view)
-{
-    return view->buffer.data<uint8_t>();
-}
-
-void gc_shared_memory_view_outside_cage_destroy(GCSharedMemoryViewOutsideCage* view)
-{
-    delete view;
 }
 }

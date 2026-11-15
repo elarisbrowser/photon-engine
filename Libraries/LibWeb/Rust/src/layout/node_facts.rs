@@ -555,6 +555,12 @@ pub(crate) fn node_creates_block_formatting_context(
         // "If the list item is a block container: the marker box is a block container"
         || data.kind.get() == NodeKind::ListItemMarkerBox
         || has_flag(data, NodeFlag::UsesButtonLayout)
+        // https://www.w3.org/TR/CSS22/visuren.html#floats
+        // "The border box of a table, a block-level replaced element, or an element in the normal flow that establishes
+        // a new block formatting context [...] must not overlap the margin box of any floats in the same block
+        // formatting context as the element itself."
+        // NB: A native control whose box hosts its internal shadow tree is a replaced element all the same.
+        || has_flag(data, NodeFlag::IsReplacedElement)
     {
         return true;
     }
@@ -717,9 +723,11 @@ pub(crate) fn kind_and_style_make_scroll_container(kind: NodeKind, style: Option
     if kind == NodeKind::Viewport {
         return true;
     }
-    let Some(style) = style else {
-        return false;
-    };
+    style.is_some_and(style_makes_scroll_container)
+}
+
+/// Whether the overflow values of `style` make a box other than the viewport a scroll container.
+pub(crate) fn style_makes_scroll_container(style: ComputedValuesView<'_>) -> bool {
     let overflow_value_makes_box_a_scroll_container =
         |overflow_keyword: u8| matches!(overflow_keyword, overflow::AUTO | overflow::HIDDEN | overflow::SCROLL);
     overflow_value_makes_box_a_scroll_container(style.overflow_x())
@@ -743,6 +751,7 @@ pub(crate) fn kind_is_block_container(kind: NodeKind) -> bool {
         kind,
         NodeKind::BlockContainer
             | NodeKind::FieldSetBox
+            | NodeKind::FrameSetBox
             | NodeKind::LegendBox
             | NodeKind::ListItemBox
             | NodeKind::ListItemMarkerBox
@@ -786,6 +795,11 @@ pub(crate) fn kind_is_svg_resource_box(kind: NodeKind) -> bool {
         kind,
         NodeKind::SVGMaskBox | NodeKind::SVGClipBox | NodeKind::SVGPatternBox
     )
+}
+
+/// Whether a box of `kind` is SVG content: an `<svg>` box or a box below one.
+pub(crate) fn kind_is_svg_content(kind: NodeKind) -> bool {
+    kind_is_svg_box(kind) || kind == NodeKind::SVGSVGBox
 }
 
 pub(crate) fn kind_is_svg_box(kind: NodeKind) -> bool {
@@ -1015,8 +1029,20 @@ impl<'pass> NodeFacts<'pass> {
         kind_is_replaced_box(self.data().kind.get())
     }
 
+    /// https://drafts.csswg.org/css-sizing-3/#min-content-zero
+    /// A box whose cyclic percentage width resolves against zero for its min-content contribution: a replaced box, or a
+    /// compressible text control (a text entry input or a textarea).
+    pub(crate) fn resolves_cyclic_percentages_like_replaced_box(&self) -> bool {
+        self.is_replaced_box() || self.is_text_input() || self.data().kind.get() == NodeKind::TextAreaBox
+    }
+
     pub(crate) fn is_range_input_box(&self) -> bool {
         self.data().kind.get() == NodeKind::RangeInputBox
+    }
+
+    /// A checkbox or radio button box, which only exists while the control keeps its native appearance.
+    pub(crate) fn is_non_devolvable_widget(&self) -> bool {
+        kind_is_non_devolvable_widget(self.data().kind.get())
     }
 
     pub(crate) fn is_native_form_control_box(&self) -> bool {
@@ -1120,9 +1146,7 @@ impl<'pass> NodeFacts<'pass> {
         if kind_is_svg_box(data.kind.get()) || data.kind.get() == NodeKind::SVGForeignObjectBox {
             return false;
         }
-        if data.kind.get() == NodeKind::SVGSVGBox
-            && (kind_is_svg_box(parent.kind.get()) || parent.kind.get() == NodeKind::SVGSVGBox)
-        {
+        if data.kind.get() == NodeKind::SVGSVGBox && kind_is_svg_content(parent.kind.get()) {
             return false;
         }
         if kind_is_replaced_box(parent.kind.get()) && node_can_have_children(parent) {
@@ -1180,8 +1204,8 @@ impl<'pass> NodeFacts<'pass> {
         has_flag(self.data(), NodeFlag::Anonymous)
     }
 
-    pub(crate) fn has_anchor_names(&self) -> bool {
-        has_flag(self.data(), NodeFlag::HasAnchorNames)
+    pub(crate) fn is_anchor_candidate(&self) -> bool {
+        self.pass.arena().node_is_anchor_candidate(self.node)
     }
 
     pub(crate) fn can_have_children(&self) -> bool {
@@ -1403,10 +1427,6 @@ impl<'pass> NodeFacts<'pass> {
     #[inline]
     pub(crate) fn default_preferred_height(&self) -> Option<CssPixels> {
         self.replaced_content().default_preferred_height
-    }
-
-    pub(crate) fn initial_containing_block_inline_size(&self) -> crate::layout::CssPixels {
-        self.pass.initial_containing_block_inline_size
     }
 
     pub(crate) fn is_scroll_container(&self) -> bool {

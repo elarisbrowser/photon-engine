@@ -62,6 +62,7 @@ public:
         NonnullRefPtr<HTTP::HeaderList> request_headers,
         ByteBuffer request_body,
         HTTP::Cookie::IncludeCredentials include_credentials,
+        HTTP::Cookie::SameSiteContext,
         Optional<Requests::RequestTransferLeaseKey>,
         Optional<u32> address_selection_hint,
         bool notify_on_cache_miss);
@@ -85,7 +86,8 @@ public:
         ByteString method,
         NonnullRefPtr<HTTP::HeaderList> request_headers,
         ByteBuffer request_body,
-        HTTP::Cookie::IncludeCredentials include_credentials);
+        HTTP::Cookie::IncludeCredentials include_credentials,
+        HTTP::Cookie::SameSiteContext);
 
     static NonnullOwnPtr<Request> import(
         u64 request_id,
@@ -209,6 +211,7 @@ private:
         NonnullRefPtr<HTTP::HeaderList> request_headers,
         ByteBuffer request_body,
         HTTP::Cookie::IncludeCredentials include_credentials,
+        HTTP::Cookie::SameSiteContext,
         Optional<Requests::RequestTransferLeaseKey> = {});
 
     Request(
@@ -249,8 +252,8 @@ private:
     static size_t on_header_received(void* buffer, size_t size, size_t nmemb, void* user_data);
     static size_t on_data_received(void* buffer, size_t size, size_t nmemb, void* user_data);
 
-    // A state change, response bytes from curl, or bytes written to the cache entry count as progress — and a
-    // request waiting on the cache entry this request holds open judges by it whether this request has stalled.
+    // A state change or response bytes from the network count as progress, and a request waiting on the cache entry
+    // this request holds open judges by it whether this request has stalled.
     void mark_activity() { m_last_activity_time = MonotonicTime::now(); }
 
     ErrorOr<void> detach_curl_handle_from_multi();
@@ -270,6 +273,13 @@ private:
     void handle_fetch_complete(int result_code);
     void send_headers_to_client();
     ErrorOr<void> write_queued_bytes_without_blocking();
+    void write_to_disk_cache(ReadonlyBytes);
+
+    enum class DiskCacheEntryOutcome : u8 {
+        Complete,
+        Incomplete,
+    };
+    void close_disk_cache_entry(DiskCacheEntryOutcome);
 
     virtual bool is_revalidation_request() const override;
     ErrorOr<void> revalidation_failed();
@@ -350,6 +360,7 @@ private:
     Optional<MonotonicTime> m_last_request_body_report_time;
 
     HTTP::Cookie::IncludeCredentials m_include_credentials { HTTP::Cookie::IncludeCredentials::Yes };
+    HTTP::Cookie::SameSiteContext m_same_site_context;
 
     Optional<AlternativeService> m_alternative_service;
     bool m_alternative_services_disabled { false };

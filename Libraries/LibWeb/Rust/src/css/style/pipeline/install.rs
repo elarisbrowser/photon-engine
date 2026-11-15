@@ -8,7 +8,6 @@
 //! and handed to the host as rows.
 
 use super::super::pointer_key::{PointerKey, PointerLookup};
-use super::super::style_invalidation::RecordView;
 use super::super::*;
 use super::install_scratch::InstallScratch;
 use super::live::Live;
@@ -81,10 +80,6 @@ impl StyleSwap {
     }
 }
 
-/// The index of an element's effects among those of a style installation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct EffectsIndex(u32);
-
 /// What the main thread does to take a style installation: the styles it swaps in, and the side effects of the
 /// elements whose styles move, both in tree order, each element's pseudo-elements following it. An element's effects
 /// name its swaps, which the main thread performs before them, and before it swaps in the styles of the elements after
@@ -101,7 +96,7 @@ pub(crate) struct StyleInstallation {
     pub(crate) pinned_records: Vec<u64>,
     /// The elements taking their first style whose parent, its layout tree parent as well, takes its first style in
     /// this installation too, in the order of their effects, each with the index of those and that parent.
-    first_styles_below_first_styles: Vec<(EffectsIndex, StyleNodeID)>,
+    first_styles_below_first_styles: Vec<(u32, StyleNodeID)>,
 }
 
 impl StyleInstallation {
@@ -181,15 +176,12 @@ impl StyleInstallation {
     /// takes its first style too.
     fn note_first_style_below_first_style(&mut self, parent: StyleNodeID) {
         let index = u32::try_from(self.effects.len() - 1).expect("an installation's effects fit their index");
-        self.first_styles_below_first_styles.push((EffectsIndex(index), parent));
+        self.first_styles_below_first_styles.push((index, parent));
     }
 
     /// Takes the elements `note_first_style_below_first_style` noted.
     pub(crate) fn take_first_styles_below_first_styles(&mut self) -> Vec<(u32, StyleNodeID)> {
         std::mem::take(&mut self.first_styles_below_first_styles)
-            .into_iter()
-            .map(|(EffectsIndex(index), parent)| (index, parent))
-            .collect()
     }
 
     /// Keeps the effects of only the elements the main thread has anything to do for beside swapping in their styles.
@@ -205,11 +197,6 @@ impl StyleInstallation {
             self.swaps.len() == first_swap || self.effects.last().is_some_and(|effects| effects.node() == node),
             "every element with a style to swap in has effects"
         );
-    }
-
-    /// Ends the installation: what all its moves damage is `document_damage`.
-    fn finish(&mut self, document_damage: u32) {
-        self.document_damage = document_damage;
     }
 }
 
@@ -376,7 +363,7 @@ impl RetainedState {
             let new = new_record.raw();
             // The main thread swaps in the record where it holds another one, or none, as below an element that was
             // display:none.
-            let main_holds_new = self.held_style_record(node) == Some(new);
+            let main_holds_new = self.held_style_record(node) == Some(new) && !self.cleared_by_ancestor(node, scratch);
             if !main_holds_new {
                 installation.swaps.push(StyleSwap::new(
                     self,
@@ -639,8 +626,8 @@ impl RetainedState {
                 || self.container_effects_for_host.get(&node).is_some()
             {
                 let sets = &self.computed_group_sets;
-                let old_view = RecordView::installed(sets, old).filter(|_| !below_display_none);
-                let new_view = RecordView::installed(sets, new).expect("an installed record is live");
+                let old_view = sets.style_record_view(old).filter(|_| !below_display_none);
+                let new_view = sets.style_record_view(new).expect("an installed record is live");
                 let facts = super::main_effects::InstallationFacts {
                     composed_by_the_host,
                     owes_an_animation_plan,
@@ -656,6 +643,12 @@ impl RetainedState {
                 };
                 let first_style = facts.element_damage.is_none();
                 let effects = self.main_effects(node, old_view, new_view, facts);
+                if effects
+                    .effects
+                    .intersects(bridge::MainEffects::CLEAR_HIDDEN_DESCENDANTS)
+                {
+                    scratch.note_effects_clear_hidden_descendants(node);
+                }
                 scratch.document_damage.push(effects.damage());
                 installation.note_element_effects(effects, first_swap);
                 if first_style {
@@ -670,10 +663,8 @@ impl RetainedState {
             installation.end_element(node, first_swap);
         }
         scratch.ordered = ordered;
-        installation.finish(super::super::style_invalidation::merged_damage(
-            Some(0),
-            scratch.document_damage.iter().copied(),
-        ));
+        installation.document_damage =
+            super::super::style_invalidation::merged_damage(Some(0), scratch.document_damage.iter().copied());
         rows
     }
 
@@ -763,6 +754,32 @@ impl RetainedState {
         }
         scratch.chain = chain;
         hidden
+    }
+
+    /// Whether an ancestor of `node` that the installation installed already clears the styles of its descendants,
+    /// noting the answer for each element asked in `scratch`.
+    fn cleared_by_ancestor(&self, node: StyleNodeID, scratch: &mut InstallScratch) -> bool {
+        if !scratch.any_effects_clear_hidden_descendants() {
+            return false;
+        }
+        let mut chain = std::mem::take(&mut scratch.chain);
+        chain.clear();
+        let mut ancestor = self.projection.inheritance_parent(node);
+        let mut cleared = false;
+        while let Some(current) = ancestor {
+            if let Some(answer) = scratch.cleared_below(current) {
+                cleared = answer;
+                break;
+            }
+            chain.push(current);
+            ancestor = self.projection.inheritance_parent(current);
+        }
+        for &current in chain.iter().rev() {
+            cleared = cleared || scratch.effects_clear_hidden_descendants(current);
+            scratch.note_cleared_below(current, cleared);
+        }
+        scratch.chain = chain;
+        cleared
     }
 
     /// Whether the host clears the styles of `node`'s descendants as `node` moves from a record whose display was none
@@ -1002,7 +1019,7 @@ mod tests {
             state
                 .custom_property_environments
                 .adopt_engine_environment(store.clone(), None, 0, None, registry);
-        let installed = state.computed_group_sets.install_derived_record(&record, || {
+        let installed = state.computed_group_sets.install_derived_record(&record, 0, || {
             computed::record_dependency_flags(&record.facts(), &record.payloads)
         });
         state.computed_group_sets.assign_installed_record(nodes[0], installed);

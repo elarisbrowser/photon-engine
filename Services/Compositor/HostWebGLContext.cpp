@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <GLES3/gl3.h>
+
 #include <AK/Vector.h>
 #include <Compositor/BitmapExport.h>
 #include <Compositor/HostWebGLContext.h>
@@ -25,6 +27,47 @@ namespace Compositor {
 using namespace Compositing::WebGL;
 
 static constexpr GLsizei max_webgl_string_list_entries = 16384;
+
+// The pixels of a bitmap converted for upload are tightly packed, row after row and image after image. So while they're
+// uploaded, the unpack parameters that the page set for its own data are reset, and afterward restored.
+class PackedBitmapUnpackState {
+    AK_MAKE_NONCOPYABLE(PackedBitmapUnpackState);
+    AK_MAKE_NONMOVABLE(PackedBitmapUnpackState);
+
+public:
+    explicit PackedBitmapUnpackState(WebGLVersion version)
+    {
+        reset(GL_UNPACK_ALIGNMENT, 1);
+        if (version == WebGLVersion::WebGL2) {
+            reset(GL_UNPACK_ROW_LENGTH, 0);
+            reset(GL_UNPACK_IMAGE_HEIGHT, 0);
+            reset(GL_UNPACK_SKIP_PIXELS, 0);
+            reset(GL_UNPACK_SKIP_ROWS, 0);
+            reset(GL_UNPACK_SKIP_IMAGES, 0);
+        }
+    }
+
+    ~PackedBitmapUnpackState()
+    {
+        for (auto const& saved : m_saved_parameters)
+            glPixelStorei(saved.parameter, saved.value);
+    }
+
+private:
+    void reset(GLenum parameter, GLint value)
+    {
+        GLint saved_value = 0;
+        glGetIntegerv(parameter, &saved_value);
+        m_saved_parameters.append({ parameter, saved_value });
+        glPixelStorei(parameter, value);
+    }
+
+    struct SavedParameter {
+        GLenum parameter;
+        GLint value;
+    };
+    Vector<SavedParameter, 6> m_saved_parameters;
+};
 
 HostWebGLContext::HostWebGLContext(NonnullOwnPtr<OpenGLContext> gl_context, RefPtr<Gfx::SkiaBackendContext> skia_backend_context)
     : m_gl_context(move(gl_context))
@@ -88,14 +131,17 @@ static ErrorOr<HostWebGLContext::UploadSource const*> upload_source_at(Vector<Ho
     return &sources[index];
 }
 
-static ErrorOr<Gfx::DecodedImageFrame> decoded_frame_for_upload(HostWebGLContext::UploadSource const& source, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context)
+static ErrorOr<BitmapInColorSpace> bitmap_for_upload(HostWebGLContext::UploadSource const& source, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context)
 {
     return source.visit(
-        [](Gfx::DecodedImageFrame const& frame) -> ErrorOr<Gfx::DecodedImageFrame> {
-            return frame;
+        [](Gfx::DecodedImageFrame const& frame) -> ErrorOr<BitmapInColorSpace> {
+            return BitmapInColorSpace { frame.bitmap_sharing_pixels(), frame.color_space() };
         },
-        [&](NonnullRefPtr<Media::VideoFrame> const& video_frame) -> ErrorOr<Gfx::DecodedImageFrame> {
-            return decoded_image_frame_from_video_frame(*video_frame, skia_backend_context);
+        [&](NonnullRefPtr<Media::VideoFrame> const& video_frame) -> ErrorOr<BitmapInColorSpace> {
+            return bitmap_from_video_frame(*video_frame, skia_backend_context);
+        },
+        [](HostWebGLContext::MissingVideoFrame) -> ErrorOr<BitmapInColorSpace> {
+            return BitmapInColorSpace { TRY(Gfx::Bitmap::create(Gfx::BitmapFormat::BGRA8888, { 1, 1 })), {} };
         });
 }
 
@@ -127,8 +173,8 @@ static ErrorOr<Gfx::BitmapExportResult> convert_bitmap_for_upload(Vector<HostWeb
         target_height = destination_height;
     }
 
-    auto frame = TRY(decoded_frame_for_upload(source, skia_backend_context));
-    return Gfx::export_bitmap_to_byte_buffer(frame.bitmap(), frame.color_space(), export_format.value(), export_flags, target_width, target_height);
+    auto [bitmap, color_space] = TRY(bitmap_for_upload(source, skia_backend_context));
+    return Gfx::export_bitmap_to_byte_buffer(*bitmap, color_space, export_format.value(), export_flags, target_width, target_height);
 }
 
 static bool copy_can_write_internal_format(GLint internalformat)
@@ -258,6 +304,7 @@ ErrorOr<void> HostWebGLContext::tex_image2d_from_bitmap(Commands::TexImage2DFrom
     if (auto const* video_frame = TRY(upload_source_at(sources, command.bitmap_index))->get_pointer<NonnullRefPtr<Media::VideoFrame>>(); video_frame && define_texture_image_from_video_frame(command, **video_frame))
         return {};
     auto converted = TRY(convert_bitmap_for_upload(sources, m_skia_backend_context, command.bitmap_index, command.format, command.type, command.has_explicit_destination_size, command.destination_width, command.destination_height, command.flip_y, command.premultiply_alpha));
+    PackedBitmapUnpackState packed_bitmap_unpack_state { m_gl_context->webgl_version() };
     m_gl_context->tex_image2d_robust_angle(command.target, command.level, command.internalformat, converted.width, converted.height, 0, command.format, command.type, converted.buffer.size(), converted.buffer.data());
     return {};
 }
@@ -267,6 +314,7 @@ ErrorOr<void> HostWebGLContext::tex_sub_image2d_from_bitmap(Commands::TexSubImag
     if (auto const* video_frame = TRY(upload_source_at(sources, command.bitmap_index))->get_pointer<NonnullRefPtr<Media::VideoFrame>>(); video_frame && update_texture_image_from_video_frame(command, **video_frame))
         return {};
     auto converted = TRY(convert_bitmap_for_upload(sources, m_skia_backend_context, command.bitmap_index, command.format, command.type, command.has_explicit_destination_size, command.destination_width, command.destination_height, command.flip_y, command.premultiply_alpha));
+    PackedBitmapUnpackState packed_bitmap_unpack_state { m_gl_context->webgl_version() };
     m_gl_context->tex_sub_image2d_robust_angle(command.target, command.level, command.xoffset, command.yoffset, converted.width, converted.height, command.format, command.type, converted.buffer.size(), converted.buffer.data());
     return {};
 }
@@ -274,6 +322,7 @@ ErrorOr<void> HostWebGLContext::tex_sub_image2d_from_bitmap(Commands::TexSubImag
 ErrorOr<void> HostWebGLContext::tex_image3d_from_bitmap(Commands::TexImage3DFromBitmap const& command, Vector<UploadSource> const& sources)
 {
     auto converted = TRY(convert_bitmap_for_upload(sources, m_skia_backend_context, command.bitmap_index, command.format, command.type, command.has_explicit_destination_size, command.destination_width, command.destination_height, command.flip_y, command.premultiply_alpha));
+    PackedBitmapUnpackState packed_bitmap_unpack_state { m_gl_context->webgl_version() };
     m_gl_context->tex_image3d_robust_angle(command.target, command.level, command.internalformat, converted.width, converted.height, command.depth, 0, command.format, command.type, converted.buffer.size(), converted.buffer.data());
     return {};
 }
@@ -281,6 +330,7 @@ ErrorOr<void> HostWebGLContext::tex_image3d_from_bitmap(Commands::TexImage3DFrom
 ErrorOr<void> HostWebGLContext::tex_sub_image3d_from_bitmap(Commands::TexSubImage3DFromBitmap const& command, Vector<UploadSource> const& sources)
 {
     auto converted = TRY(convert_bitmap_for_upload(sources, m_skia_backend_context, command.bitmap_index, command.format, command.type, command.has_explicit_destination_size, command.destination_width, command.destination_height, command.flip_y, command.premultiply_alpha));
+    PackedBitmapUnpackState packed_bitmap_unpack_state { m_gl_context->webgl_version() };
     m_gl_context->tex_sub_image3d_robust_angle(command.target, command.level, command.xoffset, command.yoffset, command.zoffset, converted.width, converted.height, command.depth, command.format, command.type, converted.buffer.size(), converted.buffer.data());
     return {};
 }

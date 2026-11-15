@@ -54,7 +54,27 @@ pub(crate) mod canvas_2d;
     clippy::unnecessary_wraps,
     reason = "the bindings call every attribute and operation as one that can throw"
 )]
+pub(crate) mod clipboard;
+#[cfg(not(test))]
+#[cfg_attr(
+    not(web_idl_bindings),
+    allow(dead_code, reason = "only the generated bindings use the interfaces")
+)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the bindings call every attribute and operation as one that can throw"
+)]
 pub(crate) mod compression;
+#[cfg(not(test))]
+#[cfg_attr(
+    not(web_idl_bindings),
+    allow(dead_code, reason = "only the generated bindings use the interfaces")
+)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the bindings call every attribute and operation as one that can throw"
+)]
+pub(crate) mod credential_management;
 #[cfg(not(test))]
 pub(crate) mod crypto;
 #[cfg(not(test))]
@@ -71,6 +91,10 @@ pub(crate) mod css;
     not(web_idl_bindings),
     allow(dead_code, reason = "only the generated bindings use the dictionaries")
 )]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the bindings call every attribute and operation as one that can throw"
+)]
 pub(crate) mod dom;
 #[cfg_attr(
     not(web_idl_bindings),
@@ -86,6 +110,18 @@ pub(crate) mod domurl;
     allow(dead_code, reason = "only the generated bindings use the interfaces")
 )]
 pub(crate) mod encoding;
+#[cfg(not(test))]
+#[cfg_attr(
+    not(web_idl_bindings),
+    allow(dead_code, reason = "only the generated bindings use the interfaces")
+)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the bindings call every attribute and operation as one that can throw"
+)]
+pub(crate) mod event_timing;
+#[cfg(not(test))]
+pub(crate) mod fetch;
 #[cfg_attr(
     not(web_idl_bindings),
     allow(dead_code, reason = "only the generated bindings use the interfaces")
@@ -104,6 +140,16 @@ pub(crate) mod file_api;
     reason = "the bindings call every attribute and operation as one that can throw"
 )]
 pub(crate) mod geometry;
+#[cfg(not(test))]
+#[cfg_attr(
+    not(web_idl_bindings),
+    allow(dead_code, reason = "only the generated bindings use the interfaces")
+)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the bindings call every attribute and operation as one that can throw"
+)]
+pub(crate) mod high_resolution_time;
 #[cfg_attr(
     not(web_idl_bindings),
     allow(dead_code, reason = "only the generated bindings use the interfaces")
@@ -123,11 +169,63 @@ pub(crate) mod html;
     reason = "the bindings call every attribute and operation as one that can throw"
 )]
 pub(crate) mod indexed_db;
+#[cfg(not(test))]
+#[cfg_attr(
+    not(web_idl_bindings),
+    allow(dead_code, reason = "only the generated bindings use the interfaces")
+)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the bindings call every attribute and operation as one that can throw"
+)]
+pub(crate) mod largest_contentful_paint;
+#[cfg(not(test))]
+#[cfg_attr(
+    not(web_idl_bindings),
+    allow(dead_code, reason = "only the generated bindings use the interfaces")
+)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the bindings call every attribute and operation as one that can throw"
+)]
+pub(crate) mod navigation_timing;
 #[cfg_attr(
     not(web_idl_bindings),
     allow(dead_code, reason = "only the generated bindings use the interfaces")
 )]
 pub(crate) mod notifications_api;
+#[cfg(not(test))]
+#[cfg_attr(
+    not(web_idl_bindings),
+    allow(dead_code, reason = "only the generated bindings use the interfaces")
+)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the bindings call every attribute and operation as one that can throw"
+)]
+pub(crate) mod paint_timing;
+#[cfg(not(test))]
+#[cfg_attr(
+    not(web_idl_bindings),
+    allow(dead_code, reason = "only the generated bindings use the interfaces")
+)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the bindings call every attribute and operation as one that can throw"
+)]
+pub(crate) mod performance_timeline;
+#[cfg(not(test))]
+pub(crate) mod platform;
+#[cfg(not(test))]
+#[cfg_attr(
+    not(web_idl_bindings),
+    allow(dead_code, reason = "only the generated bindings use the interfaces")
+)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the bindings call every attribute and operation as one that can throw"
+)]
+pub(crate) mod resource_timing;
 #[cfg_attr(
     not(web_idl_bindings),
     allow(dead_code, reason = "only the generated bindings use the interfaces")
@@ -160,11 +258,33 @@ pub(crate) mod storage_api;
     reason = "the bindings call every attribute and operation as one that can throw"
 )]
 pub(crate) mod streams;
+#[cfg(not(test))]
+#[cfg_attr(
+    not(web_idl_bindings),
+    allow(dead_code, reason = "only the generated bindings use the interfaces")
+)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the bindings call every attribute and operation as one that can throw"
+)]
+pub(crate) mod trusted_types;
+#[cfg(not(test))]
+pub(crate) mod ui_events;
 #[cfg_attr(
     not(web_idl_bindings),
     allow(dead_code, reason = "only the generated bindings use the interfaces")
 )]
 pub(crate) mod url_pattern;
+#[cfg(not(test))]
+#[cfg_attr(
+    not(web_idl_bindings),
+    allow(dead_code, reason = "only the generated bindings use the interfaces")
+)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the bindings call every attribute and operation as one that can throw"
+)]
+pub(crate) mod user_timing;
 #[cfg(not(test))]
 #[cfg_attr(
     not(web_idl_bindings),
@@ -185,6 +305,16 @@ pub(crate) mod web_assembly;
 )]
 pub(crate) mod web_gl;
 #[cfg(not(test))]
+#[cfg_attr(
+    not(web_idl_bindings),
+    allow(dead_code, reason = "only the generated bindings use the interfaces")
+)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the bindings call every operation as one that can throw"
+)]
+pub(crate) mod web_locks;
+#[cfg(not(test))]
 pub(crate) mod webidl;
 #[cfg(not(test))]
 pub(crate) mod webrtc;
@@ -197,6 +327,11 @@ pub(crate) mod webrtc;
     reason = "the bindings call every attribute and operation as one that can throw"
 )]
 pub(crate) mod xhr;
+
+#[cfg(not(test))]
+#[cfg_attr(not(web_idl_bindings), allow(dead_code))]
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) mod web_audio;
 
 // The generators of the build script, whose tests run with those of the crate.
 #[cfg(test)]

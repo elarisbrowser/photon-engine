@@ -102,7 +102,13 @@ impl AsyncFunctionDriverWrapper {
         generator_object.set_generator_state(GeneratorState::SuspendedYield);
         // Note: The top_level_promise is also kept alive by this Wrapper
         let wrapper = realm.create_object(vm, |defer_gc| AsyncFunctionDriverWrapper {
-            base: Promise::new(defer_gc, vm, Self::CLASS, realm.intrinsics().promise_prototype(vm)),
+            base: Promise::new(
+                defer_gc,
+                vm,
+                realm,
+                Self::CLASS,
+                realm.intrinsics().promise_prototype(vm),
+            ),
             generator_object: Cell::new(generator_object),
             top_level_promise: Cell::new(top_level_promise),
             current_promise: Cell::new(None),
@@ -161,7 +167,7 @@ impl AsyncFunctionDriverWrapper {
             // Already-settled native Promises whose constructor is the intrinsic %Promise%.
             if is_settled_intrinsic_promise(vm, realm, &promise) {
                 Self::schedule_resume(this, vm, promise.result(), promise.state() == PromiseState::Fulfilled);
-                promise.set_is_handled();
+                promise.mark_handled(vm);
                 return Ok(());
             }
         }
@@ -298,7 +304,7 @@ impl AsyncFunctionDriverWrapper {
                     && is_settled_intrinsic_promise(vm, realm, &promise)
                 {
                     let is_fulfilled = promise.state() == PromiseState::Fulfilled;
-                    promise.set_is_handled();
+                    promise.mark_handled(vm);
                     generator_result = if is_fulfilled {
                         generator_object.resume(vm, promise.result(), None)
                     } else {

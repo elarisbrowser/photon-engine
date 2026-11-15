@@ -5,7 +5,6 @@
  */
 
 #include <AK/ScopeGuard.h>
-#include <LibGC/ConservativeVector.h>
 #include <LibGC/RootVector.h>
 #include <LibUnicode/CharacterTypes.h>
 #include <LibUnicode/Segmenter.h>
@@ -28,6 +27,7 @@
 #include <LibWeb/HTML/HTMLHRElement.h>
 #include <LibWeb/HTML/HTMLImageElement.h>
 #include <LibWeb/HTML/HTMLLIElement.h>
+#include <LibWeb/HTML/HTMLSelectElement.h>
 #include <LibWeb/HTML/HTMLTableElement.h>
 #include <LibWeb/HTML/Numbers.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
@@ -1500,8 +1500,10 @@ static Utf16String plain_text_of_fragment(DOM::DocumentFragment& fragment)
         GC::Ref<DOM::Node> node;
         bool preserves_white_space;
         bool is_block_end;
+
+        void visit_edges(GC::Cell::Visitor& visitor) { visitor.visit(node); }
     };
-    GC::ConservativeVector<PendingNode> pending_nodes;
+    GC::RootVector<PendingNode> pending_nodes;
     pending_nodes.append({ fragment, false, false });
     while (!pending_nodes.is_empty()) {
         auto [node, preserves_white_space, is_block_end] = pending_nodes.take_last();
@@ -1558,7 +1560,7 @@ static Utf16String plain_text_of_fragment(DOM::DocumentFragment& fragment)
 }
 
 // https://w3c.github.io/editing/docs/execCommand/#the-inserthtml-command
-bool command_insert_html_action(DOM::Document& document, Utf16View value)
+static bool insert_html(DOM::Document& document, Variant<Utf16View, GC::Ref<DOM::DocumentFragment>> value)
 {
     // 1. Set value to the result of invoking get trusted types compliant string with TrustedHTML, this's relevant
     //    global object, value, "Document execCommand", and "script".
@@ -1574,17 +1576,26 @@ bool command_insert_html_action(DOM::Document& document, Utf16View value)
     if (!range->start_container()->is_editable_or_editing_host())
         return true;
 
+    // 4. Let frag be the result of calling createContextualFragment(value) on the active range.
+    // NB: A user paste passes the fragment its sanitizer inspected, which is inserted as is.
+    auto create_fragment = [&](DOM::Range& range) -> GC::Ptr<DOM::DocumentFragment> {
+        return value.visit(
+            [&](Utf16View html) -> GC::Ptr<DOM::DocumentFragment> {
+                EditingHistory::ProxyMutationScope mutation_scope { *range.start_container() };
+                auto result = range.create_contextual_fragment(html.to_utf8_but_should_be_ported_to_utf16());
+                if (result.is_exception())
+                    return nullptr;
+                return result.release_value();
+            },
+            [](GC::Ref<DOM::DocumentFragment> fragment) -> GC::Ptr<DOM::DocumentFragment> { return fragment; });
+    };
+
     // NB: See the INTEROP note at plain_text_of_fragment(). Insert the lines as text, separated by line breaks.
     if (auto editing_host = range->start_container()->editing_host(); is<HTML::HTMLElement>(editing_host.ptr())
         && as<HTML::HTMLElement>(*editing_host).content_editable_state() == HTML::ContentEditableState::PlaintextOnly) {
-        GC::Ptr<DOM::DocumentFragment> fragment;
-        {
-            EditingHistory::ProxyMutationScope mutation_scope { *range->start_container() };
-            auto result = range->create_contextual_fragment(value.to_utf8_but_should_be_ported_to_utf16());
-            if (result.is_exception())
-                return false;
-            fragment = result.release_value();
-        }
+        auto fragment = create_fragment(*range);
+        if (!fragment)
+            return false;
         auto text = plain_text_of_fragment(*fragment);
         auto lines = text.utf16_view().split_view(u'\n', SplitBehavior::KeepEmpty);
         for (size_t i = 0; i < lines.size(); ++i) {
@@ -1603,8 +1614,21 @@ bool command_insert_html_action(DOM::Document& document, Utf16View value)
     //          non-breaking space, just as it does when inserting text at the same boundary.
     canonicalize_whitespace(range->start());
     range = active_range(document);
-    replace_selection_with_fragment(document, value);
+    auto fragment = create_fragment(*range);
+    if (!fragment)
+        return false;
+    replace_selection_with_fragment(document, *fragment);
     return true;
+}
+
+bool command_insert_html_action(DOM::Document& document, Utf16View value)
+{
+    return insert_html(document, value);
+}
+
+bool insert_pasted_fragment(DOM::Document& document, DOM::DocumentFragment& fragment)
+{
+    return insert_html(document, GC::Ref { fragment });
 }
 
 // https://w3c.github.io/editing/docs/execCommand/#the-insertimage-command
@@ -2338,15 +2362,27 @@ bool command_insert_paragraph_action(DOM::Document& document, Utf16View)
 // https://w3c.github.io/editing/docs/execCommand/#the-inserttext-command
 static bool insert_text(DOM::Document& document, Utf16View value, InsertTextContext context)
 {
-    // 1. Delete the selection, with strip wrappers false.
     auto& selection = *document.get_selection();
+    auto range = active_range(document);
+    if (auto* select = as_if<HTML::HTMLSelectElement>(*range->start_container()); select && select->is_editable()
+        && !select->is_inclusive_ancestor_of(range->end_container())) {
+        // AD-HOC: The spec deletes the selection first. But a replacement starting at a select's edge starts
+        //         outside the control, and an interior position can't accept text, so reject it before deleting.
+        auto offset = range->start_offset();
+        if (offset != 0 && offset != select->child_count())
+            return true;
+        MUST(range->set_start(*select->parent(), select->index() + (offset != 0 ? 1 : 0)));
+    }
+
+    // 1. Delete the selection, with strip wrappers false.
     auto replaces_selection = !selection.is_collapsed();
     delete_the_selection(selection, true, false);
     canonicalize_collapsed_selection_for_editing(selection);
 
     // 2. If the active range's start node is neither editable nor an editing host, return true.
-    auto range = active_range(document);
-    if (!range->start_container()->is_editable_or_editing_host())
+    // NB: A control can itself be removed from an editor, but its content isn't an insertion target.
+    range = active_range(document);
+    if (!range->start_container()->is_editable_or_editing_host() || !range->start_container()->in_editable_subtree())
         return true;
 
     // 3. If value's length is greater than one:

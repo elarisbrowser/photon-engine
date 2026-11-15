@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <AK/Array.h>
+#include <AK/Function.h>
 #include <AK/Noncopyable.h>
 #include <AK/Optional.h>
 #include <AK/Platform.h>
@@ -13,9 +15,9 @@
 #include <LibGfx/Forward.h>
 #include <LibWebView/Forward.h>
 
+#include <QColor>
 #include <Qt>
 
-class QColor;
 class QDrag;
 class QMargins;
 class QWheelEvent;
@@ -26,6 +28,8 @@ namespace Ladybird {
 #if defined(AK_OS_MACOS)
 // The CGDirectDisplayID of the screen the widget's window is on, or of the main screen while it has no window yet.
 Optional<u64> appkit_display_id_for_window(QWidget&);
+// Whether the screen the widget's window is on can show content brighter than SDR white, at its brightest setting.
+bool appkit_window_screen_shows_high_dynamic_range(QWidget&);
 void hide_appkit_window_title(QWidget&);
 void make_appkit_window_resizable(QWidget&);
 void keep_appkit_window_visible_while_inactive(QWidget&);
@@ -33,6 +37,8 @@ void keep_appkit_window_visible_while_inactive(QWidget&);
 void disable_appkit_window_animations(QWidget&);
 void ensure_appkit_window_is_exposed(QWidget&);
 void set_appkit_window_content_aspect_ratio(QWidget&, Gfx::IntSize);
+// The Core Animation layer that shows the widget's own surface, or null if the widget has no native window.
+void* appkit_content_layer(QWidget&);
 void offset_appkit_window_controls(QWidget&, int x_offset, int y_offset);
 // AppKit puts the window controls back in their default place when the window title changes; this moves them back
 // to their offset right away, before the next frame is drawn.
@@ -54,6 +60,12 @@ void set_appkit_view_opacity(QWidget&, qreal opacity);
 void round_appkit_view_bottom_corners(QWidget&, qreal radius);
 // Casts a shadow around a native view. Being outside of the view, the shadow takes no mouse input.
 void cast_appkit_view_shadow(QWidget&, qreal corner_radius, qreal blur_radius, qreal y_offset, QColor const&);
+// The focus ring around a focused surface: a line right outside its edge, inside a wider, softer ring.
+struct AppKitViewFocusRing {
+    QColor edge_color;
+    QColor ring_color;
+    qreal ring_width { 0 };
+};
 // A shadow right below a native view, in a plain view of its own. It is no Qt window, as Qt on macOS takes a child
 // window to be under the mouse even when it is transparent for input, and keeps the mouse from what is below it.
 class AppKitViewShadow {
@@ -65,13 +77,39 @@ public:
     ~AppKitViewShadow();
 
     // The shadow is clipped to the given room around the view.
-    void follow(QWidget&, QMargins const& room, qreal corner_radius, qreal blur_radius, qreal y_offset, QColor const& shadow_color, QColor const& fill_color);
+    // The shadow view also draws the focus ring, if any, as it lies outside the view too.
+    void follow(QWidget&, QMargins const& room, qreal corner_radius, qreal blur_radius, qreal y_offset, QColor const& shadow_color, QColor const& fill_color, Optional<AppKitViewFocusRing> const& = {});
     void hide();
     void set_opacity(qreal);
 
 private:
     void* m_view { nullptr };
     void* m_caster { nullptr };
+    void* m_focus_edge { nullptr };
+    void* m_focus_ring { nullptr };
+};
+// Shows the given height of a window's top from snapshots of its surface, taken after each repaint of that surface.
+// The window server never reads a snapshot while it is being painted.
+class AppKitWindowChromeSnapshots {
+    AK_MAKE_NONCOPYABLE(AppKitWindowChromeSnapshots);
+    AK_MAKE_NONMOVABLE(AppKitWindowChromeSnapshots);
+
+public:
+    AppKitWindowChromeSnapshots(QWidget& window, Function<int()> chrome_height);
+    ~AppKitWindowChromeSnapshots();
+
+private:
+    void update();
+
+    QWidget& m_window;
+    Function<int()> m_chrome_height;
+    void* m_layer { nullptr };
+    Array<void*, 2> m_run_loop_observers {};
+    void* m_shown_surface { nullptr };
+    void* m_spare_surface { nullptr };
+    u32 m_window_surface_id { 0 };
+    u32 m_window_surface_seed { 0 };
+    size_t m_height { 0 };
 };
 bool start_appkit_window_drag(QWidget&);
 Qt::DropAction execute_appkit_tab_drag(QWidget&, QDrag&);

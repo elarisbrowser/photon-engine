@@ -23,6 +23,7 @@ encoding_rs = "0.8.42"
 ladybird_allocator = { path = "../../../RustAllocator", optional = true }
 libcompositing_rust = { path = "../../../LibCompositing/Rust" }
 libcompress_rust = { path = "../../../LibCompress/Rust" }
+libcrypto_rust = { path = "../../../LibCrypto/Rust" }
 libgfx_rust = { path = "../../../LibGfx/Rust", default-features = false }
 libhttp_rust = { path = "../../../LibHTTP/Rust" }
 libipc_rust = { path = "../../../LibIPC/Rust" }
@@ -34,6 +35,7 @@ libwasm_engine = { path = "../../../LibWasm/Engine" }
 libweb_rust = { path = "../../Rust" }
 libwebcommon_rust = { path = "../../../LibWebCommon/Rust" }
 rustc-demangle = "0.1"
+smallvec = { version = "1.16.3", features = ["const_generics", "union"] }
 
 [build-dependencies]
 serde_json = { version = "1", features = ["float_roundtrip", "preserve_order"] }

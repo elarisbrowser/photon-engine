@@ -84,7 +84,8 @@ fn frames_above(vm: &Vm, frame: NonNull<ExecutionContext>) -> Option<Vec<NonNull
 
 /// What calls of an executable without JIT code enter through its slot in the JIT entry table.
 pub fn not_compiled_call_entry() -> *const core::ffi::c_void {
-    entry_exit::libjs_jit_not_compiled_call_entry as *const core::ffi::c_void
+    libjs_runtime_macros::jit_function_address!(entry_exit::libjs_jit_not_compiled_call_entry)
+        as *const core::ffi::c_void
 }
 
 /// Which interpreter handlers an executable's frames run with. Each tier's value is the index of its dispatch table
@@ -189,6 +190,8 @@ pub struct JitState {
     /// The call stub JIT code shares (see `libjs_jit::codegen::generate_call_stub()`), generated the first time a
     /// compile job needs it, if there is one.
     call_stub: OnceCell<Option<ExecutableMemory>>,
+    /// The construct stub JIT code shares (see `libjs_jit::codegen::generate_construct_stub()`).
+    construct_stub: OnceCell<Option<ExecutableMemory>>,
     /// The installed code that depends on things staying as they are.
     pub(crate) dependents: dependencies::Dependents,
     /// The id the next installed code gets (see `JitCode::id()`).
@@ -237,6 +240,7 @@ impl JitState {
             runtime_function_addresses: OnceCell::new(),
             entry_trampoline: OnceCell::new(),
             call_stub: OnceCell::new(),
+            construct_stub: OnceCell::new(),
             dependents: dependencies::Dependents::default(),
             next_code_id: Cell::new(1),
             htmldda_objects_exist: Cell::new(false),
@@ -393,6 +397,11 @@ impl JitState {
         id
     }
 
+    /// Whether compile jobs run on the compile threads.
+    pub(crate) fn has_compile_jobs(&self) -> bool {
+        !self.jobs.borrow().is_empty()
+    }
+
     /// Forgets every compile job, whose results are dropped when they finish.
     pub(crate) fn abandon_compile_jobs(&self) {
         self.jobs.borrow_mut().clear();
@@ -415,8 +424,15 @@ impl JitState {
             .get_or_init(|| {
                 let code = libjs_jit::codegen::generate_entry_trampoline::<libjs_jit::asm::MacroAssembler>()
                     .expect("the entry trampoline can be generated");
+                // NB: On Windows, the trampoline goes first in a chunk of its own, whose unwind info then describes
+                //     its prologue: native code calls it, and keeps no frame pointer that a stack walk from the
+                //     prologue could take for the trampoline's.
+                #[cfg(windows)]
+                let allocator = Rc::new(RefCell::new(CodeAllocator::default()));
+                #[cfg(not(windows))]
+                let allocator = Rc::clone(&self.code_allocator);
                 let memory = ExecutableMemory::allocate(
-                    &self.code_allocator,
+                    &allocator,
                     &[code.as_slice()],
                     &["entry trampoline"],
                     self.options.perf_map,
@@ -440,6 +456,24 @@ impl JitState {
                     &self.code_allocator,
                     &[code.as_slice()],
                     &["call stub"],
+                    self.options.perf_map,
+                )
+                .pop()
+            })
+            .as_ref()
+            .map_or(0, |memory| memory.address() as u64)
+    }
+
+    /// The address of the construct stub for code with this runtime info, or 0.
+    pub(crate) fn construct_stub(&self, runtime: &libjs_jit::snapshot::RuntimeInfo) -> u64 {
+        self.construct_stub
+            .get_or_init(|| {
+                let code = libjs_jit::codegen::generate_construct_stub::<libjs_jit::asm::MacroAssembler>(runtime)
+                    .expect("the construct stub compiles")?;
+                ExecutableMemory::allocate(
+                    &self.code_allocator,
+                    &[code.as_slice()],
+                    &["construct stub"],
                     self.options.perf_map,
                 )
                 .pop()

@@ -16,6 +16,7 @@
 namespace Web::CSS::StyleEngineFFI {
 
 struct FfiAppliedAnimationDefinition;
+struct FfiAnimationEffectDescriptions;
 enum class FfiElementDeclarationKind : u8;
 
 }
@@ -156,6 +157,7 @@ WEB_API void record_element_css_defined_animations(DOM::Element&, u8 slot, Reado
 // Called where an effect takes keyframes or a target: ahead of the read that samples it, as an attr() in the keyframes
 // needs the attributes it names handed over before then.
 WEB_API void record_attr_names_read_by_keyframes(DOM::Element&, Animations::KeyframeEffect const&);
+WEB_API void with_animation_effect_descriptions(ReadonlySpan<GC::Ref<Animations::KeyframeEffect>>, Function<void(StyleEngineFFI::FfiAnimationEffectDescriptions const&)> const&);
 WEB_API void record_element_animation_effect_descriptions(DOM::Element&, u8 slot, ReadonlySpan<GC::Ref<Animations::KeyframeEffect>>);
 
 // Report that a child of an element arrived, left, or changed in a way that can move whether the
@@ -184,8 +186,6 @@ WEB_API void prepare_non_author_stylesheets(DOM::Document&);
 // Called once a sheet has taken its place in the sheet list, so its successor is known.
 WEB_API void record_stylesheet_attached(StyleSheetState&, DOM::Node& document_or_shadow_root, StyleSheetState* before);
 
-// The order one tree scope declares its qualified cascade layer names in. Rules retain the interned
-// names, while StyleEngine derives the scope-local ranks used by every cascade consumer.
 WEB_API TreeScopeID style_engine_tree_scope_for(DOM::Node&);
 
 // A sheet's rules are not immutable, and each of these is one rule moving rather than the sheet

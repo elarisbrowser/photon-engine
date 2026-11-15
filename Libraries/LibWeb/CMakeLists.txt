@@ -35,7 +35,6 @@ set(SOURCES
     Bindings/WrapperWorld.cpp
     Clipboard/Clipboard.cpp
     Clipboard/ClipboardEvent.cpp
-    Clipboard/ClipboardItem.cpp
     Compositor/CompositorConnection.cpp
     Compositor/CompositorHost.cpp
     Compositor/NavigablePresenter.cpp
@@ -57,17 +56,9 @@ set(SOURCES
     ContentSecurityPolicy/Violation.cpp
     CookieStore/CookieChangeEvent.cpp
     CookieStore/CookieStore.cpp
-    CredentialManagement/Credential.cpp
     CredentialManagement/CredentialsContainer.cpp
-    CredentialManagement/FederatedCredential.cpp
-    CredentialManagement/FederatedCredentialOperations.cpp
-    CredentialManagement/PasswordCredential.cpp
-    CredentialManagement/PasswordCredentialOperations.cpp
     Crypto/Crypto.cpp
-    Crypto/CryptoAlgorithms.cpp
-    Crypto/CryptoBindings.cpp
     Crypto/CryptoKey.cpp
-    Crypto/SubtleCrypto.cpp
     CSS/Angle.cpp
     CSS/ComputedStyleWorkingSet.cpp
     CSS/ComputedValues.cpp
@@ -294,13 +285,12 @@ set(SOURCES
     EncryptedMediaExtensions/Algorithms.cpp
     EncryptedMediaExtensions/MediaKeySystemAccess.cpp
     EntriesAPI/FileSystemEntry.cpp
-    EventTiming/EventCounts.cpp
     EventTiming/EventTiming.cpp
-    EventTiming/PerformanceEventTiming.cpp
     Fetch/Body.cpp
     Fetch/BodyInit.cpp
     Fetch/Engine/FetchBodyDeliveryGate.cpp
     Fetch/Engine/FetchByteChannel.cpp
+    Fetch/Engine/FetchEngineRecord.cpp
     Fetch/Engine/FetchExecutor.cpp
     Fetch/Engine/InlineFetchExecutor.cpp
     Fetch/Engine/NetworkTransportHandle.cpp
@@ -309,6 +299,8 @@ set(SOURCES
     Fetch/Fetching/Checks.cpp
     Fetch/Fetching/ClientContextSnapshots.cpp
     Fetch/Fetching/NetworkBodyPump.cpp
+    Fetch/Fetching/FetchEngine.cpp
+    Fetch/Fetching/FetchEventSink.cpp
     Fetch/Fetching/Fetching.cpp
     Fetch/Fetching/HTTPAuthentication.cpp
     Fetch/Fetching/PendingResponse.cpp
@@ -362,7 +354,6 @@ set(SOURCES
     Geometry/DOMRectList.cpp
     Geometry/DOMRectReadOnly.cpp
     GPC/GlobalPrivacyControl.cpp
-    HighResolutionTime/Performance.cpp
     HighResolutionTime/TimeOrigin.cpp
     HTML/AbstractWorker.cpp
     HTML/BitmapDecodedImageData.cpp
@@ -515,6 +506,7 @@ set(SOURCES
     HTML/HTMLVideoElement.cpp
     HTML/HyperlinkElementUtils.cpp
     HTML/ImageBitmap.cpp
+    HTML/ImageBitmapRenderingContext.cpp
     HTML/ImageData.cpp
     HTML/ImageRequest.cpp
     HTML/ListOfAvailableImages.cpp
@@ -573,7 +565,6 @@ set(SOURCES
     HTML/RadioNodeList.cpp
     HTML/RemoteNavigable.cpp
     HTML/RemoteWindow.cpp
-    HTML/Sanitizer.cpp
     HTML/SanitizerConfiguration.cpp
     HTML/Scripting/Agent.cpp
     HTML/Scripting/ClassicScript.cpp
@@ -590,6 +581,7 @@ set(SOURCES
     HTML/Scripting/ModuleMap.cpp
     HTML/Scripting/ModuleScript.cpp
     HTML/Scripting/Script.cpp
+    HTML/Scripting/ScriptAbortHandle.cpp
     HTML/Scripting/ScriptRegistry.cpp
     HTML/Scripting/SimilarOriginWindowAgent.cpp
     HTML/Scripting/TemporaryExecutionContext.cpp
@@ -634,6 +626,7 @@ set(SOURCES
     HTML/VideoPlaybackQuality.cpp
     HTML/VideoTrack.cpp
     HTML/VideoTrackList.cpp
+    HTML/VisibilityStateEntry.cpp
     HTML/WebViewHints.cpp
     HTML/Window.cpp
     HTML/WindowEventHandlers.cpp
@@ -700,10 +693,7 @@ set(SOURCES
     MediaSourceExtensions/SourceBufferList.cpp
     MixedContent/AbstractOperations.cpp
     Namespace.cpp
-    NavigationTiming/EntryNames.cpp
-    NavigationTiming/PerformanceNavigation.cpp
     NavigationTiming/PerformanceNavigationTiming.cpp
-    NavigationTiming/PerformanceTiming.cpp
     NotificationsAPI/Notification.cpp
     NotificationsAPI/NotificationPermission.cpp
     Page/AutoScrollHandler.cpp
@@ -732,11 +722,6 @@ set(SOURCES
     Painting/Scrolling.cpp
     Painting/ScrollSnap.cpp
     Painting/SvgPaintResources.cpp
-    PerformanceTimeline/EntryTypes.cpp
-    PerformanceTimeline/EventNames.cpp
-    PerformanceTimeline/PerformanceEntry.cpp
-    PerformanceTimeline/PerformanceObserver.cpp
-    PerformanceTimeline/PerformanceObserverEntryList.cpp
     PermissionsAPI/Permissions.cpp
     PermissionsAPI/PermissionStore.cpp
     PermissionsAPI/PermissionStatus.cpp
@@ -747,6 +732,7 @@ set(SOURCES
     Platform/FontPlugin.cpp
     Platform/ImageCodecPlugin.cpp
     Platform/RemoteImageCodecPlugin.cpp
+    Platform/ThreadPoolWork.cpp
     Platform/Timer.cpp
     ReferrerPolicy/AbstractOperations.cpp
     RequestIdleCallback/IdleDeadline.cpp
@@ -758,7 +744,6 @@ set(SOURCES
     Selection/Selection.cpp
     Selection/CaretNavigation.cpp
     Selection/SelectionModifier.cpp
-    ServerTiming/PerformanceServerTiming.cpp
     ServiceWorker/Cache.cpp
     ServiceWorker/CacheStorage.cpp
     ServiceWorker/EventNames.cpp
@@ -770,16 +755,7 @@ set(SOURCES
     ServiceWorker/ServiceWorkerGlobalScope.cpp
     ServiceWorker/ServiceWorkerRecord.cpp
     ServiceWorker/ServiceWorkerRegistration.cpp
-    Speech/SpeechGrammar.cpp
-    Speech/SpeechGrammarList.cpp
-    Speech/SpeechRecognition.cpp
-    Speech/SpeechRecognitionAlternative.cpp
-    Speech/SpeechRecognitionEvent.cpp
-    Speech/SpeechRecognitionResult.cpp
-    Speech/SpeechRecognitionResultList.cpp
     Speech/SpeechSynthesis.cpp
-    Speech/SpeechSynthesisUtterance.cpp
-    Speech/SpeechSynthesisVoice.cpp
     SRI/IntegrityPolicy.cpp
     SRI/SRI.cpp
     StorageAPI/NavigatorStorage.cpp
@@ -872,6 +848,7 @@ set(SOURCES
     SVG/SVGPreserveAspectRatio.cpp
     SVG/SVGRadialGradientElement.cpp
     SVG/SVGRectElement.cpp
+    SVG/SVGResourceDocument.cpp
     SVG/SVGScriptElement.cpp
     SVG/SVGSetElement.cpp
     SVG/SVGStopElement.cpp
@@ -917,71 +894,21 @@ set(SOURCES
     UIEvents/TouchList.cpp
     UIEvents/UIEvent.cpp
     UIEvents/WheelEvent.cpp
-    UserTiming/PerformanceMark.cpp
-    UserTiming/PerformanceMeasure.cpp
     ViewTransition/ViewTransition.cpp
-    VisualLines.cpp
     WebLocks/AbstractOperations.cpp
-    WebLocks/Lock.cpp
     WebLocks/LockManager.cpp
-    WebLocks/LockRequest.cpp
     WebLocks/NavigatorLocks.cpp
     WebAssembly/WebAssembly.cpp
     WebAudio/AnalyserNode.cpp
-    WebAudio/AudioParamMap.cpp
     WebAudio/AudioWorklet.cpp
     WebAudio/AudioWorkletGlobalScope.cpp
     WebAudio/AudioWorkletNode.cpp
     WebAudio/AudioWorkletProcessor.cpp
-    WebAudio/AudioArray.cpp
-    WebAudio/AudioBuffer.cpp
-    WebAudio/AudioBufferSourceNode.cpp
     WebAudio/AudioContext.cpp
-    WebAudio/AudioDestinationNode.cpp
-    WebAudio/AudioListener.cpp
-    WebAudio/AudioNode.cpp
-    WebAudio/AudioParam.cpp
-    WebAudio/AudioParamTimeline.cpp
-    WebAudio/AudioProcessingEvent.cpp
-    WebAudio/AudioScheduledSourceNode.cpp
     WebAudio/BaseAudioContext.cpp
-    WebAudio/BiquadFilterNode.cpp
-    WebAudio/ChannelMergerNode.cpp
-    WebAudio/ChannelSplitterNode.cpp
-    WebAudio/ConstantSourceNode.cpp
-    WebAudio/ControlMessageQueue.cpp
-    WebAudio/ConvolverNode.cpp
-    WebAudio/DelayNode.cpp
-    WebAudio/DynamicsCompressorNode.cpp
-    WebAudio/GainNode.cpp
-    WebAudio/IIRFilterNode.cpp
     WebAudio/MediaElementAudioSourceNode.cpp
     WebAudio/MediaStreamAudioDestinationNode.cpp
     WebAudio/MediaStreamAudioSourceNode.cpp
-    WebAudio/OfflineAudioCompletionEvent.cpp
-    WebAudio/OfflineAudioContext.cpp
-    WebAudio/OscillatorNode.cpp
-    WebAudio/PannerNode.cpp
-    WebAudio/PeriodicWave.cpp
-    WebAudio/Rendering/AnalyserRenderNode.cpp
-    WebAudio/Rendering/AudioBus.cpp
-    WebAudio/Rendering/AudioWorkletPipe.cpp
-    WebAudio/Rendering/AudioWorkletRenderNode.cpp
-    WebAudio/Rendering/BiquadCoefficients.cpp
-    WebAudio/Rendering/ConvolverKernel.cpp
-    WebAudio/Rendering/FFT.cpp
-    WebAudio/Rendering/MediaStreamDestinationRenderNode.cpp
-    WebAudio/Rendering/MediaStreamSourceRenderNode.cpp
-    WebAudio/Rendering/OfflineAudioRenderer.cpp
-    WebAudio/Rendering/RealtimeAudioRenderer.cpp
-    WebAudio/Rendering/RenderGraph.cpp
-    WebAudio/Rendering/RenderNode.cpp
-    WebAudio/Rendering/RenderNodes.cpp
-    WebAudio/Rendering/ScriptProcessorPipe.cpp
-    WebAudio/Rendering/ScriptProcessorRenderNode.cpp
-    WebAudio/ScriptProcessorNode.cpp
-    WebAudio/StereoPannerNode.cpp
-    WebAudio/WaveShaperNode.cpp
     WebDriver/Actions.cpp
     WebDriver/BiDi/BiDi.cpp
     WebDriver/BiDi/BrowsingContext.cpp
@@ -1048,12 +975,8 @@ set(SOURCES
     WebVTT/Parser.cpp
     WebVTT/VTTCue.cpp
     WebVTT/VTTRegion.cpp
-    XHR/EventNames.cpp
     XHR/FormData.cpp
-    XHR/ProgressEvent.cpp
     XHR/XMLHttpRequest.cpp
-    XHR/XMLHttpRequestEventTarget.cpp
-    XHR/XMLHttpRequestUpload.cpp
     XLink/AttributeNames.cpp
     XML/XMLDocumentBuilder.cpp
     XML/XMLFragmentParser.cpp
@@ -1132,6 +1055,7 @@ sync_rust_crate_ffi_headers(
     FFI_HEADERS
         HTML/Parser/RustFFI.h
         RustFFI.h
+        WebAudio/RustFFI.h
         SVG/ParserRustFFI.h
         SelectorRustFFI.h
         StyleValueRustFFI.h
@@ -1142,6 +1066,7 @@ sync_rust_crate_ffi_headers(
         SelectorStateFactsGenerated.inc
         Layout/TreeBuilderRustFFI.h
         Layout/LayoutRustFFI.h
+        Compositor/RenderClockRustFFI.h
 )
 add_dependencies(LibWeb libweb_rust-ffi-headers)
 target_link_libraries(libweb_bindings_rust INTERFACE LibGfx LibGC LibUnicode)

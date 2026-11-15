@@ -4,9 +4,13 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-use super::builder::{for_each_command, inline_transform_of, read_command};
+use super::builder::{HEADER_SIZE, for_each_command, inline_transform_of, read_command};
 use super::commands::*;
+use super::effect_clip_plan::EffectClipPlan;
+use super::layers::{LayerPlan, LayerPlanInputs, build_layer_plan};
 use super::nested_records::{NestedRecordsRole, for_each_nested_record_span, span_bytes};
+use super::storage::DisplayListStorage;
+use super::summary::{LiveContent, summarize};
 use crate::css::color_resolution::format_to_8bit_compatible;
 use crate::layout::LayoutNodeArena;
 use crate::layout::node_data::NodeSlotId;
@@ -15,11 +19,11 @@ use crate::painting::dump::{
     push_float_size, push_int_point, push_int_rect, push_int_size,
 };
 use crate::painting::paint_read::PaintRead;
-#[cfg(test)]
 use crate::painting::visual_context::VisualContextTree;
 use crate::painting::visual_context::VisualContextTreeDump;
 use crate::painting::visual_context::dump::SlotKind;
 use crate::stage::MainThread;
+use libcompositing_rust::visual_context::CompositorScrollTable;
 use libgfx_rust::path::Path;
 use libgfx_rust::{
     Color, CompositingAndBlendingOperator, CornerRadii, FloatPoint, FloatRect, FloatSize, IntPoint, IntRect, IntSize,
@@ -42,8 +46,6 @@ pub struct FfiPaintingDumpCallbacks {
     context: *mut c_void,
     /// Describes the row in the slot, as its layout node describes itself.
     debug_description: extern "C" fn(context: *mut c_void, slot: NodeSlotId, description_sink: *mut c_void),
-    /// Answers the storage handle of a nested display list.
-    nested_display_list: extern "C" fn(context: *mut c_void, display_list_id: u64) -> *const c_void,
     append_text: extern "C" fn(context: *mut c_void, bytes: *const u8, byte_count: usize),
 }
 
@@ -56,16 +58,21 @@ impl FfiPaintingDumpCallbacks {
         String::from_utf8_lossy(&description).into_owned()
     }
 
-    fn nested_display_list(&self, _: &MainThread, display_list_id: DisplayListResourceId) -> *const c_void {
-        // Nested ids come from records the host produced, so they resolve in its storage.
-        let display_list = (self.nested_display_list)(self.context, display_list_id.0);
-        assert!(!display_list.is_null());
-        display_list
-    }
-
     fn append_text(&self, _: &MainThread, text: &str) {
         // The C++ sink copies the completed dump synchronously.
         (self.append_text)(self.context, text.as_ptr(), text.len());
+    }
+}
+
+/// The display lists the dumped one nests, at any depth.
+struct DumpCallbacks<'a> {
+    nested_display_lists: &'a HashMap<u64, std::sync::Arc<crate::painting::display_list_resources::NestedDisplayList>>,
+}
+
+impl DumpCallbacks<'_> {
+    fn nested_display_list(&self, display_list_id: DisplayListResourceId) -> &DisplayListStorage {
+        // Nested ids come from records the recording produced, so they resolve in what it draws.
+        &self.nested_display_lists[&display_list_id.0].resource.storage
     }
 }
 
@@ -113,26 +120,102 @@ impl VisualContextNodeOwners {
     }
 }
 
+/// Hands `append_line` each animation the compositor runs for the document of `host`, in the order the tree holds
+/// them: the property it animates (0 for opacity, 1 for background color, 2 for filter, 3 for transform) and the element
+/// of the box owning the node it drives, or zero. Answers, in bit 0, whether the animations share one timing anchor and,
+/// in bit 1, whether every one drives a live node.
+///
 /// # Safety
 ///
-/// `host` must be a live document host, on its document's thread, and `visual_context_tree` a live retained tree
-/// handle built from its render state; `display_list` is the storage handle of the display list, and it and every
-/// storage handle `callbacks` returns must remain live for this call. `debug_description` is called synchronously
-/// with a `Vec<u8>` sink the host fills through `layout_arena_paint_push_bytes`.
+/// `host` must be a live document host, on its document's thread, and `append_line` must return before the next call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn render_state_dump_compositor_animations(
+    host: &crate::render_state::DocumentHost,
+    read: &crate::render_state::BegunRead,
+    viewport: NodeSlotId,
+    context: *mut c_void,
+    append_line: unsafe extern "C" fn(*mut c_void, u8, u32),
+) -> u8 {
+    use crate::painting::host::FfiVisualAnimationTargetKind;
+    let (lines, flags) = crate::painting::ffi::read_arena(host, read, viewport, |arena, viewport| {
+        let Some(tree) = arena.paint_state().visual_context.tree.clone() else {
+            return (Vec::new(), 3);
+        };
+        let owners = VisualContextNodeOwners::collect(arena, viewport);
+        let lines = tree
+            .visual_animations()
+            .iter()
+            .map(|animation| {
+                let kind = match animation.target_kind {
+                    FfiVisualAnimationTargetKind::Opacity => 0,
+                    FfiVisualAnimationTargetKind::BackgroundColor => 1,
+                    FfiVisualAnimationTargetKind::Filter => 2,
+                    FfiVisualAnimationTargetKind::Transform => 3,
+                };
+                let slot_kind = match animation.target_kind {
+                    FfiVisualAnimationTargetKind::Transform => SlotKind::Spatial,
+                    _ => SlotKind::Effect,
+                };
+                let element = animation
+                    .node_indices
+                    .first()
+                    .and_then(|&index| owners.owner(slot_kind, index))
+                    .and_then(|slot| arena.node_style_node(slot))
+                    .map_or(0, |element| element.raw());
+                (kind, element)
+            })
+            .collect::<Vec<_>>();
+        let summary = tree.visual_animation_summary();
+        (
+            lines,
+            u8::from(summary.share_timing_anchor) | (u8::from(summary.targets_are_valid) << 1),
+        )
+    });
+    for (kind, element) in lines {
+        // SAFETY: Guaranteed by the caller.
+        unsafe { append_line(context, kind, element) };
+    }
+    flags
+}
+
+/// # Safety
+///
+/// Dumps `display_list` with the nodes it names of the visual context tree of `host`'s document, prepared up to date.
+///
+/// # Safety
+///
+/// `host` must be a live document host, on its document's thread; `display_list` is the storage handle of the display
+/// list, and it and every storage handle `callbacks` returns must remain live for this call. `debug_description` is
+/// called synchronously with a `Vec<u8>` sink the host fills through `layout_arena_paint_push_bytes`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn painting_dump(
     host: &crate::render_state::DocumentHost,
     read: &crate::render_state::BegunRead,
     viewport: NodeSlotId,
-    visual_context_tree: *const c_void,
-    display_list: *const c_void,
+    device_viewport_rect: IntRect,
     callbacks: FfiPaintingDumpCallbacks,
 ) {
-    assert!(!display_list.is_null());
     // SAFETY: Guaranteed by the entry point's contract.
     let main_thread = unsafe { main_thread(host) };
-    let visual_context_tree = unsafe { libcompositing_rust::ffi::tree_from_handle(visual_context_tree) };
-    let (_, command_runs) = unsafe { libcompositing_rust::display_list::storage::tape_of(display_list) };
+    // SAFETY: As above.
+    let visual_context_tree = unsafe { crate::painting::ffi::main_visual_context_tree(host, read) }
+        .expect("a document with a committed viewport box has a visual context tree");
+    let visual_context_tree = visual_context_tree.as_ref();
+    let recording =
+        crate::painting::ffi::read_arena(host, read, (), |arena, ()| arena.paint_state().last_recording.clone())
+            .expect("the dump records the document first");
+    let display_list = DisplayListStorage::recorded(
+        recording.display_list.clone(),
+        recording
+            .visual_context_tree
+            .clone()
+            .expect("a recording was recorded against a tree"),
+    );
+    let nested_display_lists = recording.resources.with_nested_resources().nested_display_lists;
+    let dump_callbacks = DumpCallbacks {
+        nested_display_lists: &nested_display_lists,
+    };
+    let (tape, command_runs) = (display_list.bytes(), display_list.command_runs());
     let owners = {
         crate::painting::ffi::read_arena(host, read, viewport, |arena, viewport| {
             let mut owners = VisualContextNodeOwners::collect(arena, viewport);
@@ -146,8 +229,28 @@ pub unsafe extern "C" fn painting_dump(
         let owner = owners.owner(kind, index)?;
         Some(callbacks.debug_description(&main_thread, owner))
     });
+    dump_compositor_scroll_table(&mut output, visual_context_tree.compositor_scroll_table());
+    let layer_plan = dump_layers_if_every_canvas_and_video_kept_updating(
+        &mut output,
+        tape,
+        command_runs,
+        visual_context_tree,
+        host.scroll_state().device_offsets(),
+        device_viewport_rect,
+    );
     output.push_str("\nDisplayList:\n");
-    dump_commands(&main_thread, &mut output, &callbacks, display_list, 0);
+    match layer_plan {
+        Some(layer_plan) => {
+            dump_top_level_commands_with_their_layers(
+                &main_thread,
+                &mut output,
+                &dump_callbacks,
+                &display_list,
+                &layer_plan,
+            );
+        }
+        None => dump_commands(&main_thread, &mut output, &dump_callbacks, &display_list, 0),
+    }
     callbacks.append_text(&main_thread, &output);
 }
 
@@ -155,25 +258,148 @@ fn push_indent(output: &mut String, indent: usize) {
     output.extend(std::iter::repeat_n(' ', indent * 2));
 }
 
+// Lists every row, unlike the tree section above it, which shows only the nodes that command runs reach.
+fn dump_compositor_scroll_table(output: &mut String, table: &CompositorScrollTable) {
+    if table.nodes.is_empty() {
+        return;
+    }
+    output.push_str("\nScrollNodes:\n");
+    for node in table.nodes.iter() {
+        output.push_str("ScrollNode");
+        write_field(output, "scroll_node_index", node.scroll_node_index);
+        write_field(output, "parent_scroll_node_index", node.parent_scroll_node_index);
+        write_field(output, "scrollport_rect", node.scrollport_rect);
+        write_field(output, "min_scroll_offset", node.min_scroll_offset);
+        write_field(output, "max_scroll_offset", node.max_scroll_offset);
+        writeln!(output, " is_viewport={}", node.is_viewport).unwrap();
+        let Ok(container_index) = table
+            .snap_containers
+            .binary_search_by_key(&node.scroll_node_index, |container| container.scroll_node_index)
+        else {
+            continue;
+        };
+        let container = &table.snap_containers[container_index];
+        push_indent(output, 1);
+        output.push_str("SnapContainer");
+        write_field(output, "snapport", container.snapport);
+        write_field(output, "min_scroll_offset", container.min_scroll_offset);
+        write_field(output, "max_scroll_offset", container.max_scroll_offset);
+        writeln!(
+            output,
+            " strictness={} snaps_x={} snaps_y={} horizontal_writing_mode={}",
+            container.strictness, container.snaps_x, container.snaps_y, container.horizontal_writing_mode
+        )
+        .unwrap();
+        let first_area_index = container.first_area_index as usize;
+        for area in &table.snap_areas[first_area_index..first_area_index + container.area_count as usize] {
+            push_indent(output, 2);
+            output.push_str("SnapArea");
+            write!(output, " pseudo_element_type={}", area.pseudo_element_type).unwrap();
+            write_field(output, "rect", area.rect);
+            writeln!(
+                output,
+                " align_x={} align_y={} always_stop={}",
+                area.align_x, area.align_y, area.always_stop
+            )
+            .unwrap();
+        }
+    }
+}
+
 fn dump_commands(
     main_thread: &MainThread,
     output: &mut String,
-    callbacks: &FfiPaintingDumpCallbacks,
-    display_list: *const c_void,
+    callbacks: &DumpCallbacks,
+    display_list: &DisplayListStorage,
     base_indent: usize,
 ) {
-    // SAFETY: The caller keeps the storage live for the dump.
-    let (bytes, command_runs) = unsafe { libcompositing_rust::display_list::storage::tape_of(display_list) };
+    let (bytes, command_runs) = (display_list.bytes(), display_list.command_runs());
     for run in command_runs {
         let run_bytes = &bytes[run.offset as usize..(run.offset + run.size) as usize];
         dump_command_bytes(main_thread, output, callbacks, run_bytes, run.context, base_indent);
     }
 }
 
+// A list that draws no canvas or video gets no section.
+fn dump_layers_if_every_canvas_and_video_kept_updating(
+    output: &mut String,
+    tape: &[u8],
+    command_runs: &[DisplayListCommandRun],
+    tree: &VisualContextTree,
+    scroll_offsets: &[FloatPoint],
+    device_viewport_rect: IntRect,
+) -> Option<LayerPlan> {
+    let summary = summarize(tape, command_runs);
+    let mut canvases_and_videos = Vec::new();
+    for live_content_record in &summary.live_content_records {
+        let content = live_content_record.content;
+        if matches!(content, LiveContent::Canvas(_) | LiveContent::VideoFrame(_))
+            && !canvases_and_videos.contains(&content)
+        {
+            canvases_and_videos.push(content);
+        }
+    }
+    if canvases_and_videos.is_empty() {
+        return None;
+    }
+    let effect_clips =
+        EffectClipPlan::new(tree, command_runs).expect("a display list's runs name live nodes of its tree");
+    let layer_plan = build_layer_plan(&LayerPlanInputs {
+        tape,
+        command_runs,
+        summary: &summary,
+        effect_clips: &effect_clips,
+        tree,
+        scroll_offsets,
+        viewport_rect: device_viewport_rect,
+        active_media: &canvases_and_videos,
+    });
+    match layer_plan {
+        Ok(layer_plan) => {
+            output.push_str("\nLayers:\n");
+            layer_plan.write_layer_lines(output, "  ").unwrap();
+            Some(layer_plan)
+        }
+        Err(unlayered_reason) => {
+            writeln!(output, "\nLayers: none ({unlayered_reason})").unwrap();
+            None
+        }
+    }
+}
+
+// Each top-level command starts with the layer it draws into. The records nested in it draw into the same layer.
+fn dump_top_level_commands_with_their_layers(
+    main_thread: &MainThread,
+    output: &mut String,
+    callbacks: &DumpCallbacks,
+    display_list: &DisplayListStorage,
+    layer_plan: &LayerPlan,
+) {
+    let (bytes, command_runs) = (display_list.bytes(), display_list.command_runs());
+    for run in command_runs {
+        let run_bytes = &bytes[run.offset as usize..(run.offset + run.size) as usize];
+        for_each_command(run_bytes, |_, offset_in_run, payload| {
+            let layer_label = format!("L{} ", layer_plan.layer_of_record(run.offset + offset_in_run as u32));
+            let record_bytes = &run_bytes[offset_in_run..offset_in_run + HEADER_SIZE + payload.len()];
+            let record_dump_start = output.len();
+            dump_command_bytes(main_thread, output, callbacks, record_bytes, run.context, 0);
+            let record_dump = output.split_off(record_dump_start);
+            for (line_index, line) in record_dump.split_inclusive('\n').enumerate() {
+                if line_index == 0 {
+                    output.push_str(&layer_label);
+                } else {
+                    output.extend(std::iter::repeat_n(' ', layer_label.len()));
+                }
+                output.push_str(line);
+            }
+        });
+    }
+}
+
 fn dump_command_bytes(
     main_thread: &MainThread,
     output: &mut String,
-    callbacks: &FfiPaintingDumpCallbacks,
+    callbacks: &DumpCallbacks,
     command_bytes: &[u8],
     context: ContextRef,
     base_indent: usize,
@@ -208,7 +434,7 @@ fn dump_command_bytes(
             main_thread,
             output,
             callbacks,
-            callbacks.nested_display_list(main_thread, nested.display_list),
+            callbacks.nested_display_list(nested.display_list),
             base_indent + 1,
         );
     });
@@ -230,7 +456,7 @@ fn nested_display_lists(command_type: DisplayListCommandType, payload: &[u8]) ->
 fn dump_records_inside(
     main_thread: &MainThread,
     output: &mut String,
-    callbacks: &FfiPaintingDumpCallbacks,
+    callbacks: &DumpCallbacks,
     command_type: DisplayListCommandType,
     payload: &[u8],
     context: ContextRef,
@@ -328,6 +554,9 @@ fn dump_command(output: &mut String, command_type: DisplayListCommandType, paylo
     match command_type {
         DisplayListCommandType::DrawGlyphRun => {
             let command = read_command::<DrawGlyphRun>(payload);
+            if command.stroke_width > 0.0 {
+                write_field(output, "stroke_width", command.stroke_width);
+            }
             write_field(output, "rect", command.rect);
             write_field(output, "translation", command.translation);
             write_field(output, "color", command.color);
@@ -397,7 +626,6 @@ fn dump_command(output: &mut String, command_type: DisplayListCommandType, paylo
         DisplayListCommandType::DrawCanvas => {
             let command = read_command::<DrawCanvas>(payload);
             write_field(output, "dst_rect", command.dst_rect);
-            write!(output, " content_generation={}", command.content_generation).unwrap();
         }
         DisplayListCommandType::DrawVideoFrame => {
             let command = read_command::<DrawVideoFrame>(payload);
@@ -578,15 +806,6 @@ fn dump_command(output: &mut String, command_type: DisplayListCommandType, paylo
             write_field(output, "rect", command.rect);
             write!(output, " effect=e{}", command.effect.0).unwrap();
         }
-        DisplayListCommandType::CompositorScrollNode => {
-            let command = read_command::<CompositorScrollNode>(payload);
-            write_field(output, "scroll_node_index", command.scroll_node_index);
-            write_field(output, "parent_scroll_node_index", command.parent_scroll_node_index);
-            write_field(output, "scrollport_rect", command.scrollport_rect);
-            write_field(output, "min_scroll_offset", command.min_scroll_offset);
-            write_field(output, "max_scroll_offset", command.max_scroll_offset);
-            write!(output, " is_viewport={}", command.is_viewport).unwrap();
-        }
         DisplayListCommandType::CompositorBlockingWheelEventRegion => {
             let command = read_command::<CompositorBlockingWheelEventRegion>(payload);
             write_field(output, "rect", command.rect);
@@ -628,6 +847,7 @@ fn dump_command(output: &mut String, command_type: DisplayListCommandType, paylo
             write_field(output, "min_scroll_offset", command.min_scroll_offset);
             write_field(output, "max_scroll_offset", command.max_scroll_offset);
             write_field(output, "thumb_color", command.thumb_color);
+            write_field(output, "thumb_outline_color", command.thumb_outline_color);
             write_field(output, "track_color", command.track_color);
             write!(
                 output,
@@ -637,31 +857,6 @@ fn dump_command(output: &mut String, command_type: DisplayListCommandType, paylo
             .unwrap();
         }
         DisplayListCommandType::PaintScrollBar => {}
-        DisplayListCommandType::CompositorSnapContainer => {
-            let command = read_command::<CompositorSnapContainer>(payload);
-            write_field(output, "scroll_node_index", command.scroll_node_index);
-            write_field(output, "snapport", command.snapport);
-            write_field(output, "min_scroll_offset", command.min_scroll_offset);
-            write_field(output, "max_scroll_offset", command.max_scroll_offset);
-            write!(
-                output,
-                " strictness={} snaps_x={} snaps_y={} horizontal_writing_mode={}",
-                command.strictness, command.snaps_x, command.snaps_y, command.horizontal_writing_mode
-            )
-            .unwrap();
-        }
-        DisplayListCommandType::CompositorSnapArea => {
-            let command = read_command::<CompositorSnapArea>(payload);
-            write_field(output, "scroll_node_index", command.scroll_node_index);
-            write!(output, " pseudo_element_type={}", command.pseudo_element_type).unwrap();
-            write_field(output, "rect", command.rect);
-            write!(
-                output,
-                " align_x={} align_y={} always_stop={}",
-                command.align_x, command.align_y, command.always_stop
-            )
-            .unwrap();
-        }
         // The display list of a page holds none of the commands of the canvas 2D stream.
         DisplayListCommandType::Canvas2DFillPath
         | DisplayListCommandType::Canvas2DStrokePath

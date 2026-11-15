@@ -78,6 +78,7 @@ fn generate_media_features(manifest_dir: &Path, out_dir: &Path) -> Result<(), Bo
              pub accepted_value_types: u8,\n\
              pub accepted_keywords: &'static [u16],\n\
              pub false_keywords: &'static [u16],\n\
+             pub implied_keywords: &'static [(u16, u16)],\n\
          }\n\n\
          pub(crate) const MEDIA_FEATURES: &[MediaFeatureMetadata] = &[\n",
     );
@@ -130,9 +131,28 @@ fn generate_media_features(manifest_dir: &Path, out_dir: &Path) -> Result<(), Bo
             .transpose()?
             .unwrap_or_default()
             .join(", ");
+        // Each environment keyword maps to the queried keywords that it matches as well as itself.
+        let mut implied_keywords = Vec::new();
+        if let Some(implications) = feature.get("implied-keywords") {
+            let implications = implications.as_object().ok_or("implied keywords are not an object")?;
+            for (environment_keyword, queried_keywords) in implications {
+                let queried_keywords = queried_keywords
+                    .as_array()
+                    .ok_or("implied keywords of a keyword are not an array")?;
+                for queried_keyword in queried_keywords {
+                    let queried_keyword = queried_keyword.as_str().ok_or("implied keyword is not a string")?;
+                    implied_keywords.push(format!(
+                        "(crate::css::css_enums::keyword::{}, crate::css::css_enums::keyword::{})",
+                        keyword_constant(environment_keyword),
+                        keyword_constant(queried_keyword)
+                    ));
+                }
+            }
+        }
+        let implied_keywords = implied_keywords.join(", ");
         writeln!(
             output,
-            "    MediaFeatureMetadata {{ name: \"{name}\", allows_range: {allows_range}, accepted_value_types: {value_types}, accepted_keywords: &[{accepted_keywords}], false_keywords: &[{false_keywords}] }},"
+            "    MediaFeatureMetadata {{ name: \"{name}\", allows_range: {allows_range}, accepted_value_types: {value_types}, accepted_keywords: &[{accepted_keywords}], false_keywords: &[{false_keywords}], implied_keywords: &[{implied_keywords}] }},"
         )?;
     }
     output.push_str("];\n");
@@ -889,6 +909,8 @@ fn generate_property_metadata(manifest_dir: &Path, out_dir: &Path) -> Result<(),
         "font-size",
         "font-size-adjust",
         "font-style",
+        "font-synthesis-style",
+        "font-synthesis-weight",
         "font-variant-alternates",
         "font-variant-caps",
         "font-variant-east-asian",
@@ -2330,7 +2352,6 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
             "ReplayClip",
             "ReplayLayer",
             "ReplayMask",
-            "FfiVisualViewportTransform",
         ]
         .map(String::from),
     );
@@ -2371,7 +2392,6 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
         ("ReplayClip", "Compositing::ReplayClip"),
         ("ReplayLayer", "Compositing::ReplayLayer"),
         ("ReplayMask", "Compositing::ReplayMask"),
-        ("FfiVisualViewportTransform", "Compositing::TransformWithOrigin"),
     ] {
         config.export.rename.insert(rust_name.to_string(), cpp_name.to_string());
     }
@@ -2394,7 +2414,7 @@ fn expose_shared_abi_types_as_cpp_types(config: &mut cbindgen::Config) {
             "LibGfx/Vector3.h",
             "LibGfx/WindingRule.h",
             "LibWeb/Forward.h",
-            "LibCompositing/DisplayList/AccumulatedVisualContext.h",
+            "LibCompositing/DisplayList/ContextRef.h",
             "LibWeb/Painting/ChromeMetrics.h",
             "LibCompositing/DisplayList/DisplayListCommandsGenerated.h",
         ]
@@ -2415,8 +2435,6 @@ fn expose_compositing_types_as_cpp_types(config: &mut cbindgen::Config) {
         "FfiVisualAnimationTransformOperationKind",
         "FfiCompositorAnimationPublishOutcome",
         "FfiVisualAnimationSummary",
-        "FfiAnimatedContentViewportEffect",
-        "FfiTestStickyConstraints",
         "FfiDisplayListReplayCallbacks",
         "FfiEasingDescriptor",
         "FfiEasingKind",
@@ -2428,7 +2446,15 @@ fn expose_compositing_types_as_cpp_types(config: &mut cbindgen::Config) {
             .rename
             .insert(name.to_string(), format!("Compositing::RustFFI::{name}"));
     }
+    config.export.exclude.push("SnapSelectionStrategyType".to_string());
+    config.export.rename.insert(
+        "SnapSelectionStrategyType".to_string(),
+        "Compositing::SnapSelectionStrategy::Type".to_string(),
+    );
     config.includes.push("LibCompositing/RustFFI.h".to_string());
+    config
+        .includes
+        .push("LibCompositing/Scrolling/ScrollSnapSelection.h".to_string());
 }
 
 /// Names the document host and the begun read as the layout header declares them, for a header whose entries take them.
@@ -2466,6 +2492,35 @@ fn main() -> Result<(), Box<dyn Error>> {
     generate_transform_functions(&manifest_dir, &out_dir)?;
 
     let base_config = cbindgen::Config::from_file(manifest_dir.join("cbindgen.toml"))?;
+
+    let mut web_audio_config = base_config.clone();
+    web_audio_config.namespaces = Some(vec!["Web".into(), "WebAudio".into(), "RustFFI".into()]);
+    for name in ["NodeHandle", "ControlMessageQueue", "RealtimeAudioRenderer"] {
+        web_audio_config.export.rename.insert(name.into(), "void".into());
+        web_audio_config.export.exclude.push(name.into());
+    }
+    web_audio_config.export.include.push("AutomationRate".into());
+    web_audio_config.export.item_types = vec![
+        cbindgen::ItemType::Enums,
+        cbindgen::ItemType::Structs,
+        cbindgen::ItemType::Typedefs,
+        cbindgen::ItemType::OpaqueItems,
+        cbindgen::ItemType::Functions,
+    ];
+    generate_ffi_header(
+        web_audio_config,
+        &[
+            manifest_dir.join("src/web_audio/rendering/render_node.rs"),
+            manifest_dir.join("src/web_audio/rendering/audio_frame_ring.rs"),
+            manifest_dir.join("src/web_audio/rendering/media_stream_destination_render_node.rs"),
+            manifest_dir.join("src/web_audio/rendering/pipe_callbacks.rs"),
+            manifest_dir.join("src/web_audio/rendering/realtime_audio_renderer.rs"),
+            manifest_dir.join("src/web_audio/control_message.rs"),
+            manifest_dir.join("src/web_audio/control_thread.rs"),
+        ],
+        &out_dir,
+        Path::new("WebAudio/RustFFI.h"),
+    );
 
     // CSS tokenizer header — namespace Web::CSS::Parser::FFI, CSS types only.
     let mut css_config = base_config.clone();
@@ -2730,6 +2785,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     style_engine_config.export.include = vec![
         // Taken only by an entry of the boundary table, which cbindgen does not see.
         "FfiAppliedAnimationDefinition".to_string(),
+        "FfiFrameSetDimension".to_string(),
+        "FfiFrameSetBorder".to_string(),
         // Named by no exported signature: a replaced content input crosses as its raw values.
         "FfiReplacedContentInputKind".to_string(),
         "FfiReplacedContentInputPresent".to_string(),
@@ -2946,6 +3003,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     // An animation sample and plan read the document's style engine, which the document host reaches.
     declare_document_host_of_layout_header(&mut computed_values_config);
 
+    computed_values_config.export.rename.insert(
+        "FfiAnimationEffectDescriptions".to_string(),
+        "Web::CSS::StyleEngineFFI::FfiAnimationEffectDescriptions".to_string(),
+    );
+    computed_values_config
+        .after_includes
+        .get_or_insert_with(String::new)
+        .push_str("\nnamespace Web::CSS::StyleEngineFFI { struct FfiAnimationEffectDescriptions; }");
+
     let libgfx_font_source = manifest_dir.join("../../LibGfx/Rust/src/font.rs");
     println!("cargo:rerun-if-changed={}", libgfx_font_source.display());
     generate_ffi_header(
@@ -3024,7 +3090,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             manifest_dir.join("src/css/ffi_support.rs"),
             manifest_dir.join("src/layout/node_data.rs"),
             manifest_dir.join("src/layout/partial_relayout.rs"),
-            manifest_dir.join("src/layout/box_removal.rs"),
             manifest_dir.join("src/layout/tree_builder.rs"),
             manifest_dir.join("src/layout/tree_update_marks.rs"),
             manifest_dir.join("src/render_state.rs"),
@@ -3035,6 +3100,36 @@ fn main() -> Result<(), Box<dyn Error>> {
         ],
         &out_dir,
         Path::new("Layout/TreeBuilderRustFFI.h"),
+    );
+
+    // The lanes of the render clock - namespace Web::Compositor::RustFFI, layered on the layout header for the ticks
+    // the lanes hand on.
+    let mut render_clock_config = base_config.clone();
+    render_clock_config.namespaces = Some(vec!["Web".to_string(), "Compositor".to_string(), "RustFFI".to_string()]);
+    for (rust_name, cpp_name) in [
+        ("ArcRef", "Web::Layout::RustFFI::ArcRef"),
+        ("ClockTicks", "Web::Layout::RustFFI::ClockTicks"),
+        ("FfiThreadSafeMessagePoster", "IPC::FfiThreadSafeMessagePoster"),
+        ("RawMessage", "IPC::FfiRawMessage"),
+    ] {
+        render_clock_config
+            .export
+            .rename
+            .insert(rust_name.to_string(), cpp_name.to_string());
+    }
+    render_clock_config.includes.extend(
+        [
+            "LibIPC/RawMessage.h",
+            "LibIPC/ThreadSafeMessagePoster.h",
+            "LibWeb/Layout/LayoutRustFFI.h",
+        ]
+        .map(String::from),
+    );
+    generate_ffi_header(
+        render_clock_config,
+        &[manifest_dir.join("src/render_state/clock/render_clock.rs")],
+        &out_dir,
+        Path::new("Compositor/RenderClockRustFFI.h"),
     );
 
     // Layout engine header - namespace Web::Layout::RustFFI, layered on the tree-builder
@@ -3053,6 +3148,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     layout_config
         .includes
         .push("LibWeb/Layout/TreeBuilderRustFFI.h".to_string());
+    // Rust posts to the compositor through a poster C++ made.
+    layout_config
+        .export
+        .exclude
+        .push("FfiThreadSafeMessagePoster".to_string());
+    layout_config.export.rename.insert(
+        "FfiThreadSafeMessagePoster".to_string(),
+        "IPC::FfiThreadSafeMessagePoster".to_string(),
+    );
+    layout_config
+        .includes
+        .push("LibIPC/ThreadSafeMessagePoster.h".to_string());
     // A compositor animation effect state is opaque to C++, which holds it by pointer, and so are the paint server an
     // SVG paint resource callback fills and a parsed SVG path.
     for name in [
@@ -3089,7 +3196,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             manifest_dir.join("src/layout/line_box.rs"),
             manifest_dir.join("src/layout/line_box_fragment.rs"),
             manifest_dir.join("src/painting/paintable_data.rs"),
-            manifest_dir.join("src/painting/paintable_build.rs"),
             manifest_dir.join("src/painting/host/mod.rs"),
             manifest_dir.join("src/painting/host/visual_context.rs"),
             manifest_dir.join("src/painting/host/hit_test.rs"),
@@ -3098,12 +3204,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             manifest_dir.join("src/painting/stacking_context/dump.rs"),
             manifest_dir.join("src/painting/layout_tree_dump.rs"),
             manifest_dir.join("src/painting/ffi.rs"),
+            manifest_dir.join("src/painting/viewport_mapping.rs"),
             manifest_dir.join("src/render_state/clock.rs"),
             manifest_dir.join("src/render_state/clock/hover.rs"),
             manifest_dir.join("src/layout/script_entries.rs"),
+            manifest_dir.join("src/layout/query/inline_cursor.rs"),
             manifest_dir.join("src/painting/paint_changes.rs"),
             manifest_dir.join("src/painting/ffi/main_thread_entries.rs"),
             manifest_dir.join("src/painting/paint_passes.rs"),
+            manifest_dir.join("src/painting/presentation.rs"),
+            manifest_dir.join("src/painting/vector_image_cache.rs"),
+            manifest_dir.join("src/painting/recorded_scrolling.rs"),
+            manifest_dir.join("src/painting/rasterize.rs"),
         ],
         &out_dir,
         Path::new("Layout/LayoutRustFFI.h"),

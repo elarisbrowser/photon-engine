@@ -26,9 +26,9 @@
 #include <LibWebCommon/Page/PageId.h>
 #include <LibWebView/AccessibilityTreeManager.h>
 #include <LibWebView/BrowsingSession.h>
-#include <LibWebView/ViewImplementation.h>
 #include <LibWebView/WebCompatReport.h>
 #include <UI/Qt/BackingStoreRelease.h>
+#include <UI/Qt/RemoteView.h>
 #include <UI/Qt/ScreenshotSelectionOverlay.h>
 
 #include <LibWebCommon/Page/QueuedInputEvent.h>
@@ -112,12 +112,14 @@ struct WebContentViewInitialState {
     WebView::IsPrivate is_private { WebView::IsPrivate::No };
     double maximum_frames_per_second { 60.0 };
     Optional<u64> display_id;
-    WebView::ViewImplementation const* owner_view { nullptr };
+    bool screen_shows_high_dynamic_range { false };
+    Optional<u64> owner_view_id;
+    bool is_tab { true };
 };
 
 class WebContentView final
     : public WebContentViewBase
-    , public WebView::ViewImplementation
+    , public RemoteView
 #if !defined(Q_OS_WIN)
     , public QAccessible::ActivationObserver
 #endif
@@ -126,7 +128,7 @@ class WebContentView final
 public:
     AK_ALLOC_WITH_KMALLOC;
 
-    WebContentView(QWidget* window, Optional<WebView::CanonicalTraversable&> traversable = {}, WebContentViewInitialState initial_state = {});
+    WebContentView(QWidget* window, Optional<u64> hub_view_id = {}, WebContentViewInitialState initial_state = {});
     virtual ~WebContentView() override;
 
 #ifdef LADYBIRD_QT_USE_VULKAN_WINDOW
@@ -168,7 +170,6 @@ public:
     void set_viewport_rect(Gfx::IntRect);
     void push_viewport_size();
     void set_device_pixel_ratio(double);
-    void set_zoom_level(double);
     void set_vertical_tab_overlay_insets(int left, int right);
     void set_bookmarks_bar_overlay_height(int);
     // How much the page is dimmed under a page dialog, from 0 to 1, where the page is presented above anything Qt paints
@@ -177,11 +178,13 @@ public:
     // A card that floats over the page, such as the find bar. Qt paints it above the page, so whatever presents the
     // page above Qt's painting steps aside while it shows.
     void add_floating_surface(QWidget&);
+    // The address field's suggestions float over the page as such a card does, but outlive the view, as they belong to
+    // the window.
+    void set_suggestions_over_page(bool);
     void prepare_for_window_move();
     void finish_window_move();
     void close_select_dropdown_after_crash();
     void cancel_mouse_press();
-    void review_hidden_crash_report(ByteString const& report_name);
     void leave_report_review();
     void review_web_compat_report(WebCompatReportCapture);
     void select_web_compat_report_screenshot(Function<void(QImage)> on_selected, Function<void()> on_close = {});
@@ -195,7 +198,12 @@ public:
         Dark,
     };
     void update_palette(PaletteMode = PaletteMode::Default);
-    Optional<QPixmap> tab_preview_pixmap(QSize const& maximum_size) const;
+    // A preview of a page that the Compositor shows itself comes from it, so it can lag a frame behind the page.
+    Optional<QPixmap> tab_preview_pixmap(QSize const& maximum_size);
+
+    // Frames that the Compositor shows itself are only announced while something here wants to hear of them.
+    void add_frame_notification_interest();
+    void remove_frame_notification_interest();
 
     WebView::AccessibilityTreeManager const* accessibility_tree_manager() const { return m_accessibility_manager.ptr(); }
 
@@ -211,21 +219,19 @@ public:
 
 signals:
     void ready_to_paint();
+    void tab_preview_changed();
     void crash_overlay_changed();
     void image_overlay_unavailable();
     void urls_dropped(QList<QUrl> const&);
 
 private:
-    // ^WebView::ViewImplementation
-    virtual void prepare_page_for_navigable(WebView::WebContentPage&) override;
-    virtual Core::AnonymousBuffer system_theme() override;
+    // ^RemoteView
+    virtual void show_context_menu(Menu&, Gfx::IntPoint widget_position) override;
     virtual Optional<ScreenRects> screen_rects() const override;
     virtual void update_zoom() override;
-    virtual Web::DevicePixelSize viewport_size() const override;
-    virtual Gfx::IntPoint to_content_position(Gfx::IntPoint widget_position) const override;
-    virtual Gfx::IntPoint to_widget_position(Gfx::IntPoint content_position) const override;
-    virtual void show_context_menu(WebView::Menu&, Gfx::IntPoint widget_position) override;
     virtual void did_accept_presented_backing_store(i32, Gfx::IntRect) override;
+
+    Web::DevicePixelSize viewport_size() const;
 
 #ifdef LADYBIRD_QT_USE_RHI_WIDGET
     // ^QRhiWidget
@@ -249,6 +255,10 @@ private:
     // The pixels of a frame for Qt to paint, which there is no need to read back while the page's window covers them.
     RefPtr<Gfx::Bitmap const> cpu_bitmap_to_paint(Paintable const&) const;
     QImage visible_snapshot() const;
+    // What the view shows, which the Compositor takes where the view does not hold the frame itself.
+    void take_visible_snapshot(Optional<QSize> maximum_size, Function<void(QImage)>);
+    bool holds_displayed_frame() const;
+    void refresh_tab_preview(QSize const& maximum_size);
 
     void update_viewport_size();
     void update_cursor(Gfx::Cursor cursor);
@@ -271,7 +281,7 @@ private:
     void watch_screen_geometry(QScreen&);
 
     void set_crash_overlay_visible(bool);
-    void show_crash_report_review(Optional<ByteString> const& hidden_crash_report_name = {});
+    void show_crash_report_review();
 
     void start_web_compat_report();
     ScreenshotSelectionOverlay& select_screenshot(QImage const& frame, ScreenshotSelectionOverlay::Purpose, Function<void()> on_close = {});
@@ -318,7 +328,6 @@ private:
 
     bool m_follows_mouse_while_inactive { false };
 
-    bool m_tooltip_override { false };
     Optional<ByteString> m_tooltip_text;
     QTimer m_tooltip_hover_timer;
 
@@ -341,8 +350,14 @@ private:
     CrashReportReviewWidget* m_crash_report_review { nullptr };
 
     QPointer<ScreenshotSelectionOverlay> m_screenshot_selection_overlay;
+    size_t m_frame_notification_interest { 0 };
+    QPixmap m_tab_preview;
+    QSize m_tab_preview_maximum_size;
+    bool m_tab_preview_is_stale { true };
+    bool m_tab_preview_request_in_flight { false };
     QPointer<ScreenshotViewer> m_screenshot_viewer;
     Vector<QPointer<QWidget>> m_floating_surfaces;
+    bool m_suggestions_over_page { false };
     PageOverlay* m_web_compat_report_overlay { nullptr };
 
     bool handle_native_gesture_event(QNativeGestureEvent const&);
@@ -385,6 +400,20 @@ private:
 
     void* m_iosurface_layer { nullptr };
     void* m_page_dim_layer { nullptr };
+
+    // The Compositor commits the page's frames into a remote layer, which this layer shows by the ID of its context.
+    static bool can_host_remote_layers();
+    virtual void remote_layer_changed(Compositing::RemoteLayerHostHandle) override;
+    void update_remote_layer_host();
+    void synchronize_resize_with_remote_layer();
+    void await_resized_frame_before_commit(u64 token);
+    void release_resized_frame_with_commit(u64 token);
+    Optional<u64> m_synchronized_resize_token;
+    MonotonicTime m_last_resize_time { MonotonicTime::now_coarse() };
+    bool m_page_lags_behind_resize { false };
+    void* m_remote_layer_host { nullptr };
+    u32 m_remote_layer_context_id { 0 };
+    bool m_asked_for_remote_layer { false };
 #endif
 
 #ifdef LADYBIRD_QT_USE_RHI_WIDGET
@@ -408,6 +437,16 @@ private:
     void release_imported_d3d_textures();
 
     Vector<ImportedD3DTexture> m_imported_d3d_textures;
+
+    virtual void remote_layer_changed(Compositing::RemoteLayerHostHandle) override;
+    virtual void childEvent(QChildEvent*) override;
+    virtual bool eventFilter(QObject*, QEvent*) override;
+    bool has_visible_child_over_page() const;
+    void update_whether_view_hosts_remote_layer();
+    void native_window_changed();
+    bool m_hosts_remote_layer { false };
+    bool m_vertical_tabs_overlay_page { false };
+    bool m_bookmarks_bar_overlays_page { false };
 #endif
 
 #ifdef LADYBIRD_QT_USE_VULKAN_WINDOW
@@ -431,7 +470,7 @@ private:
     bool vulkan_window_update_would_only_resize() const;
     void remap_unexposed_vulkan_window();
 
-    virtual void release_backing_store(i32 bitmap_id) override;
+    virtual void release_backing_store(u64 page_id, i32 bitmap_id) override;
 
 #    ifdef LADYBIRD_HAS_WAYLAND_GPU_QUERY
     bool create_page_surface();
@@ -446,7 +485,6 @@ private:
     void destroy_page_surface();
     void release_retired_backing_stores_no_longer_painted();
     void release_all_retired_backing_stores();
-    Vector<Gfx::SharedImageBuffer const*> backing_stores() const;
     QRect rect_shown_in_window() const;
 
     // Shows the page's frames on Wayland by handing their dma-bufs to the compositor of the desktop. Without it, the
@@ -460,7 +498,7 @@ private:
     // The backing stores the view is done with that the compositor of the desktop may still read. The page they belong
     // to can stop displaying the tab before the compositor is done.
     struct BackingStoreWaitingForRelease {
-        NonnullRefPtr<WebView::WebContentPage> page;
+        u64 page_id { 0 };
         i32 bitmap_id { -1 };
     };
     Vector<BackingStoreWaitingForRelease> m_backing_stores_waiting_for_release;

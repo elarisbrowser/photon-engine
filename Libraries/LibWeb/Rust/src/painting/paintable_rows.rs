@@ -51,7 +51,7 @@ mod tests {
         assert!(slot_with(link.clone()) == slot_with(link.clone()));
 
         let mut moved = link.clone();
-        moved.committed_offset.x = crate::css::css_pixels::CssPixels::from_integer(10);
+        moved.offset.x = crate::css::css_pixels::CssPixels::from_integer(10);
         assert!(slot_with(link.clone()) != slot_with(moved));
 
         // An equal fragment laid out again is a different fragment.
@@ -207,6 +207,25 @@ impl UniqueNodeIdColumn {
             Some(&(stamped_for, id)) if !slot.is_invalid() && stamped_for == slot => id,
             _ => 0,
         }
+    }
+
+    /// Publishes the names of the nodes the rows of a chunk new to the arena carry, from its first slot
+    /// `first_slot_index` on, each in its first generation, `generation`; a row whose name is 0 carries none.
+    pub(crate) fn publish_new_chunk(&mut self, first_slot_index: usize, generation: u8, ids: &[i64]) {
+        if ids.iter().all(|&id| id == 0) {
+            return;
+        }
+        debug_assert!(self.ids.len() <= first_slot_index);
+        self.ids.resize_with_default(first_slot_index);
+        let block: Vec<(NodeSlotId, i64)> = ids
+            .iter()
+            .enumerate()
+            .map(|(offset, &id)| match id {
+                0 => Default::default(),
+                id => (NodeSlotId::new((first_slot_index + offset) as u32, generation), id),
+            })
+            .collect();
+        self.ids.extend_from_slice(&block);
     }
 
     pub(crate) fn publish(&mut self, slot: NodeSlotId, id: i64) {
@@ -750,6 +769,10 @@ impl LayoutNodeArena {
             self.withdraw_stacking_context_state_of_reset_row(id, Some(record.stacking_context));
             let former_paint_parent =
                 crate::painting::paint_order::paint_parent(&self.paintable_rows(), id).unwrap_or(NodeSlotId::INVALID);
+            let element = self.node_style_node(id);
+            if let Some(trace) = self.paint_state_mut().visual_context.trace.as_mut() {
+                trace.note_removed_box(id, element);
+            }
             self.paint_state_mut()
                 .visual_context
                 .dirty_boxes

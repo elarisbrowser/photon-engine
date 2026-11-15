@@ -27,7 +27,6 @@ use crate::bytecode::instruction::typed as op;
 use crate::bytecode::operand::*;
 use crate::bytecode::source_map::SourceOffset;
 use crate::parser::OutOfStack;
-use crate::parser::columns::NONE;
 use crate::parser::columns::tag;
 use crate::parser::literals::EscapeMode;
 use crate::u32_from_usize;
@@ -39,17 +38,19 @@ use super::generators::generate_await_of_value;
 use super::members::*;
 use super::nodes::*;
 use super::operators::emit_to_primitive_property_key;
-use super::registers::ScopedOperand;
 use super::scope::ParameterShape;
 use super::scope::ScopeBindings;
+use super::stream::ClassPrivateEnvironment;
 use super::stream::Control;
 use super::stream::Handler;
 use super::stream::LoopKind;
 use super::stream::OpenIterator;
 use super::stream::ScopeEnvironment;
+use super::stream::TargetBinding;
 use super::stream::ValKind;
+use super::stream::operand_list_count;
 use super::sweep::declaration_kind_of_mark;
-use super::sweep::is_anonymous;
+use super::sweep::is_anonymous_function_definition;
 use super::sweep::next_tag;
 use super::sweep::resource_of_mark;
 use crate::parser::literals::raw_template_value;
@@ -235,7 +236,7 @@ impl Generator<'_> {
         } else {
             None
         };
-        let saved_strict = std::mem::replace(&mut self.strict, true);
+        let strict_code = self.begin_strict_code();
         let first_temporary = self.next_temporary();
         let dst = self.temporary();
         let held = self.hold_registers();
@@ -243,9 +244,9 @@ impl Generator<'_> {
         if data.name.is_none() && lhs_name.is_none() && computed_name.is_none() {
             // NB: An anonymous class binds an empty name, which an environment shape cannot hold.
             let identifier = self.intern_identifier_text(crate::utf16::Utf16View::Ascii(b""));
-            self.emit(op::CreateVariable {
+            self.put(op::CreateVariable {
                 identifier,
-                mode: libjs_abi::EnvironmentMode::Lexical as u32,
+                mode: libjs_abi::EnvironmentMode::Lexical as u8,
                 is_immutable: true,
                 is_global: false,
                 is_strict: true,
@@ -286,7 +287,7 @@ impl Generator<'_> {
             };
             if let Some(name) = private_name_of(key) {
                 if !has_private_environment {
-                    self.put(op::CreatePrivateEnvironment {});
+                    self.enter_class_private_environment();
                     has_private_environment = true;
                 }
                 let identifier = intern_private_name(self, name);
@@ -309,7 +310,14 @@ impl Generator<'_> {
             };
             element_keys.push(match key {
                 Some(key) if private_name_of(key).is_none() => {
-                    Some(self.sweep_class_element_key(key, first_element_row)?)
+                    let operand = self.sweep_class_element_key(key, first_element_row)?;
+                    if let ClassElementData::Method { is_static: true, .. } = element_data
+                        && let ClassElementKey::Expression(expression) = key
+                        && !matches!(tree.node_tag(expression), tag::STR_KEY | tag::NUM_KEY)
+                    {
+                        self.throw_if_key_of_static_method_is_prototype(operand);
+                    }
+                    Some(operand)
                 }
                 _ => None,
             });
@@ -333,7 +341,21 @@ impl Generator<'_> {
             elements: class_elements,
         });
 
+        let private_environment = has_private_environment.then(|| {
+            let Some(Control::PrivateEnvironment(private_environment)) = self.pop_control() else {
+                unreachable!("the private environment of a class is what is going on");
+            };
+            private_environment
+        });
         self.end_class_scope(environment);
+        let element_keys_are_in_array = element_keys.len() > MAX_OPERAND_LIST_LENGTH;
+        if element_keys_are_in_array {
+            let undefined = self.context.constants.add_undefined();
+            let keys: Vec<Operand> = element_keys.iter().map(|key| key.unwrap_or(undefined)).collect();
+            let array = self.temporary();
+            self.put_new_array(array, &keys);
+            element_keys = vec![Some(array)];
+        }
         self.put(op::NewClass {
             dst,
             super_class,
@@ -342,16 +364,81 @@ impl Generator<'_> {
             class_environment: environment.register,
             class_blueprint_index: blueprint_index,
             lhs_name,
-            element_keys_count: u32_from_usize(element_keys.len()),
+            element_keys_are_in_array,
+            element_keys_count: operand_list_count(element_keys.len()),
             element_keys: &element_keys,
         });
-        if has_private_environment {
-            self.put(op::LeavePrivateEnvironment {});
+        if let Some(private_environment) = private_environment {
+            self.leave_class_private_environment(private_environment);
         }
-        self.strict = saved_strict;
+        self.end_strict_code(strict_code);
         self.release_held_registers(held);
         self.push_value(dst, first_temporary);
         Ok(())
+    }
+
+    /// The private names of a class come next, whose environment is current until the class is done.
+    fn enter_class_private_environment(&mut self) {
+        self.put(op::CreatePrivateEnvironment {});
+        let outer_handler = self.handler();
+        // NB: An exception that leaves the function takes the private environment with its execution context.
+        let handler = outer_handler.map(|_| Handler {
+            label: self.new_label(),
+            catches: false,
+        });
+        if handler.is_some() {
+            self.set_handler(handler);
+        }
+        let private_environment = ClassPrivateEnvironment { handler, outer_handler };
+        self.push_control(Control::PrivateEnvironment(private_environment));
+    }
+
+    /// The class is done, and the private environment around it is current again, also for exceptions.
+    fn leave_class_private_environment(&mut self, private_environment: ClassPrivateEnvironment) {
+        self.put(op::LeavePrivateEnvironment {});
+        let Some(handler) = private_environment.handler else {
+            return;
+        };
+        self.set_handler(private_environment.outer_handler);
+        let end_label = self.new_label();
+        self.jump(end_label);
+        self.bind_reachable_label(handler.label);
+        let error = self.temporary();
+        let value_feedback = self.next_value_feedback();
+        self.put(op::Catch {
+            value_feedback,
+            dst: error,
+        });
+        self.put(op::LeavePrivateEnvironment {});
+        self.put(op::Throw { src: error });
+        self.bind_label(end_label);
+    }
+
+    /// A static method gets defined on the class before the key of the next element gets evaluated, which fails for the
+    /// non-configurable `prototype` of the class. `NewClass` defines them all at once, so it has to fail here instead.
+    fn throw_if_key_of_static_method_is_prototype(&mut self, key: Operand) {
+        let prototype = self.add_constant_string_view(crate::utf16::Utf16View::Ascii(b"prototype"));
+        let first_temporary = self.next_temporary();
+        let is_prototype = self.temporary();
+        let arith_feedback = self.next_arith_feedback();
+        self.put(op::StrictlyEquals {
+            arith_feedback,
+            dst: is_prototype,
+            lhs: key,
+            rhs: prototype,
+        });
+        let not_prototype = self.new_label();
+        self.jump_unless(is_prototype, not_prototype);
+        let error_string = self.intern_string_text(crate::utf16::Utf16View::Ascii(
+            b"Object's [[DefineOwnProperty]] method returned false",
+        ));
+        self.put(op::NewTypeError {
+            dst: is_prototype,
+            error_string,
+        });
+        self.put(op::Throw { src: is_prototype });
+        self.bind_label(not_prototype);
+        self.release_temporaries_from(first_temporary);
     }
 
     /// The key of an element of a class, which `NewClass` turns into a property key.
@@ -373,7 +460,7 @@ impl Generator<'_> {
             _ => {
                 let value = self.sweep_value(first_row, key)?;
                 // NB: A key is what it is by the time the next one gets evaluated.
-                Ok(emit_to_primitive_property_key(self, &ScopedOperand::plain(value)).operand())
+                Ok(emit_to_primitive_property_key(self, value))
             }
         }
     }
@@ -471,22 +558,15 @@ impl Generator<'_> {
         let initializer = NodeId(tree.node_a(NodeId(tree.node_b(field))));
         let is_computed = tree.node_tag(field) == tag::COMPUTED_CLASS_FIELD;
         let first_row = key.index() + 1 + usize::from(is_computed || tree.node_tag(key) == tag::BIGINT);
-        let bare_initializer = tree.skip_parens(initializer);
-        let initializer_tag = tree.node_tag(bare_initializer);
-        let is_anonymous_definition = match initializer_tag {
-            tag::FUNCTION => is_anonymous(tree, bare_initializer),
-            tag::CLASS => tree.node_a(bare_initializer) == NONE,
-            _ => false,
-        };
         let value = if let Some(name) = class_field_name(tree, field) {
             let name = self.intern_identifier_text(crate::utf16::Utf16View::of_string(&name));
             self.set_pending_function_name(initializer, Some(name));
             self.sweep_value(first_row, initializer)?
-        } else if is_anonymous_definition {
+        } else if is_anonymous_function_definition(tree, initializer) {
             // NB: A computed key is only known once the class is defined, so the function reads it.
             let name = self.temporary();
             self.put(op::GetClassFieldInitializerName { dst: name });
-            if initializer_tag == tag::CLASS {
+            if tree.node_tag(tree.skip_parens(initializer)) == tag::CLASS {
                 self.context.stream.pending_computed_class_name = Some(name);
                 self.sweep_value(first_row, initializer)?
             } else {
@@ -494,7 +574,7 @@ impl Generator<'_> {
                 self.put(op::SetFunctionName {
                     function: value,
                     name,
-                    prefix: libjs_abi::FunctionNamePrefix::None as u32,
+                    prefix: libjs_abi::FunctionNamePrefix::None as u8,
                 });
                 value
             }
@@ -507,6 +587,7 @@ impl Generator<'_> {
 
     /// A static block, which runs as a function of its own.
     pub(super) fn sweep_static_block(&mut self, block: NodeId) -> Result<(), OutOfStack> {
+        self.create_arguments_object_of_static_block();
         self.sweep_rows(FIRST_ROW_OF_REPARSED_FUNCTION, block.index())?;
         self.end_disposal();
         Ok(())
@@ -517,24 +598,18 @@ impl Generator<'_> {
         if !is_derived {
             return;
         }
-        let arguments = self.temporary();
-        self.put(op::CreateRestParams {
-            dst: arguments,
-            rest_index: 0,
-        });
+        // NB: The arguments go to the super constructor as they are, without the array iterator that
+        //     `super(...args)` would use.
         let super_constructor = self.temporary();
         self.put(op::GetSuperConstructor { dst: super_constructor });
         let dst = self.temporary();
-        let value_feedback = self.next_value_feedback();
         let call_feedback = self.next_call_feedback();
-        self.put(op::SuperCallWithArgumentArray {
-            value_feedback,
+        self.put(op::SuperCallWithForwardedArguments {
             call_feedback,
             dst,
             super_constructor,
-            arguments,
-            is_synthetic: true,
         });
+        self.put(op::BindThisFromSuperCall { result: dst });
         self.put(op::Return { value: dst });
     }
 
@@ -562,9 +637,11 @@ impl Generator<'_> {
         let first_temporary = self.next_temporary();
         let dst = self.temporary();
         let cache = self.next_template_object_cache();
+        let strings_are_in_array = self.fit_operand_list(&mut strings);
         self.put(op::GetTemplateObject {
             dst,
-            strings_count: u32_from_usize(strings.len()),
+            strings_are_in_array,
+            strings_count: operand_list_count(strings.len()),
             cache,
             strings: &strings,
         });
@@ -622,7 +699,7 @@ impl Generator<'_> {
             if !is_first {
                 self.put(op::ConcatString { dst, src: value });
             } else if is_string {
-                self.put(op::Mov { dst, src: value });
+                self.emit_mov(dst, value);
             } else {
                 self.put(op::ToString { dst, value });
             }
@@ -798,6 +875,15 @@ impl Generator<'_> {
             row = case.index() + 1;
         }
         self.jump(default_label.unwrap_or(end_label));
+        // NB: Every test comes before the code of the cases, so nothing reads the discriminant from here on. The
+        //     environment of the cases comes after it in the registers, though, so that it stays held if there is one.
+        let held = match environment {
+            Some(_) => Some(held),
+            None => {
+                self.release_held_registers(held);
+                None
+            }
+        };
 
         self.push_control(Control::Switch { break_label: end_label });
         let initialized_locals = self.context.initialized_locals.clone();
@@ -817,7 +903,9 @@ impl Generator<'_> {
 
         self.pop_control();
         self.end_scope(environment);
-        self.release_held_registers(held);
+        if let Some(held) = held {
+            self.release_held_registers(held);
+        }
         self.end_of_statement();
         Ok(())
     }
@@ -871,7 +959,7 @@ impl Generator<'_> {
                 body,
                 row,
                 catch_position,
-                &entry_environment,
+                entry_environment,
                 first_function,
             )?;
             self.leave_try_part(finally, end_label);
@@ -882,7 +970,7 @@ impl Generator<'_> {
             self.pop_control();
             self.set_handler(outer_handler);
             let finally = finally as usize;
-            let body = self.bind_finally_handler(finally, handler, &entry_environment);
+            let body = self.bind_finally_handler(finally, handler, entry_environment);
             self.bind_label(body);
             let saved_completion = self.save_completion();
             self.sweep_rows(row, finalizer.index() + 1)?;
@@ -904,7 +992,7 @@ impl Generator<'_> {
         body: NodeId,
         first_row: usize,
         position: u32,
-        entry_environment: &ScopedOperand,
+        entry_environment: Operand,
         first_function: u32,
     ) -> Result<(), OutOfStack> {
         let tree = self.tree;
@@ -931,6 +1019,15 @@ impl Generator<'_> {
             self.bind_target(parameter, first_row, value, PatternMode::Declares(DeclarationKind::Let))?;
             row = parameter.index() + 1;
         }
+        // NB: Nothing reads the caught value once it is bound. The environment of the parameter comes after it in the
+        //     registers, though, so that it stays held until the end if there is one.
+        let held = match environment {
+            Some(_) => Some(held),
+            None => {
+                self.release_held_registers(held);
+                None
+            }
+        };
 
         let body_environment = self.begin_scope(tree.node_pos(body), false);
         self.push_control(Control::Block {
@@ -949,7 +1046,9 @@ impl Generator<'_> {
 
         self.pop_control();
         self.end_scope(environment);
-        self.release_held_registers(held);
+        if let Some(held) = held {
+            self.release_held_registers(held);
+        }
         Ok(())
     }
 
@@ -1066,6 +1165,19 @@ impl Generator<'_> {
             bindings.map(|bindings| self.enter_scope_environment(bindings, false, None));
         self.push_control(Control::Block { environment });
         self.current_source_offset = SourceOffset(tree.node_pos(statement));
+        if let LoopTarget::Declared {
+            target: pattern, kind, ..
+        } = target
+            && kind != DeclarationKind::Var
+            && matches!(tree.node_tag(pattern), tag::ARRAY_PATTERN | tag::OBJECT_PATTERN)
+            && tree.pattern_contains_expression(pattern.0)
+        {
+            // NB: The bindings of each iteration are new, and the code of the pattern sees them in their dead zone.
+            for_each_bound_name(tree, pattern, &mut |name| {
+                let ident = self.identifier_of(name);
+                self.put_in_dead_zone(ident);
+            });
+        }
         self.assign_to_loop_target(target, value)?;
         self.end_of_statement();
         self.sweep_rows(right as usize + 1, body as usize + 1)?;
@@ -1087,7 +1199,8 @@ impl Generator<'_> {
         let receiver = self.held_register();
         let keys = self.held_register();
         let cursor = self.held_register();
-        let value = self.held_register();
+        // NB: Nothing reads the source once the iterator has it.
+        let value = source;
         let done = self.held_register();
         let end_label = self.new_label();
         let update_label = self.new_label();
@@ -1108,10 +1221,7 @@ impl Generator<'_> {
             cache,
         });
         let zero = self.add_constant_i32(0);
-        self.put(op::Mov {
-            dst: cursor,
-            src: zero.operand(),
-        });
+        self.emit_mov(cursor, zero);
 
         self.bind_reachable_label(update_label);
         self.put(op::ObjectPropertyIteratorNext {
@@ -1157,7 +1267,8 @@ impl Generator<'_> {
         let object = self.held_register();
         let next = self.held_register();
         let iterator_done = self.held_register();
-        let value = self.held_register();
+        // NB: Nothing reads the source once the iterator has it.
+        let value = source;
         let done = self.held_register();
         let cache = self.next_property_lookup_cache();
         self.put(op::GetIterator {
@@ -1169,7 +1280,7 @@ impl Generator<'_> {
                 libjs_abi::IteratorHint::Async
             } else {
                 libjs_abi::IteratorHint::Sync
-            } as u32,
+            } as u8,
             fast_array_mode_allowed: !is_await,
             cache,
         });
@@ -1202,20 +1313,24 @@ impl Generator<'_> {
         self.bind_reachable_label(update_label);
         if is_await {
             let held = self.hold_registers();
-            let result = self.allocate_register();
-            self.put(op::IteratorNext {
-                dst: result.operand(),
-                iterator_object: object,
-                iterator_next: next,
-                iterator_done,
+            let result = self.held_register();
+            // NB: A result that is not an object only throws once it is awaited.
+            let call_feedback = self.next_call_feedback();
+            self.put(op::Call {
+                call_feedback,
+                dst: result,
+                callee: next,
+                this_value: object,
+                argument_count: 0,
+                arguments: &[],
             });
-            let awaited = generate_await_of_value(self, &result);
-            self.put(op::ThrowIfNotObject { src: awaited.operand() });
+            let awaited = generate_await_of_value(self, result);
+            self.put(op::ThrowIfNotObject { src: awaited });
             let done_key = self.intern_property_key_text(crate::utf16::Utf16View::Ascii(b"done"));
-            emit_get_by_key(self, &ScopedOperand::plain(done), &awaited, done_key, None);
+            emit_get_by_key(self, done, awaited, done_key);
             self.jump_if(done, end_label);
             let value_key = self.intern_property_key_text(crate::utf16::Utf16View::Ascii(b"value"));
-            emit_get_by_key(self, &ScopedOperand::plain(value), &awaited, value_key, None);
+            emit_get_by_key(self, value, awaited, value_key);
             self.release_held_registers(held);
         } else {
             self.put(op::IteratorNextUnpack {
@@ -1237,7 +1352,7 @@ impl Generator<'_> {
         self.set_handler(outer_handler);
 
         self.bind_reachable_label(close_handler.label);
-        self.close_iterator_after_exception(iterator, &entry_environment);
+        self.close_iterator_after_exception(iterator, entry_environment);
 
         self.bind_label(end_label);
         self.context.scope.block_end();
@@ -1247,7 +1362,7 @@ impl Generator<'_> {
     }
 
     /// Closes an iterator on the way to whoever handles an exception, which stays what gets thrown.
-    fn close_iterator_after_exception(&mut self, iterator: OpenIterator, entry_environment: &ScopedOperand) {
+    fn close_iterator_after_exception(&mut self, iterator: OpenIterator, entry_environment: Operand) {
         let error = self.temporary();
         let value_feedback = self.next_value_feedback();
         self.put(op::Catch {
@@ -1288,7 +1403,7 @@ impl Generator<'_> {
             iterator_object: iterator.object,
             iterator_next: iterator.next,
             iterator_done: iterator.done,
-            completion_type: libjs_abi::CompletionType::Throw as u32,
+            completion_type: libjs_abi::CompletionType::Throw as u8,
             completion_value: error,
             cache,
         });
@@ -1309,7 +1424,7 @@ impl Generator<'_> {
         } else {
             for parameter in parameters.iter() {
                 let first_name = names.len();
-                for_each_parameter_name(tree, parameter, &mut |name| names.push(name));
+                for_each_bound_name(tree, parameter, &mut |name| names.push(name));
                 let target = match tree.node_tag(parameter) {
                     tag::REST | tag::ASSIGN_PATTERN => NodeId(tree.node_a(parameter)),
                     _ => parameter,
@@ -1490,7 +1605,7 @@ impl Generator<'_> {
             }
             target_tag if target_tag == tag::IDENT || (tag::IDENT_MARKED..tag::MEMBER_MARKED).contains(&target_tag) => {
                 let ident = self.identifier_of(Name(tree.node_a(target)));
-                self.target_of_identifier(ident);
+                self.target_of_identifier(ident, TargetBinding::MightAppear);
             }
             _ => {
                 self.sweep_rows(first_row, target.index() + 1)?;
@@ -1525,15 +1640,19 @@ impl Generator<'_> {
                 self.current_source_offset = SourceOffset(tree.node_pos(target));
                 let ident = self.declare_binding(Name(tree.node_a(target)), kind);
                 // NB: Whatever a run through this code before left in a local, it is in its dead zone here.
-                if kind != DeclarationKind::Var && ident.local_type == Some(LocalType::Variable) {
-                    let empty = self.context.constants.add_empty();
-                    self.put(op::Mov {
-                        dst: Operand::local(ident.local_index),
-                        src: empty,
-                    });
+                if kind != DeclarationKind::Var {
+                    self.put_in_dead_zone(ident);
                 }
                 Ok(())
             }
+        }
+    }
+
+    /// Puts a lexical binding that lives in a register back in its dead zone.
+    fn put_in_dead_zone(&mut self, ident: Identifier) {
+        if ident.local_type == Some(LocalType::Variable) {
+            let empty = self.context.constants.add_empty();
+            self.emit_mov(Operand::local(ident.local_index), empty);
         }
     }
 
@@ -1605,8 +1724,7 @@ impl Generator<'_> {
 
     /// Whatever anonymous function or class `value` is takes `name` as its name.
     fn set_pending_function_name(&mut self, value: NodeId, name: Option<IdentifierTableIndex>) {
-        let tree = self.tree;
-        if matches!(tree.node_tag(tree.skip_parens(value)), tag::FUNCTION | tag::CLASS) {
+        if is_anonymous_function_definition(self.tree, value) {
             self.context.stream.pending_function_name = name;
         }
     }
@@ -1647,7 +1765,7 @@ impl Generator<'_> {
         // NB: Every property comes from the value that the pattern started with, whatever gets written along the way.
         let object = if value.is_local() || value.is_argument() {
             let copy = self.held_register();
-            self.put(op::Mov { dst: copy, src: value });
+            self.emit_mov(copy, value);
             copy
         } else {
             value
@@ -1662,11 +1780,13 @@ impl Generator<'_> {
             if item_tag == tag::REST {
                 let target = NodeId(tree.node_a(item));
                 self.prepare_pattern_target(target, row, mode)?;
+                let excluded_names_are_in_array = self.fit_operand_list(&mut excluded_names);
                 let copy = self.temporary();
                 self.put(op::CopyObjectExcludingProperties {
                     dst: copy,
                     from_object: object,
-                    excluded_names_count: u32_from_usize(excluded_names.len()),
+                    excluded_names_are_in_array,
+                    excluded_names_count: operand_list_count(excluded_names.len()),
                     excluded_names: &excluded_names,
                 });
                 self.bind_target(target, row, copy, mode)?;
@@ -1674,6 +1794,7 @@ impl Generator<'_> {
             }
             let (element, element_first_row);
             let property_value;
+            let element_registers = (item_tag == tag::COMPUTED_PROPERTY && !has_rest).then(|| self.hold_registers());
             match item_tag {
                 tag::SHORTHAND => {
                     let name = Name(tree.node_a(item));
@@ -1693,11 +1814,12 @@ impl Generator<'_> {
                     let position = self.current_source_offset;
                     let key_value = self.sweep_value(row, key)?;
                     self.current_source_offset = position;
-                    let converted = emit_to_primitive_property_key(self, &ScopedOperand::plain(key_value)).operand();
+                    let converted = emit_to_primitive_property_key(self, key_value);
                     if has_rest {
                         excluded_names.push(converted);
+                        // NB: Rest needs this key after the other properties have been bound.
+                        first_temporary = self.next_temporary();
                     }
-                    first_temporary = self.next_temporary();
                     element = NodeId(tree.node_b(item));
                     // NB: A mark comes after a computed key.
                     element_first_row = key.index() + 2;
@@ -1717,13 +1839,7 @@ impl Generator<'_> {
                         self.put_get_by_id(property_value, object, Name(tree.node_a(key)));
                     } else {
                         let property_key = self.intern_property_key_text(text.view());
-                        emit_get_by_key(
-                            self,
-                            &ScopedOperand::plain(property_value),
-                            &ScopedOperand::plain(object),
-                            property_key,
-                            None,
-                        );
+                        emit_get_by_key(self, property_value, object, property_key);
                     }
                     if has_rest {
                         let name = match &text {
@@ -1735,6 +1851,9 @@ impl Generator<'_> {
                 }
             }
             self.bind_pattern_element(element, element_first_row, property_value, mode)?;
+            if let Some(registers) = element_registers {
+                self.release_held_registers(registers);
+            }
             self.release_temporaries_from(first_temporary);
             row = item.index() + 1;
         }
@@ -1753,10 +1872,7 @@ impl Generator<'_> {
         let held = self.hold_registers();
         let is_exhausted = self.held_register();
         let no = self.context.constants.add_boolean(false);
-        self.put(op::Mov {
-            dst: is_exhausted,
-            src: no,
-        });
+        self.emit_mov(is_exhausted, no);
         let object = self.held_register();
         let next = self.held_register();
         let done = self.held_register();
@@ -1766,7 +1882,7 @@ impl Generator<'_> {
             dst_iterator_next: next,
             dst_iterator_done: done,
             iterable: value,
-            hint: libjs_abi::IteratorHint::Sync as u32,
+            hint: libjs_abi::IteratorHint::Sync as u8,
             fast_array_mode_allowed: true,
             cache,
         });
@@ -1794,11 +1910,26 @@ impl Generator<'_> {
             let first_temporary = self.next_temporary();
             let is_rest = tree.node_tag(item) == tag::REST;
             // NB: A rest element started out as a spread element, whose mark means nothing here.
-            row += usize::from(tree.ast.tag[row] == tag::MARK_SPREAD_START);
-            if tree.node_tag(item) != tag::HOLE {
-                let element = if is_rest { NodeId(tree.node_a(item)) } else { item };
-                self.prepare_pattern_target(element, row, mode)?;
+            row += usize::from(tree.ast.tag[row] == tag::MARK_ARRAY_START);
+            if tree.node_tag(item) == tag::HOLE {
+                let after_step = self.new_label();
+                if index != 0 {
+                    self.jump_if(is_exhausted, after_step);
+                }
+                self.set_handler(outer_handler);
+                self.put(op::IteratorStep {
+                    dst_done: is_exhausted,
+                    iterator_object: object,
+                    iterator_next: next,
+                    iterator_done: done,
+                });
+                self.set_handler(Some(close_handler));
+                self.bind_label(after_step);
+                row = item.index() + 1;
+                continue;
             }
+            let element = if is_rest { NodeId(tree.node_a(item)) } else { item };
+            self.prepare_pattern_target(element, row, mode)?;
             let element_value = self.temporary();
             if is_rest {
                 let exhausted = self.new_label();
@@ -1844,15 +1975,10 @@ impl Generator<'_> {
             self.jump_unless(is_exhausted, have_value);
             self.bind_label(exhausted);
             let undefined = self.context.constants.add_undefined();
-            self.put(op::Mov {
-                dst: element_value,
-                src: undefined,
-            });
+            self.emit_mov(element_value, undefined);
             self.reference_label(have_value);
             self.bind_label(have_value);
-            if tree.node_tag(item) != tag::HOLE {
-                self.bind_pattern_element(item, row, element_value, mode)?;
-            }
+            self.bind_pattern_element(item, row, element_value, mode)?;
             self.release_temporaries_from(first_temporary);
             row = item.index() + 1;
         }
@@ -1867,13 +1993,13 @@ impl Generator<'_> {
             iterator_object: object,
             iterator_next: next,
             iterator_done: done,
-            completion_type: libjs_abi::CompletionType::Normal as u32,
+            completion_type: libjs_abi::CompletionType::Normal as u8,
             completion_value: undefined,
             cache,
         });
         self.jump(end_label);
         self.bind_reachable_label(close_handler.label);
-        self.close_iterator_after_exception(iterator, &entry_environment);
+        self.close_iterator_after_exception(iterator, entry_environment);
         self.bind_label(end_label);
         self.release_held_registers(held);
         Ok(())
@@ -1935,23 +2061,24 @@ fn parameter_has_expression(tree: &SyntaxTree, parameter: NodeId) -> bool {
         && tree.pattern_contains_expression(target.0)
 }
 
-/// Calls `callback` with what a parameter binds, in the order of the source.
-fn for_each_parameter_name(tree: &SyntaxTree, parameter: NodeId, callback: &mut impl FnMut(Name)) {
-    match tree.node_tag(parameter) {
+/// Calls `callback` with each of the BoundNames of `target`, an identifier or a binding pattern, in the order of the
+/// source.
+fn for_each_bound_name(tree: &SyntaxTree, target: NodeId, callback: &mut impl FnMut(Name)) {
+    match tree.node_tag(target) {
         tag::ARRAY_PATTERN | tag::OBJECT_PATTERN => {
-            for item in tree.node_list(tree.node_a(parameter)).iter() {
+            for item in tree.node_list(tree.node_a(target)).iter() {
                 match tree.node_tag(item) {
                     tag::HOLE => {}
                     tag::PROPERTY | tag::COMPUTED_PROPERTY => {
-                        for_each_parameter_name(tree, NodeId(tree.node_b(item)), callback);
+                        for_each_bound_name(tree, NodeId(tree.node_b(item)), callback);
                     }
                     tag::SHORTHAND => callback(Name(tree.node_a(item))),
-                    _ => for_each_parameter_name(tree, item, callback),
+                    _ => for_each_bound_name(tree, item, callback),
                 }
             }
         }
-        tag::REST | tag::ASSIGN_PATTERN => for_each_parameter_name(tree, NodeId(tree.node_a(parameter)), callback),
-        _ => callback(Name(tree.node_a(parameter))),
+        tag::REST | tag::ASSIGN_PATTERN => for_each_bound_name(tree, NodeId(tree.node_a(target)), callback),
+        _ => callback(Name(tree.node_a(target))),
     }
 }
 

@@ -11,8 +11,6 @@ endif()
 ladybird_test_suite(LibWeb)
 
 set(TEST_SOURCES
-    BenchmarkDisplayListRecording.cpp
-    TestAudioWorkletPipe.cpp
     TestBlobBytes.cpp
     TestContentBlocker.cpp
     TestCSSDecodeBytes.cpp
@@ -28,6 +26,7 @@ set(TEST_SOURCES
     TestFetchController.cpp
     TestFetchControllerRegistry.cpp
     TestFetchEngineMessages.cpp
+    TestFetchEngineRecord.cpp
     TestFetchExecutor.cpp
     TestFetchResponse.cpp
     TestFetchTaskDestination.cpp
@@ -62,7 +61,6 @@ if (NOT WIN32)
         TestCSSSyntaxParser.cpp
         TestLengthAbsolutizeParity.cpp
         TestStylePropertyMetadataParity.cpp
-        TestStyleStructRef.cpp
     )
 endif()
 
@@ -72,6 +70,9 @@ target_sources(TestLibWeb PRIVATE
     ${LADYBIRD_SOURCE_DIR}/Libraries/LibWeb/WebIDL/CallbackType.cpp
 )
 target_link_libraries(TestLibWeb PRIVATE LibCompositing LibCrypto LibGC LibGfx LibHTTP LibIPC LibJS LibRequests LibThreading LibURL LibWeb LibWebCommon LibWebView)
+
+# NB: This one needs a process of its own: its agents must not share one with the persistent main-thread VM of the suite.
+ladybird_test(TestAgentThreads.cpp LibWeb LIBS LibCore LibGC LibGfx LibIPC LibJS LibThreading LibURL LibWeb LibWebCommon)
 
 # The check reads the symbols of the build's objects with nm, which can't see into an LTO build's bitcode objects and
 # isn't the toolchain's symbol reader on Windows.

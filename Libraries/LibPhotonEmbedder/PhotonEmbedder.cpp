@@ -2117,12 +2117,12 @@ void View::set_residency_monitor_enabled(bool enabled)
 bool View::set_task_queue_diagnostics_enabled(bool enabled)
 {
     VERIFY(m_impl && m_impl->view);
-    return m_impl->view->set_task_queue_diagnostics_enabled(enabled);
+    return TabPerformanceMonitor::set_view_task_queue_diagnostics_enabled(m_impl->view->view_id(), enabled);
 }
 size_t View::copy_task_queue_diagnostics(char* output, size_t capacity) const
 {
     VERIFY(m_impl && m_impl->view);
-    auto diagnostics = m_impl->view->task_queue_diagnostics_json();
+    auto diagnostics = TabPerformanceMonitor::task_queue_diagnostics_json(m_impl->view->view_id());
     auto bytes = diagnostics.bytes_as_string_view();
     if (output && capacity > 0) {
         auto copied = min(capacity - 1, bytes.length());

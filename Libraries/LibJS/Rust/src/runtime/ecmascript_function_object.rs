@@ -28,9 +28,7 @@ use crate::layout::function_object::{RawNativeFunction, ecmascript_function_flag
 use crate::layout::member::NullableMember;
 use crate::layout::object::{IndexedStorageKind, Object};
 use crate::layout::value::Value;
-use crate::runtime::abstract_operations::{
-    create_unmapped_arguments_object, get_prototype_from_constructor, new_call_environment,
-};
+use crate::runtime::abstract_operations::{create_unmapped_arguments_object, new_call_environment};
 use crate::runtime::async_function_driver_wrapper::AsyncFunctionDriverWrapper;
 use crate::runtime::async_generator::AsyncGenerator;
 use crate::runtime::class_field_definition::{ClassElementName, ClassFieldDefinition};
@@ -41,7 +39,6 @@ use crate::runtime::function_environment::FunctionEnvironment;
 use crate::runtime::function_object::{FUNCTION_OBJECT_METHODS, FunctionObject};
 use crate::runtime::function_prototype::FunctionPrototype;
 use crate::runtime::generator_object::{GeneratingFunction, GeneratorObject};
-use crate::runtime::intrinsics::Intrinsics;
 use crate::runtime::object::{
     MayInterfereWithIndexedPropertyAccess, ObjectMethods, PrivateElement, StackFrameInfo, allocate_object,
 };
@@ -51,6 +48,7 @@ use crate::runtime::property_descriptor::PropertyDescriptor;
 use crate::runtime::property_key::PropertyKey;
 use crate::runtime::realm::Realm;
 use crate::runtime::reflect_object::ReflectObject;
+use crate::runtime::shape::Shape;
 use crate::runtime::shared_function_instance_data::{
     ClassFieldInitializerName, ClosureCount, ConstructorKind, FunctionKind, SharedFunctionInstanceData, ThisMode,
 };
@@ -63,6 +61,10 @@ struct ClassData {
     private_methods: Vec<PrivateElement>, // [[PrivateMethods]]
     /// The [[ClassFieldInitializerName]] of an initializer of a field whose key is computed.
     class_field_initializer_name: ClassFieldInitializerName,
+    /// The shape of the objects InitializeInstanceElements initialized for this derived constructor, while it was
+    /// always the same one (see record_instance_elements_shape()).
+    instance_elements_shape: Option<Gc<Shape>>,
+    instance_elements_shape_varies: bool,
 }
 
 /// The parts of a class constructor, or of a field initializer, that the interpreter does not read.
@@ -92,7 +94,10 @@ pub static ECMASCRIPT_FUNCTION_OBJECT_METHODS: ObjectMethods = ObjectMethods {
     },
     // NB: The non-enumerable lazy properties shadow enumerable ones of the prototype chain.
     eligible_for_own_property_enumeration_fast_path: |object| {
-        !as_ecmascript_function(object).has_flag(ecmascript_function_flags::HAS_LAZY_LENGTH_AND_NAME)
+        !as_ecmascript_function(object).has_flag(
+            ecmascript_function_flags::HAS_LAZY_LENGTH_AND_NAME
+                | ecmascript_function_flags::MAY_NEED_LAZY_PROTOTYPE_INSTANTIATION,
+        )
     },
     internal_own_property_keys: EcmascriptFunctionObject::internal_own_property_keys,
     internal_call: Some(EcmascriptFunctionObject::internal_call),
@@ -248,9 +253,18 @@ impl EcmascriptFunctionObject {
             shared_data.script_or_module.set(vm.get_active_script_or_module());
         }
         shared_data.note_closure_created();
-        let function = if private_environment.is_some() || home_object.is_some() || shared_data.is_class_constructor() {
+        let is_method = home_object.is_some();
+        let function = if private_environment.is_some() || is_method || shared_data.is_class_constructor() {
             let function = allocate_object(vm, |defer_gc| EcmascriptFunctionObjectWithRareData {
-                base: Self::new(defer_gc, vm, shared_data, parent_environment, prototype),
+                base: Self::new(
+                    defer_gc,
+                    vm,
+                    realm,
+                    shared_data,
+                    parent_environment,
+                    prototype,
+                    is_method,
+                ),
                 private_environment: NullableMember::new(private_environment),
                 home_object: NullableMember::new(home_object),
                 storage: EcmascriptFunctionObjectStorage::default(),
@@ -259,11 +273,19 @@ impl EcmascriptFunctionObject {
             function.upcast()
         } else {
             allocate_object(vm, |defer_gc| {
-                Self::new(defer_gc, vm, shared_data, parent_environment, prototype)
+                Self::new(
+                    defer_gc,
+                    vm,
+                    realm,
+                    shared_data,
+                    parent_environment,
+                    prototype,
+                    is_method,
+                )
             })
         };
         function.initialize(vm, realm);
-        if home_object.is_some() {
+        if is_method {
             function.make_method();
         }
         function
@@ -299,37 +321,44 @@ impl EcmascriptFunctionObject {
     fn new(
         _: &DeferGc<'_>,
         vm: &Vm,
+        realm: Gc<Realm>,
         shared_data: Gc<SharedFunctionInstanceData>,
         parent_environment: Option<Gc<Environment>>,
         prototype: Gc<Object>,
+        is_method: bool,
     ) -> Self {
-        let base =
-            FunctionObject::new_with_prototype(vm, Self::CLASS, prototype, MayInterfereWithIndexedPropertyAccess::No);
+        // OPTIMIZATION: Start from a premade shape: normal and async functions create their properties lazily, and
+        //               the other kinds already have theirs in spec order.
+        let mut shape = Self::premade_shape(realm, shared_data, is_method);
+        // NB: The function's [[Realm]] is the realm of its shape, so the shape comes from the function's realm even when
+        //     the prototype belongs to another one.
+        if shape.prototype() != Some(prototype) {
+            shape = shape.create_prototype_transition(vm, Some(prototype));
+        }
+        let base = FunctionObject::new_with_shape(Self::CLASS, shape, MayInterfereWithIndexedPropertyAccess::No);
         base.set_is_ecmascript_function_object();
         base.class_bits.set(ecmascript_function_flags::IS_ECMASCRIPT_FUNCTION);
-
-        // OPTIMIZATION: Start from a premade shape: normal and async functions create their properties lazily, and
-        //               the other kinds already have theirs in spec order. Arrow functions use the same shape as other
-        //               functions of their kind, but never get a lazy prototype.
-        let realm = base.shape().realm();
-        let function_shape = match shared_data.kind() {
-            FunctionKind::Normal => realm.normal_function_shape(),
-            FunctionKind::Generator => realm.generator_function_shape(),
-            FunctionKind::Async => realm.async_function_shape(),
-            FunctionKind::AsyncGenerator => realm.async_generator_function_shape(),
-        };
-        // NB: unsafe_set_shape(); the named storage gets room for the shape's properties when the function is allocated.
-        if function_shape.prototype() == Some(prototype) {
-            base.shape.set(function_shape);
-        } else {
-            base.shape
-                .set(function_shape.create_prototype_transition(vm, Some(prototype)));
-        }
 
         let function = Self { base };
         function.fields().shared_data.set(Some(shared_data));
         function.fields().environment.set(parent_environment);
         function
+    }
+
+    /// The premade shape that functions with `shared_data` start from. Normal functions that are constructors have a
+    /// "prototype" property, which most of them make lazily, so they start from a shape of their own: property lookup
+    /// caches must not apply what they saw on an arrow function or a method, which has no "prototype" property, to
+    /// them.
+    fn premade_shape(realm: Gc<Realm>, shared_data: Gc<SharedFunctionInstanceData>, is_method: bool) -> Gc<Shape> {
+        match shared_data.kind() {
+            FunctionKind::Normal if Self::has_constructor_for(shared_data, is_method) => {
+                realm.normal_constructor_function_shape()
+            }
+            FunctionKind::Normal => realm.normal_function_shape(),
+            FunctionKind::Generator => realm.generator_function_shape(),
+            FunctionKind::Async => realm.async_function_shape(),
+            FunctionKind::AsyncGenerator => realm.async_generator_function_shape(),
+        }
     }
 
     fn initialize(&self, vm: &Vm, realm: Gc<Realm>) {
@@ -342,7 +371,8 @@ impl EcmascriptFunctionObject {
         match self.kind() {
             FunctionKind::Normal => {
                 self.make_length_and_name_lazy();
-                if !self.is_arrow_function() {
+                // NB: Class constructors get their "prototype" property from ClassDefinitionEvaluation.
+                if !self.is_arrow_function() && !self.is_class_constructor() {
                     self.set_flag(ecmascript_function_flags::MAY_NEED_LAZY_PROTOTYPE_INSTANTIATION, true);
                 }
             }
@@ -411,23 +441,157 @@ impl EcmascriptFunctionObject {
     fn reify_lazy_length_and_name_with_name(&self, vm: &Vm, name_string: Gc<PrimitiveString>) {
         self.set_flag(ecmascript_function_flags::HAS_LAZY_LENGTH_AND_NAME, false);
 
+        let attributes = PropertyAttributes::new(Attribute::CONFIGURABLE);
+        self.insert_properties(
+            vm,
+            0,
+            &[(&vm.names.length, attributes), (&vm.names.name, attributes)],
+            &[Value::from_i32(self.function_length()), Value::from_string(name_string)],
+        );
+    }
+
+    /// OPTIMIZATION: Few normal functions are ever used as constructors, so they make their "prototype" property when
+    ///               something looks for it.
+    ///
+    /// Gives the function its "prototype" property if it may not have it yet, right after "length" and "name", where
+    /// the spec creates it.
+    #[inline(always)]
+    fn instantiate_lazy_prototype_if_needed(&self, vm: &Vm) {
+        if self.has_flag(ecmascript_function_flags::MAY_NEED_LAZY_PROTOTYPE_INSTANTIATION) {
+            self.instantiate_lazy_prototype(vm);
+        }
+    }
+
+    fn instantiate_lazy_prototype(&self, vm: &Vm) {
+        self.set_flag(ecmascript_function_flags::MAY_NEED_LAZY_PROTOTYPE_INSTANTIATION, false);
+
+        let prototype = self.create_prototype_object(vm);
+        let attributes = PropertyAttributes::new(Attribute::WRITABLE);
+        // NB: Lazy "length" and "name" are put in front of all other properties when they are made.
+        let index = if self.has_flag(ecmascript_function_flags::HAS_LAZY_LENGTH_AND_NAME) {
+            0
+        } else {
+            let shape = self.shape();
+            debug_assert!(
+                shape
+                    .lookup(&vm.names.length)
+                    .is_some_and(|metadata| metadata.offset == 0)
+                    && shape
+                        .lookup(&vm.names.name)
+                        .is_some_and(|metadata| metadata.offset == 1),
+                "a function with a lazy prototype has its length and name first"
+            );
+            2
+        };
+        if self.shape().property_count() == index {
+            self.define_direct_property(vm, &vm.names.prototype, Value::from_object(prototype), attributes);
+            return;
+        }
+        self.insert_properties(
+            vm,
+            index,
+            &[(&vm.names.prototype, attributes)],
+            &[Value::from_object(prototype)],
+        );
+    }
+
+    /// Whether the function has the property `property_key` without having made it yet, which looking it up makes.
+    #[cfg(feature = "jit")]
+    pub(crate) fn has_lazy_property(&self, vm: &Vm, property_key: &PropertyKey) -> bool {
+        (self.has_flag(ecmascript_function_flags::HAS_LAZY_LENGTH_AND_NAME)
+            && (*property_key == vm.names.length || *property_key == vm.names.name))
+            || (self.has_flag(ecmascript_function_flags::MAY_NEED_LAZY_PROTOTYPE_INSTANTIATION)
+                && *property_key == vm.names.prototype)
+    }
+
+    pub(crate) fn reify_lazy_property(&self, vm: &Vm, property_key: &PropertyKey) {
+        if self.has_flag(ecmascript_function_flags::HAS_LAZY_LENGTH_AND_NAME)
+            && (*property_key == vm.names.length || *property_key == vm.names.name)
+        {
+            self.reify_lazy_length_and_name(vm);
+        }
+
+        if self.has_flag(ecmascript_function_flags::MAY_NEED_LAZY_PROTOTYPE_INSTANTIATION)
+            && *property_key == vm.names.prototype
+        {
+            self.instantiate_lazy_prototype(vm);
+        }
+    }
+
+    /// Gives the function all of the properties it makes lazily. This must happen before its shape changes in a way that
+    /// insert_properties() cannot rebuild.
+    pub(crate) fn reify_lazy_properties(&self, vm: &Vm) {
+        // OPTIMIZATION: When "length", "name" and "prototype" are all lazy, one rebuild of the shape makes them.
+        if self.has_flag(ecmascript_function_flags::HAS_LAZY_LENGTH_AND_NAME)
+            && self.has_flag(ecmascript_function_flags::MAY_NEED_LAZY_PROTOTYPE_INSTANTIATION)
+        {
+            self.set_flag(ecmascript_function_flags::HAS_LAZY_LENGTH_AND_NAME, false);
+            self.set_flag(ecmascript_function_flags::MAY_NEED_LAZY_PROTOTYPE_INSTANTIATION, false);
+            let name_string = PrimitiveString::create_from_fly_string(vm, &self.name());
+            let prototype = self.create_prototype_object(vm);
+            let length_and_name_attributes = PropertyAttributes::new(Attribute::CONFIGURABLE);
+            self.insert_properties(
+                vm,
+                0,
+                &[
+                    (&vm.names.length, length_and_name_attributes),
+                    (&vm.names.name, length_and_name_attributes),
+                    (&vm.names.prototype, PropertyAttributes::new(Attribute::WRITABLE)),
+                ],
+                &[
+                    Value::from_i32(self.function_length()),
+                    Value::from_string(name_string),
+                    Value::from_object(prototype),
+                ],
+            );
+            return;
+        }
+        self.reify_length_and_name(vm);
+        self.instantiate_lazy_prototype_if_needed(vm);
+    }
+
+    /// The object a lazy "prototype" property holds, made as MakeConstructor would make it.
+    fn create_prototype_object(&self, vm: &Vm) -> Gc<Object> {
+        debug_assert!(
+            self.shape().lookup(&vm.names.prototype).is_none(),
+            "a function with a lazy prototype does not have one yet"
+        );
+        let realm = self.realm().expect("an ECMAScript function has a realm");
+        let prototype = Object::create_with_premade_shape(vm, realm.normal_function_prototype_shape());
+        prototype.initialize_direct(
+            realm.normal_function_prototype_constructor_offset(),
+            Value::from_object(self.as_function_object_gc()),
+        );
+        prototype
+    }
+
+    /// Rebuilds the shape from the premade shape of the function's kind with the given properties in front of the one
+    /// at `index` in insertion order, and gives them the given values.
+    fn insert_properties(
+        &self,
+        vm: &Vm,
+        index: u32,
+        properties: &[(&PropertyKey, PropertyAttributes)],
+        values: &[Value],
+    ) {
+        debug_assert_eq!(properties.len(), values.len());
         let old_shape = self.shape();
         // NB: Rebuilding the shape bypasses transitions away from the old one and moves existing property offsets.
         old_shape.mark_unstable(vm);
         let realm = old_shape.realm();
         let mut shape = match self.kind() {
-            FunctionKind::Normal => realm.normal_function_shape(),
-            FunctionKind::Async => realm.async_function_shape(),
             FunctionKind::Generator | FunctionKind::AsyncGenerator => {
-                unreachable!("generator functions have their length and name from the start")
+                unreachable!("generator functions have all of their properties from the start")
             }
+            FunctionKind::Normal | FunctionKind::Async => Self::premade_shape(
+                realm,
+                self.shared_data(),
+                self.has_flag(ecmascript_function_flags::IS_METHOD),
+            ),
         };
         if shape.prototype() != old_shape.prototype() {
             shape = shape.create_prototype_transition(vm, old_shape.prototype());
         }
-        let attributes = PropertyAttributes::new(Attribute::CONFIGURABLE);
-        shape = shape.create_put_transition(vm, &vm.names.length, attributes);
-        shape = shape.create_put_transition(vm, &vm.names.name, attributes);
         // NB: Adding the transitions can allocate, which must not happen while the shape is borrowed, so the properties
         //     are read out first.
         let property_count = old_shape.property_count() as usize;
@@ -438,15 +602,22 @@ impl EcmascriptFunctionObject {
             property_attributes.push(metadata.attributes);
             ControlFlow::Continue(())
         });
-        for (index, attributes) in property_attributes.into_iter().enumerate() {
-            let property_key = property_keys.get(index).expect("the index is in bounds");
+        for (position, attributes) in property_attributes.into_iter().enumerate() {
+            if position == index as usize {
+                for (inserted_key, inserted_attributes) in properties {
+                    shape = shape.create_put_transition(vm, inserted_key, *inserted_attributes);
+                }
+            }
+            let property_key = property_keys.get(position).expect("the position is in bounds");
             shape = shape.create_put_transition(vm, &property_key, attributes);
         }
+        if index as usize == property_count {
+            for (inserted_key, inserted_attributes) in properties {
+                shape = shape.create_put_transition(vm, inserted_key, *inserted_attributes);
+            }
+        }
 
-        self.prepend_named_properties(
-            shape,
-            &[Value::from_i32(self.function_length()), Value::from_string(name_string)],
-        );
+        self.insert_named_properties(shape, index, values);
     }
 
     pub fn as_ecmascript_function_gc(&self) -> Gc<EcmascriptFunctionObject> {
@@ -465,7 +636,6 @@ impl EcmascriptFunctionObject {
         if should_dump_bytecode() {
             rust_executable.dump();
         }
-        shared_data.clear_compile_inputs();
         Ok(rust_executable)
     }
 
@@ -487,8 +657,6 @@ impl EcmascriptFunctionObject {
         this_argument: Value,
     ) -> ThrowCompletionOr<Value> {
         let function = as_ecmascript_function(object);
-
-        debug_assert!(function.bytecode_executable().is_some());
 
         // 1. Let callerContext be the running execution context.
         // NOTE: No-op, kept by the VM in its execution context stack.
@@ -542,8 +710,6 @@ impl EcmascriptFunctionObject {
     ) -> ThrowCompletionOr<Gc<Object>> {
         let function = as_ecmascript_function(object);
 
-        debug_assert!(function.bytecode_executable().is_some());
-
         // 1. Let callerContext be the running execution context.
         // NOTE: No-op, kept by the VM in its execution context stack.
 
@@ -556,8 +722,11 @@ impl EcmascriptFunctionObject {
         if kind == ConstructorKind::Base {
             // a. Let thisArgument be ? OrdinaryCreateFromConstructor(newTarget, "%Object.prototype%").
             // NB: With room for the properties the constructor is known to add.
-            let prototype = get_prototype_from_constructor(vm, new_target, Intrinsics::object_prototype)?;
-            this_argument = Some(Object::create_for_construct(vm, prototype, function.shared_data()));
+            this_argument = Some(Object::create_from_constructor_for_construct(
+                vm,
+                new_target,
+                function.shared_data(),
+            )?);
         }
 
         // 4. Let calleeContext be PrepareForOrdinaryCall(F, newTarget).
@@ -625,9 +794,19 @@ impl EcmascriptFunctionObject {
         }
 
         // 15. Let thisBinding be ? constructorEnv.GetThisBinding().
-        let this_binding = constructor_env
-            .expect("a constructor runs in an environment")
-            .get_this_binding(vm)?;
+        // OPTIMIZATION: The frame answers for an environment without a this binding, with its this value, which is
+        //               empty while it is not initialized.
+        let this_binding = if function.shared_data().function_environment_has_this_binding() {
+            constructor_env
+                .expect("a constructor runs in an environment")
+                .get_this_binding(vm)?
+        } else {
+            let this_value = callee_context.this_value.get();
+            if this_value.is_empty() {
+                return vm.throw_completion(ErrorKind::ReferenceError, ErrorType::ThisHasNotBeenInitialized, &[]);
+            }
+            this_value
+        };
 
         // 16. Assert: Type(thisBinding) is Object.
         debug_assert!(this_binding.is_object());
@@ -665,6 +844,11 @@ impl EcmascriptFunctionObject {
 
         // 6. Set the ScriptOrModule of calleeContext to F.[[ScriptOrModule]].
         callee_context.script_or_module.set(self.script_or_module());
+
+        // NB: Frames of functions whose environment has no this binding answer for new.target themselves.
+        callee_context
+            .new_target
+            .set(new_target.map_or(Value::UNDEFINED, Value::from_object));
 
         if self.function_environment_needed() {
             // 7. Let localEnv be NewFunctionEnvironment(F, newTarget).
@@ -805,9 +989,9 @@ impl EcmascriptFunctionObject {
     // 10.2.1.4 OrdinaryCallEvaluateBody ( F, argumentsList ), https://tc39.es/ecma262/#sec-ordinarycallevaluatebody
     // 15.8.4 Runtime Semantics: EvaluateAsyncFunctionBody, https://tc39.es/ecma262/#sec-runtime-semantics-evaluatefunctionbody
     fn ordinary_call_evaluate_body(&self, vm: &Vm, context: &ExecutionContext) -> ThrowCompletionOr<Value> {
-        let executable = self
-            .bytecode_executable()
-            .expect("a function is compiled before it is called");
+        // NB: The function was compiled before the call, but its code may have been flushed since (see
+        //     `bytecode::flushing`), as nothing held it while the call allocated.
+        let executable = self.compiled_executable(vm)?;
         let result = vm.run_executable(NonNull::from(context), executable, 0);
 
         // NOTE: Running the bytecode should eventually return a completion.
@@ -915,6 +1099,33 @@ impl EcmascriptFunctionObject {
             .storage
             .class_data
             .get_or_init(Box::default)
+    }
+
+    /// Remembers that InitializeInstanceElements for this derived constructor initializes an object of `shape`, which
+    /// JIT code can rely on while it is always the same one (see instance_elements_shape()).
+    pub fn record_instance_elements_shape(&self, vm: &Vm, shape: Gc<Shape>) {
+        let Some(class_data) = self.class_data() else {
+            return;
+        };
+        {
+            let class_data = class_data.borrow();
+            if class_data.instance_elements_shape_varies || class_data.instance_elements_shape == Some(shape) {
+                return;
+            }
+        }
+        let mut class_data = class_data.borrow_mut(vm);
+        if class_data.instance_elements_shape.is_some() {
+            class_data.instance_elements_shape = None;
+            class_data.instance_elements_shape_varies = true;
+        } else {
+            class_data.instance_elements_shape = Some(shape);
+        }
+    }
+
+    /// The shape of every object InitializeInstanceElements initialized for this derived constructor so far, if there
+    /// was one and it was always the same.
+    pub fn instance_elements_shape(&self) -> Option<Gc<Shape>> {
+        self.class_data()?.borrow().instance_elements_shape
     }
 
     pub fn has_class_data(&self) -> bool {
@@ -1078,9 +1289,12 @@ impl EcmascriptFunctionObject {
 
     // Equivalent to absence of [[Construct]]
     pub fn has_constructor(&self) -> bool {
-        self.kind() == FunctionKind::Normal
-            && !self.is_arrow_function()
-            && !self.has_flag(ecmascript_function_flags::IS_METHOD)
+        Self::has_constructor_for(self.shared_data(), self.has_flag(ecmascript_function_flags::IS_METHOD))
+    }
+
+    /// Whether a function with `shared_data` has a [[Construct]] internal method.
+    fn has_constructor_for(shared_data: Gc<SharedFunctionInstanceData>, is_method: bool) -> bool {
+        shared_data.kind() == FunctionKind::Normal && !shared_data.is_arrow_function() && !is_method
     }
 
     pub fn kind(&self) -> FunctionKind {
@@ -1228,45 +1442,14 @@ impl EcmascriptFunctionObject {
         vm: &Vm,
         property_key: &PropertyKey,
     ) -> ThrowCompletionOr<Option<PropertyDescriptor>> {
-        let function = as_ecmascript_function(object);
-
-        if function.has_flag(ecmascript_function_flags::HAS_LAZY_LENGTH_AND_NAME)
-            && (*property_key == vm.names.length || *property_key == vm.names.name)
-        {
-            function.reify_length_and_name(vm);
-        }
-
-        if function.has_flag(ecmascript_function_flags::MAY_NEED_LAZY_PROTOTYPE_INSTANTIATION)
-            && *property_key == vm.names.prototype
-        {
-            let realm = function.realm().expect("an ECMAScript function has a realm");
-            let metadata = object.shape().lookup(property_key);
-            if metadata.is_none() {
-                let prototype = Object::create_with_premade_shape(vm, realm.normal_function_prototype_shape());
-                prototype.initialize_direct(
-                    realm.normal_function_prototype_constructor_offset(),
-                    Value::from_object(function.as_function_object_gc()),
-                );
-                object.define_direct_property(
-                    vm,
-                    &vm.names.prototype,
-                    Value::from_object(prototype),
-                    PropertyAttributes::new(Attribute::WRITABLE),
-                );
-            }
-            function.set_flag(ecmascript_function_flags::MAY_NEED_LAZY_PROTOTYPE_INSTANTIATION, false);
-        }
-
+        as_ecmascript_function(object).reify_lazy_property(vm, property_key);
         object.ordinary_get_own_property(vm, property_key)
     }
 
     fn internal_own_property_keys<'vm>(object: &Object, vm: &'vm Vm) -> ThrowCompletionOr<MarkedVec<'vm, Value>> {
         let function = as_ecmascript_function(object);
 
-        function.reify_length_and_name(vm);
-        if function.has_flag(ecmascript_function_flags::MAY_NEED_LAZY_PROTOTYPE_INSTANTIATION) {
-            Self::internal_get_own_property(object, vm, &vm.names.prototype)?;
-        }
+        function.reify_lazy_properties(vm);
 
         object.ordinary_own_property_keys(vm)
     }

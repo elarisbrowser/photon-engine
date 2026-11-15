@@ -11,12 +11,11 @@ use core::cell::Cell;
 
 use libjs_rust::api::{DeferGc, GcRefCell, Trace, Value, Vm};
 
-use crate::bindings::conversions::CppInterface;
 use crate::bindings::interface::{Ref, Wrappable, allocate, wrap};
 use crate::bindings::promise::{WebIdlPromise, create_resolved_promise, exception_value, react_to_promise};
 use crate::bindings::{CallContext, MustNotThrow, WebIdlResult};
+use crate::dom::abort_signal::AbortSignal;
 use crate::streams::algorithms::{AbortAlgorithm, CloseAlgorithm, SizeAlgorithm, StartAlgorithm, WriteAlgorithm};
-use crate::streams::cpp::AbortSignal;
 use crate::streams::queue_with_sizes::QueueWithSizes;
 use crate::streams::underlying_sink::UnderlyingSink;
 use crate::streams::writable_stream::{
@@ -51,9 +50,8 @@ pub(crate) struct WritableStreamDefaultController {
     // https://streams.spec.whatwg.org/#writablestreamdefaultcontroller-queue
     // https://streams.spec.whatwg.org/#writablestreamdefaultcontroller-queuetotalsize
     queue: QueueWithSizes,
-    // https://streams.spec.whatwg.org/#writablestreamdefaultcontroller-abortcontroller, of which LibWeb's C++ keeps the
-    // signal.
-    signal: GcRefCell<Option<AbortSignal>>,
+    // https://streams.spec.whatwg.org/#writablestreamdefaultcontroller-abortcontroller
+    signal: GcRefCell<Option<Ref<AbortSignal>>>,
     // https://streams.spec.whatwg.org/#writablestreamdefaultcontroller-started
     started: Cell<bool>,
     // https://streams.spec.whatwg.org/#writablestreamdefaultcontroller-strategyhwm
@@ -114,16 +112,13 @@ impl WritableStreamDefaultController {
     }
 
     /// The signal of the controller's [[abortController]].
-    pub(crate) fn abort_signal(&self) -> AbortSignal {
-        self.signal
-            .borrow()
-            .clone()
-            .expect("a controller that is set up has a signal")
+    pub(crate) fn abort_signal(&self) -> Ref<AbortSignal> {
+        self.signal.borrow().expect("a controller that is set up has a signal")
     }
 
     // https://streams.spec.whatwg.org/#ws-default-controller-signal
-    pub(crate) fn signal(&self, cx: &mut CallContext) -> WebIdlResult<CppInterface> {
-        Ok(self.abort_signal().wrapper(cx.realm()))
+    pub(crate) fn signal(&self, _: &mut CallContext) -> WebIdlResult<Ref<AbortSignal>> {
+        Ok(self.abort_signal())
     }
 
     // https://streams.spec.whatwg.org/#ws-default-controller-error
@@ -193,7 +188,7 @@ pub(crate) fn set_up_writable_stream_default_controller(
     controller.queue.reset_queue(vm);
 
     // 6. Set controller.[[abortController]] to a new AbortController.
-    let signal = AbortSignal::create();
+    let signal = AbortSignal::create(vm);
     *controller.signal.borrow_mut(vm) = Some(signal);
 
     // 7. Set controller.[[started]] to false.
@@ -477,7 +472,8 @@ pub(crate) fn writable_stream_default_controller_get_chunk_size(
     // 1. If controller.[[strategySizeAlgorithm]] is undefined, then:
     let Some(strategy_size_algorithm) = controller.strategy_size_algorithm() else {
         // 1. Assert: controller.[[stream]].[[state]] is not "writable".
-        assert!(controller.stream().state() != WritableStreamState::Writable);
+        // AD-HOC: This does not hold: closing clears the algorithms, and the stream is "writable" until the sink closed.
+        //         A write in that time gets here on its way to being rejected.
 
         // 2. Return 1.
         return Value::from_f64(1.0);

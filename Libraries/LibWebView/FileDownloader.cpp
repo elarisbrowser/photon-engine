@@ -132,6 +132,8 @@ struct FileDownloader::ActiveDownload {
     u32 redirect_count { 0 };
     bool can_issue_own_requests { false };
     bool can_restart_from_zero { false };
+    // The context of the request that started the download, so later requests send the same cookies.
+    HTTP::Cookie::SameSiteContext same_site_context { HTTP::Cookie::SameSiteContext::same_site() };
     DownloadRangeSupport range_support;
     bool segmentation_abandoned { false };
     bool restored_from_disk { false };
@@ -246,7 +248,7 @@ void FileDownloader::start_download_request(u64 download_id, URL::URL const& url
         fail_download(download_id, MUST(String::formatted("Unable to launch RequestServer: {}", client.error())));
         return;
     }
-    auto request = client.value()->start_request("GET"sv, url, *request_headers, {}, HTTP::CacheMode::Default, HTTP::Cookie::IncludeCredentials::Yes, Requests::RequestClient::TransferLease::No, 0u);
+    auto request = client.value()->start_request("GET"sv, url, active->same_site_context, *request_headers, {}, HTTP::CacheMode::Default, HTTP::Cookie::IncludeCredentials::Yes, Requests::RequestClient::TransferLease::No, 0u);
     if (!request) {
         fail_download(download_id, "Unable to start request to download file"_string);
         return;
@@ -285,7 +287,7 @@ void FileDownloader::follow_download_redirect(u64 download_id, HTTP::HeaderList 
     start_download_request(download_id, redirect_url.release_value());
 }
 
-u64 FileDownloader::adopt_download(IsPrivate is_private, ByteString profile_identity, URL::URL const& url, LexicalPath destination, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ReadonlyBytes initial_data,
+u64 FileDownloader::adopt_download(IsPrivate is_private, ByteString profile_identity, URL::URL const& url, LexicalPath destination, Optional<u64> total_size, HTTP::Cookie::SameSiteContext same_site_context, int request_server_client_id, u64 request_server_request_id, int owner_client_id, ReadonlyBytes initial_data,
     ResponseFinished on_response_finished)
 {
     ScopeGuard report_failure = [&] {
@@ -300,6 +302,7 @@ u64 FileDownloader::adopt_download(IsPrivate is_private, ByteString profile_iden
 
     active->effective_url = url;
     active->can_issue_own_requests = true;
+    active->same_site_context = same_site_context;
 
     if (!initial_data.is_empty()) {
         append_download_data(download_id, initial_data);
@@ -308,10 +311,10 @@ u64 FileDownloader::adopt_download(IsPrivate is_private, ByteString profile_iden
             return download_id;
     }
 
-    // The response lives in the RequestServer of the client that fetched it.
+    // The response lives in the RequestServer of its owner.
     RefPtr<Requests::Request> request;
-    if (auto request_server = RequestServerManager::the().instance_for_client(request_server_client_id))
-        request = request_server->ui_client().adopt_request(request_server_client_id, request_server_request_id);
+    if (auto request_server = RequestServerManager::the().instance_for_client(owner_client_id))
+        request = request_server->ui_client().adopt_request(request_server_client_id, request_server_request_id, Requests::RequestClient::TransferLease::No, owner_client_id);
     if (!request) {
         fail_download(download_id, "Unable to adopt request to download file"_string);
         return download_id;
@@ -634,7 +637,7 @@ void FileDownloader::start_segment_request(u64 download_id, size_t segment_index
         fail_download(download_id, MUST(String::formatted("Unable to launch RequestServer: {}", client.error())));
         return;
     }
-    auto request = client.value()->start_request("GET"sv, active->effective_url, *request_headers, {}, HTTP::CacheMode::NoStore, HTTP::Cookie::IncludeCredentials::Yes, Requests::RequestClient::TransferLease::No, static_cast<u32>(segment_index));
+    auto request = client.value()->start_request("GET"sv, active->effective_url, active->same_site_context, *request_headers, {}, HTTP::CacheMode::NoStore, HTTP::Cookie::IncludeCredentials::Yes, Requests::RequestClient::TransferLease::No, static_cast<u32>(segment_index));
     if (!request) {
         fail_download(download_id, "Unable to start request to download file"_string);
         return;
@@ -1378,6 +1381,7 @@ void FileDownloader::persist_download_snapshot(u64 id, PersistUrgency urgency)
         .created_time = active->created_time,
         .can_restart_from_zero = active->can_restart_from_zero,
         .may_replace_destination = active->may_replace_destination,
+        .same_site_context = active->same_site_context,
     };
 
     record.segments.ensure_capacity(active->segments.size());
@@ -1506,6 +1510,7 @@ bool FileDownloader::restore_persisted_download(DownloadRecord& record, ByteStri
     active->can_issue_own_requests = true;
     active->can_restart_from_zero = record.can_restart_from_zero;
     active->may_replace_destination = record.may_replace_destination;
+    active->same_site_context = record.same_site_context;
     active->created_time = record.created_time;
     active->restored_from_disk = true;
     active->range_support.supports_ranges = true;

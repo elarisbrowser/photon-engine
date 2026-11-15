@@ -25,10 +25,15 @@ use smallvec::SmallVec;
 pub(crate) enum LayoutChange {
     SetNeedsLayoutUpdate {
         node: NodeSlotId,
-        propagate_through_ancestors: bool,
+    },
+    RelayoutElementAfterStyleChange {
+        element: StyleNodeID,
+        rebuilds_layout_tree: bool,
     },
     /// The whole layout tree is built again.
     SetNeedsFullLayoutTreeUpdate,
+    /// See [`LayoutNodeArena::forces_parallel_layout`].
+    ForceParallelLayout,
     /// Loads filled faces into the font cascades of these addresses in place, so the styles naming them stay as they
     /// are: the boxes whose text renders in one of them lay out again.
     RelayoutUsersOfFontLists {
@@ -62,6 +67,10 @@ pub(crate) enum LayoutChange {
         scope_host: Option<StyleNodeID>,
         anchor_name: usize,
         elements: Box<[StyleNodeID]>,
+    },
+    SetImplicitAnchorElement {
+        element: StyleNodeID,
+        anchor: Option<StyleNodeID>,
     },
     /// What the element has scrolled to.
     SetElementScrollOffset {
@@ -116,6 +125,11 @@ pub(crate) enum LayoutChange {
     },
     /// A layout committed: the text find in page searches is mapped again.
     InvalidateSearchableText,
+    /// The frameset the row was built for published another layout: the row takes it, and lays out again where it
+    /// changed.
+    RestampFrameSetLayout {
+        node: NodeSlotId,
+    },
     /// The element the row was built for published other table spans: the row takes them, and lays out again where
     /// they changed.
     RestampTableSpans {
@@ -151,8 +165,10 @@ pub(crate) enum LayoutChange {
     },
     /// How the host learns what boxes a DOM node has, or none.
     SetBoxPresenceHost(Option<super::layout_node_arena::BoxPresenceHost>),
-    /// The document's layout passes are traced from now on.
-    BeginLayoutTrace,
+    /// The document's layout passes, and its layout tree builds where asked, are traced from now on.
+    BeginLayoutTrace {
+        tree_builds: bool,
+    },
     /// The boxes of the traced events at these lines are named so.
     NameLayoutTraceOwners(Vec<(usize, String)>),
     /// The tree scope registers these counter styles now.
@@ -169,17 +185,21 @@ impl LayoutChange {
     pub(crate) fn row_write(&self) -> crate::render_state::RowWrite {
         use crate::render_state::RowWrite;
         match self {
-            Self::InvalidateSearchableText | Self::RecordLastSuccessfulPositionOptions => RowWrite::None,
+            Self::InvalidateSearchableText | Self::RecordLastSuccessfulPositionOptions | Self::ForceParallelLayout => {
+                RowWrite::None
+            }
             Self::StyleNodeChanged { .. } => RowWrite::Identities,
             Self::SetNodeFlag { flag, .. } if *flag as u32 & NodeFlag::IDENTITY != 0 => RowWrite::Identities,
             Self::SetNodeStyle { .. } => RowWrite::NamedStyles,
             Self::SetNeedsLayoutUpdate { .. }
+            | Self::RelayoutElementAfterStyleChange { .. }
             | Self::SetNeedsFullLayoutTreeUpdate
             | Self::RelayoutUsersOfFontLists { .. }
             | Self::MarkBox { .. }
             | Self::ApplyLayoutTreeUpdateMark { .. }
             | Self::RecordPartialRelayoutEscape
             | Self::SetAnchorNameElements { .. }
+            | Self::SetImplicitAnchorElement { .. }
             | Self::SetElementScrollOffset { .. }
             | Self::SetWritingSuggestion(_)
             | Self::SetPseudoElementScrollOffset { .. }
@@ -192,12 +212,13 @@ impl LayoutChange {
             | Self::HandOverOwnedProvider { .. }
             | Self::SetOwnedImageNaturalSize { .. }
             | Self::RestampTableSpans { .. }
+            | Self::RestampFrameSetLayout { .. }
             | Self::SetNodeNeedsCompositorAnimationFrame { .. }
             | Self::PinBoundBoxStyleRecordForDetachment { .. }
             | Self::PinNodeStyleRecordForHost { .. }
             | Self::ReleaseNodeStyleRecordPinForHost { .. }
             | Self::SetBoxPresenceHost(_)
-            | Self::BeginLayoutTrace
+            | Self::BeginLayoutTrace { .. }
             | Self::NameLayoutTraceOwners(_)
             | Self::CounterStyles { .. } => RowWrite::Rows,
         }
@@ -215,7 +236,7 @@ impl LayoutChange {
             | Self::PinBoundBoxStyleRecordForDetachment { .. }
             | Self::PinNodeStyleRecordForHost { .. }
             | Self::ReleaseNodeStyleRecordPinForHost { .. }
-            | Self::BeginLayoutTrace
+            | Self::BeginLayoutTrace { .. }
             | Self::NameLayoutTraceOwners(_) => false,
             _ => true,
         }
@@ -234,15 +255,17 @@ impl LayoutChange {
     /// left to change.
     pub(crate) fn apply(self, arena: &mut LayoutNodeArena) {
         match self {
-            Self::SetNeedsLayoutUpdate {
-                node,
-                propagate_through_ancestors,
-            } => {
+            Self::SetNeedsLayoutUpdate { node } => {
                 if arena.slot_is_live(node) {
-                    arena.set_needs_layout_update(node, propagate_through_ancestors);
+                    arena.set_needs_layout_update(node, true);
                 }
             }
+            Self::RelayoutElementAfterStyleChange {
+                element,
+                rebuilds_layout_tree,
+            } => arena.mark_element_for_relayout_after_style_change(element, rebuilds_layout_tree),
             Self::SetNeedsFullLayoutTreeUpdate => arena.set_needs_full_layout_tree_update(true),
+            Self::ForceParallelLayout => arena.force_parallel_layout(),
             Self::RelayoutUsersOfFontLists { font_lists } => arena.relayout_users_of_font_lists(&font_lists),
             Self::MarkBox { target, marks } => marks.apply(arena, target),
             Self::ApplyLayoutTreeUpdateMark { node, mark } => arena.apply_layout_tree_update_mark(node, mark),
@@ -268,6 +291,7 @@ impl LayoutChange {
                 anchor_name,
                 elements,
             } => arena.set_anchor_name_elements(scope_host, anchor_name, elements.iter().copied()),
+            Self::SetImplicitAnchorElement { element, anchor } => arena.set_implicit_anchor_element(element, anchor),
             Self::SetElementScrollOffset { element, offset } => arena.set_element_scroll_offset(element, offset),
             Self::SetWritingSuggestion(suggestion) => arena.set_writing_suggestion(suggestion),
             Self::SetPseudoElementScrollOffset {
@@ -298,6 +322,11 @@ impl LayoutChange {
                 }
             }
             Self::InvalidateSearchableText => arena.invalidate_searchable_text(),
+            Self::RestampFrameSetLayout { node } => {
+                if arena.slot_is_live(node) && arena.restamp_frameset_layout(node) {
+                    arena.set_needs_layout_update(node, true);
+                }
+            }
             Self::RestampTableSpans { node } => {
                 if arena.slot_is_live(node) && arena.restamp_table_spans(node) {
                     arena.set_needs_layout_update(node, true);
@@ -330,7 +359,7 @@ impl LayoutChange {
             Self::PinNodeStyleRecordForHost { node, record } => arena.pin_node_style_record_for_host(node, record),
             Self::ReleaseNodeStyleRecordPinForHost { node } => arena.release_node_style_record_pin_for_host(node),
             Self::SetBoxPresenceHost(host) => arena.set_box_presence_host(host),
-            Self::BeginLayoutTrace => arena.layout_trace.begin(),
+            Self::BeginLayoutTrace { tree_builds } => arena.layout_trace.begin(tree_builds),
             Self::NameLayoutTraceOwners(names) => arena.name_layout_trace_owners(names),
             Self::CounterStyles { tree_scope, scope } => arena.publish_counter_styles(tree_scope, scope),
         }
@@ -343,8 +372,6 @@ pub(crate) enum LayoutWrite<'a> {
     /// Detaches the layout subtree `root` heads from its parent, if it has one, and frees it. The host prepared its rows
     /// for leaving the tree before.
     DropSubtree { root: NodeSlotId },
-    /// Detaches the layout placement of the top layer element and clears every stale projected subtree of it.
-    DetachTopLayerElement(StyleNodeID),
     /// Detaches what is left of the boxes of each node the style node identities name as the nodes leave the document,
     /// while the identities still name them: their synthetic pseudo-elements' boxes and their boxes' top layer
     /// placements go, and their boxes are cleared for the parent's rebuild to free. An identity of 0 names no node.
@@ -361,9 +388,6 @@ pub(crate) enum LayoutWrite<'a> {
     PropagateRootStylesToViewport,
     /// Prepares every row of the subtree the row heads for leaving the layout tree.
     PrepareSubtreeForDetach { root: NodeSlotId },
-    /// Clears the committed box of every row of the subtree the row heads, and prepares each for leaving the layout
-    /// tree, as a removal does before it drops the subtree.
-    PrepareSubtreeForRemoval { root: NodeSlotId },
 }
 
 /// What a write answers: whether the subtree it dropped was attached, and what it owes the host.
@@ -389,11 +413,8 @@ impl LayoutWrite<'_> {
                     false
                 }
             }
-            Self::DetachTopLayerElement(element) => {
-                super::tree_builder::detach_top_layer_element_layout_subtree(host_calls, arena, element);
-                false
-            }
             Self::DetachRemainingRowsForRemoval(nodes) => {
+                super::tree_builder::note_removed_list_entries(arena, nodes);
                 for node in nodes.iter().filter_map(|&node| StyleNodeID::from_raw(node)) {
                     super::tree_builder::detach_remaining_rows_for_removal(host_calls, arena, node);
                 }
@@ -434,17 +455,6 @@ impl LayoutWrite<'_> {
                 super::layout_node_arena::prepare_subtree_for_detach(host_calls, arena, root);
                 false
             }
-            Self::PrepareSubtreeForRemoval { root } => {
-                let mut rows = Vec::new();
-                arena.for_each_node_in_layout_subtree_in_pre_order(root, |row| rows.push(row));
-                for &row in &rows {
-                    crate::painting::ffi::paintable_cleared_from_node(host_calls, arena, row);
-                }
-                for row in rows {
-                    super::layout_node_arena::prepare_row_for_detach(host_calls, arena, row);
-                }
-                false
-            }
         };
         LayoutWritten {
             was_attached,
@@ -465,16 +475,24 @@ pub(crate) fn queue(host: &DocumentHost, change: LayoutChange) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn render_state_set_needs_layout_update(
+pub extern "C" fn render_state_set_needs_layout_update(host: &DocumentHost, node: NodeSlotId) {
+    queue(host, LayoutChange::SetNeedsLayoutUpdate { node });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_relayout_element_after_style_change(
     host: &DocumentHost,
-    node: NodeSlotId,
-    propagate_through_ancestors: bool,
+    style_node: u32,
+    rebuilds_layout_tree: bool,
 ) {
+    let Some(element) = StyleNodeID::from_raw(style_node) else {
+        return;
+    };
     queue(
         host,
-        LayoutChange::SetNeedsLayoutUpdate {
-            node,
-            propagate_through_ancestors,
+        LayoutChange::RelayoutElementAfterStyleChange {
+            element,
+            rebuilds_layout_tree,
         },
     );
 }
@@ -506,6 +524,12 @@ pub extern "C" fn render_state_relayout_users_of_font_lists(host: &DocumentHost,
 #[unsafe(no_mangle)]
 pub extern "C" fn render_state_set_needs_full_layout_tree_update(host: &DocumentHost) {
     queue(host, LayoutChange::SetNeedsFullLayoutTreeUpdate);
+}
+
+/// See [`LayoutNodeArena::forces_parallel_layout`].
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_force_parallel_layout(host: &DocumentHost) {
+    queue(host, LayoutChange::ForceParallelLayout);
 }
 
 #[unsafe(no_mangle)]
@@ -564,6 +588,19 @@ pub extern "C" fn render_state_set_anchor_name_elements(
             .collect(),
     };
     queue(host, change);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn render_state_set_implicit_anchor_element(host: &DocumentHost, element: u32, anchor: u32) {
+    if let Some(element) = StyleNodeID::from_raw(element) {
+        queue(
+            host,
+            LayoutChange::SetImplicitAnchorElement {
+                element,
+                anchor: StyleNodeID::from_raw(anchor),
+            },
+        );
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -722,6 +759,11 @@ pub extern "C" fn render_state_invalidate_searchable_text(host: &DocumentHost) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn render_state_restamp_frameset_layout(host: &DocumentHost, node: NodeSlotId) {
+    queue(host, LayoutChange::RestampFrameSetLayout { node });
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn render_state_restamp_table_spans(host: &DocumentHost, node: NodeSlotId) {
     queue(host, LayoutChange::RestampTableSpans { node });
 }
@@ -740,11 +782,7 @@ mod tests {
         arena
             .free_subtree(freed)
             .destroy_shells_and_invoke_callbacks(&crate::stage::MainThread::for_test());
-        LayoutChange::SetNeedsLayoutUpdate {
-            node: freed,
-            propagate_through_ancestors: true,
-        }
-        .apply(&mut arena);
+        LayoutChange::SetNeedsLayoutUpdate { node: freed }.apply(&mut arena);
         assert!(!arena.slot_is_live(freed));
     }
 
@@ -755,11 +793,7 @@ mod tests {
         arena.write_shape(node).set_kind(NodeKind::BlockContainer);
         arena.reset_layout_update_flags_in_subtree(node);
         assert!(!arena.node_needs_layout_update(node));
-        LayoutChange::SetNeedsLayoutUpdate {
-            node,
-            propagate_through_ancestors: false,
-        }
-        .apply(&mut arena);
+        LayoutChange::SetNeedsLayoutUpdate { node }.apply(&mut arena);
         assert!(arena.node_needs_layout_update(node));
         arena
             .free_subtree(node)

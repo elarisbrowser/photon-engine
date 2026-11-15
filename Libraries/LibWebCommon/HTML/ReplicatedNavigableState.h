@@ -13,6 +13,7 @@
 #include <LibURL/Origin.h>
 #include <LibURL/URL.h>
 #include <LibWebCommon/CSS/PreferredColorScheme.h>
+#include <LibWebCommon/ContentSecurityPolicy/SerializedPolicy.h>
 #include <LibWebCommon/Export.h>
 #include <LibWebCommon/HTML/CrossOrigin/OpenerPolicy.h>
 #include <LibWebCommon/HTML/CrossProcessId.h>
@@ -47,6 +48,10 @@ struct ReplicatedContainerState {
     // The container's local name, which navigate makes its request's destination and initiator type.
     Optional<Utf16FlyString> local_name;
 
+    // The container's name content attribute, which lets a cross-origin child whose target name matches it be found by
+    // that name on its parent's window.
+    Optional<Utf16FlyString> name {};
+
     // https://html.spec.whatwg.org/multipage/browsers.html#determining-the-iframe-element-referrer-policy
     ReferrerPolicy::ReferrerPolicy iframe_referrer_policy { ReferrerPolicy::ReferrerPolicy::EmptyString };
 
@@ -61,6 +66,10 @@ struct ReplicatedContainerState {
     // https://w3c.github.io/webappsec-upgrade-insecure-requests/#upgrade-insecure-navigations-set, of the container's
     // node document's policy container.
     UpgradeInsecureRequests::UpgradeInsecureNavigationsSet document_upgrade_insecure_navigations_set {};
+
+    // https://html.spec.whatwg.org/multipage/browsers.html#policy-container-csp-list, of the container's node
+    // document's policy container, whose frame-src governs where the navigable can be navigated to.
+    Vector<ContentSecurityPolicy::SerializedPolicy> document_csp_list {};
 
     // https://drafts.csswg.org/css-color-adjust-1/#color-scheme-effect
     // The container's used color scheme, which decides whether the canvas of the navigable's document is opaque.
@@ -81,6 +90,7 @@ struct ReplicatedNavigableState {
     Utf16String target_name;
     URL::URL active_document_url;
     URL::Origin active_document_origin;
+    SandboxingFlagSet active_document_sandboxing_flag_set {};
     bool active_document_is_fully_active { false };
     URL::URL top_level_creation_url;
     URL::Origin top_level_origin;

@@ -143,9 +143,7 @@ impl InitialStyle {
 /// How an element's style came about.
 #[derive(Clone, Copy)]
 pub(super) enum Outcome {
-    Computed {
-        directly: bool,
-    },
+    Computed,
     /// The element took the record of an element it agrees with.
     Shared,
     /// The element took the record of an element whose cascade picked the same declarations.
@@ -280,6 +278,8 @@ pub(super) struct PassContext<'a> {
     pub(super) uses_caches: bool,
     /// What the audit of what the pass reuses asks for, as `LIBWEB_STYLE_AUDIT_CACHES` asks.
     pub(super) cache_audit: super::self_check::Mode,
+    /// Whether the pass notes how each element came by its record, for a test tracing it.
+    pub(super) traces: bool,
     /// The font inputs of the document element's record from before the pass, which elements
     /// resolve root-relative lengths against unless the pass styles the document element.
     pub(super) held_root_font: Option<RootFontInputs>,
@@ -289,6 +289,14 @@ pub(super) struct PassContext<'a> {
     /// What of those moved from the ones the document element had before, which restyles every
     /// element under it that reads it.
     pub(super) root_font_moved: std::sync::OnceLock<RootFontReads>,
+    /// The body's color computed independently of the order in which the workers reach tables.
+    pub(super) quirks_body_style: std::sync::OnceLock<QuirksBodyStyle>,
+}
+
+pub(super) struct QuirksBodyStyle {
+    color: Option<RetainedStyleValueData>,
+    fonts: Vec<font_resolution::FontRequest>,
+    random_bases: Vec<RandomBaseRequest>,
 }
 
 impl<'a> PassContext<'a> {
@@ -317,14 +325,75 @@ impl<'a> PassContext<'a> {
             waits_once: false,
             uses_caches: true,
             cache_audit: super::self_check::Mode::Off,
+            traces: false,
             held_root_font,
             root_font: Default::default(),
             root_font_moved: Default::default(),
+            quirks_body_style: Default::default(),
         }
     }
 }
 
 impl PassContext<'_> {
+    // https://quirks.spec.whatwg.org/#the-tables-inherit-color-from-body-quirk
+    // A body after the table can still be awaiting computation on another worker. Compute its inheritance chain
+    // privately, as an on-demand read does, and keep the result for this round. Font and random-value requests
+    // suspend the table until the next round, which computes the dependency against the resolved inputs.
+    fn quirks_table_color(&self, node: StyleNodeID) -> &QuirksBodyStyle {
+        self.quirks_body_style.get_or_init(|| {
+            let Some(body) = self.state.quirks_table_body(node) else {
+                return QuirksBodyStyle {
+                    color: Some(
+                        crate::css::style_compute::initial_value_handle(
+                            crate::css::property_metadata::property_id::COLOR,
+                        )
+                        .clone(),
+                    ),
+                    fonts: Vec::new(),
+                    random_bases: Vec::new(),
+                };
+            };
+            if self.records.computed(body)
+                && let Some(view) = self.records.assigned_record_view(body)
+            {
+                return QuirksBodyStyle {
+                    color: Some(
+                        view.longhands()
+                            .effective_value(view.animated_overlay, crate::css::property_metadata::property_id::COLOR)
+                            .clone(),
+                    ),
+                    fonts: Vec::new(),
+                    random_bases: Vec::new(),
+                };
+            }
+            let mut chain: SmallVec<[StyleNodeID; 32]> =
+                std::iter::successors(Some(body), |&node| self.state.projection.inheritance_parent(node)).collect();
+            chain.reverse();
+            let mut cells = super::records::RecordCells::default();
+            cells.reserve(self.state.projection.element_slot_count());
+            let records =
+                Records::new(self.state, &cells, None).composing_over_equal_records(Record::holds_the_same_style_as);
+            let context = PassContext {
+                uses_caches: false,
+                ..PassContext::new(self.state, self.index, self.initial, &records, self.root_font())
+            };
+            let statistics = style_chain(&context, &chain);
+            let color = records
+                .assigned_record_view(body)
+                .filter(|_| records.computed(body))
+                .map(|view| {
+                    view.longhands()
+                        .effective_value(view.animated_overlay, crate::css::property_metadata::property_id::COLOR)
+                        .clone()
+                });
+            QuirksBodyStyle {
+                color,
+                fonts: statistics.font_requests,
+                random_bases: statistics.random_requests,
+            }
+        })
+    }
+
     /// The matched declarations cache of the pass.
     fn matched_declarations(&self) -> &MatchedDeclarationsCache {
         self.kept_matched_declarations.unwrap_or(&self.own_matched_declarations)
@@ -439,9 +508,10 @@ pub(super) struct Statistics {
     pub(super) waiting_pseudo_elements: Vec<StyleNodeID>,
     /// What the pass suspended of those, where it suspends, for its next round to resume.
     pub(super) suspended: Vec<Suspended>,
-    pub(super) pseudo_elements_declined: u64,
     /// The elements the pass styled.
     pub(super) styled: Vec<StyleNodeID>,
+    /// How each element the pass styled came by its record, where it traces.
+    pub(super) traced_outcomes: Vec<(StyleNodeID, super::counters::TracedOutcome)>,
     /// The elements that took the custom properties their parents hand down now without being
     /// styled, keeping their style otherwise.
     pub(super) moved_custom_properties: Vec<StyleNodeID>,
@@ -833,6 +903,7 @@ impl<'a> Scratch<'a> {
         // What an element matches, its parent and its containers decide its style. Its matches
         // are the ones it had where no entry it was rematched for answers otherwise.
         let only_matches_moved = rematched
+            && !state.is_quirks_table(node)
             && moved & (PARENT_CHANGED | CONTAINERS_MOVED | RECOMPUTE_SELF) == 0
             && (moved & PARENT_RESTYLED == 0
                 || state
@@ -902,6 +973,11 @@ impl<'a> Scratch<'a> {
                     .records
                     .insert_pseudo_element_records(node, pseudo_element_records);
                 self.statistics.outcomes.note(&Outcome::Shared);
+                if context.traces {
+                    self.statistics
+                        .traced_outcomes
+                        .push((node, super::counters::TracedOutcome::Shared));
+                }
                 self.audit_caches(context, node, cache_audit::Reuse::SharedStyle);
                 #[cfg(test)]
                 context.set_output(node, || ElementOutput {
@@ -946,7 +1022,6 @@ impl<'a> Scratch<'a> {
                 Some(record) => Ok((
                     record,
                     ComputedFacts {
-                        directly: false,
                         element_dependent: false,
                         reused: true,
                     },
@@ -995,9 +1070,7 @@ impl<'a> Scratch<'a> {
                     );
                     match computed.reused {
                         true => Outcome::Reused,
-                        false => Outcome::Computed {
-                            directly: computed.directly,
-                        },
+                        false => Outcome::Computed,
                     }
                 }
                 Err(outcome) => {
@@ -1027,6 +1100,9 @@ impl<'a> Scratch<'a> {
             self.statistics.waiting_with_kept_matches.push(node);
         }
         self.statistics.outcomes.note(&outcome);
+        if context.traces {
+            self.statistics.traced_outcomes.push((node, (&outcome).into()));
+        }
         #[cfg(test)]
         context.set_output(node, || ElementOutput {
             matches: matched.then(|| self.matches.clone()),
@@ -1257,12 +1333,13 @@ impl<'a> Scratch<'a> {
                     element_dependent |= dependent;
                     pseudo_element_records.push((target, record));
                 }
-                PseudoElementOutcome::Declined => self.statistics.pseudo_elements_declined += 1,
                 // A pseudo-element waiting on a font or a random base value is styled again with
                 // its element once those resolved. Until then its element shares its records with
                 // no other.
                 PseudoElementOutcome::Waiting => element_dependent = true,
-                PseudoElementOutcome::Unstyled | PseudoElementOutcome::GeneratesNoBox => {}
+                PseudoElementOutcome::Declined
+                | PseudoElementOutcome::Unstyled
+                | PseudoElementOutcome::GeneratesNoBox => {}
             }
         }
         Some((pseudo_element_records, element_dependent))
@@ -1399,11 +1476,12 @@ impl<'a> Scratch<'a> {
                 target,
                 context.root_font(),
                 group_seeds,
+                None,
             );
             if let Some(request) = suspended_font {
                 self.statistics.font_requests.push(request);
             }
-            let Ok(mut computed) = driven else {
+            let Some(mut computed) = driven else {
                 return Err(match self.pseudo_element_waits(node, requested) {
                     true => PseudoElementOutcome::Waiting,
                     false => PseudoElementOutcome::Declined,
@@ -1436,9 +1514,10 @@ impl<'a> Scratch<'a> {
                     target,
                     context.root_font(),
                     group_seeds,
+                    None,
                 );
                 computed.reads.display_none_is_animated = ignoring_animations
-                    .is_ok_and(|ignoring_animations| !computed_display_is_none(&ignoring_animations));
+                    .is_some_and(|ignoring_animations| !computed_display_is_none(&ignoring_animations));
             }
             let registered = state.registered_custom_property_store(
                 node,
@@ -1737,7 +1816,6 @@ impl<'a> Scratch<'a> {
                 return Ok((
                     record,
                     ComputedFacts {
-                        directly: false,
                         element_dependent: false,
                         reused: true,
                     },
@@ -1785,6 +1863,25 @@ impl<'a> Scratch<'a> {
         // samples its animations over the record the pass installs.
         let sampled_custom_properties = context.records.sampled_custom_properties(node).flatten();
 
+        let quirks_color = if state.is_quirks_table(node) {
+            let requested = self.requested();
+            let body = context.quirks_table_color(node);
+            self.statistics.font_requests.extend(body.fonts.iter().cloned());
+            self.statistics
+                .random_requests
+                .extend(body.random_bases.iter().map(|request| RandomBaseRequest {
+                    node: request.node,
+                    name: request.name.clone(),
+                    element_shared: request.element_shared,
+                }));
+            if self.waits(node, requested) || body.color.is_none() {
+                return Err(Outcome::ComputeDeclined);
+            }
+            body.color.as_ref()
+        } else {
+            None
+        };
+
         let group_seeds = context
             .initial
             .group_seeds(parent.and_then(|(parent, _)| context.records.get_shared(parent)));
@@ -1819,12 +1916,13 @@ impl<'a> Scratch<'a> {
                 super::PseudoElementTarget::of_kind(super::rules::ELEMENT_PSEUDO_KIND),
                 context.root_font(),
                 group_seeds,
+                quirks_color,
             );
             if let Some(request) = suspended_font {
                 self.statistics.font_requests.push(request);
             }
             self.waits(node, requested);
-            let Ok(mut computed) = driven else {
+            let Some(mut computed) = driven else {
                 return Err(Outcome::ComputeDeclined);
             };
             computed.element_dependent |= custom_properties_read_subject;
@@ -1859,9 +1957,10 @@ impl<'a> Scratch<'a> {
                     super::PseudoElementTarget::of_kind(super::rules::ELEMENT_PSEUDO_KIND),
                     context.root_font(),
                     group_seeds,
+                    quirks_color,
                 );
                 computed.reads.display_none_is_animated = ignoring_animations
-                    .is_ok_and(|ignoring_animations| !computed_display_is_none(&ignoring_animations));
+                    .is_some_and(|ignoring_animations| !computed_display_is_none(&ignoring_animations));
             }
             let registered = state.registered_custom_property_store(
                 node,
@@ -1970,7 +2069,6 @@ impl<'a> Scratch<'a> {
         Ok((
             record,
             ComputedFacts {
-                directly: computed.directly,
                 element_dependent: computed.element_dependent,
                 reused: false,
             },
@@ -2042,7 +2140,7 @@ impl<'a> Scratch<'a> {
         node: StyleNodeID,
         backed: Option<(u8, StyleNodeID)>,
     ) -> Option<MatchedKey<'c>> {
-        if !context.uses_caches || backed.is_some() {
+        if !context.uses_caches || backed.is_some() || context.state.is_quirks_table(node) {
             return None;
         }
         let state = context.state;
@@ -2514,7 +2612,6 @@ enum PseudoElementOutcome {
 
 /// What came of computing an element besides its record.
 struct ComputedFacts {
-    directly: bool,
     element_dependent: bool,
     /// Whether the record is one computed for an element before, reused.
     reused: bool,
@@ -2960,6 +3057,7 @@ fn style_queued<T: Sync>(
         }
     }
     let mut statistics = Statistics::default();
+    let mut styled_threads = 0u64;
     for (index, scratch) in scratches.slots.into_iter().enumerate() {
         let Some(mut scratch) = scratch.into_inner().expect("no thread panicked while styling") else {
             continue;
@@ -2968,8 +3066,21 @@ fn style_queued<T: Sync>(
             && let Some(cache) = context.group_caches.and_then(|caches| caches.get(index))
         {
             *cache.lock().expect("no thread panicked while styling") = std::mem::take(&mut scratch.groups).kept();
+            styled_threads |= 1 << index;
         }
         statistics.add(scratch);
+    }
+    // NB: The caches of the threads that sat the pass out count it as a small one too, so the room a large pass left
+    //     them goes back while only the calling thread styles, as it does for an animation.
+    if context.uses_caches
+        && let Some(caches) = context.group_caches
+    {
+        for (index, cache) in caches.made_with_index() {
+            if styled_threads & (1 << index) == 0 {
+                let mut cache = cache.lock().expect("no thread panicked while styling");
+                *cache = std::mem::take(&mut *cache).kept();
+            }
+        }
     }
     statistics.cache_audit.conclude(context.cache_audit);
     statistics
@@ -3002,9 +3113,6 @@ pub(super) enum DemandedPseudoElement {
     Declined,
 }
 
-/// Style the pseudo-element `target` of `node` for a read of its style, whether or not it
-/// generates a box, from the rules the element matches for it, over the record `context` holds for
-/// `node`, which it inherits from. Which pseudo-elements are styled is what `read` says.
 /// Whether the computed values of `computed` hold `display: none`.
 fn computed_display_is_none(computed: &super::compute::ComputedElement) -> bool {
     crate::css::style_compute::display_of(
@@ -3015,17 +3123,10 @@ fn computed_display_is_none(computed: &super::compute::ComputedElement) -> bool 
     .is_none()
 }
 
-pub(super) fn style_pseudo_element(
-    context: &PassContext<'_>,
-    node: StyleNodeID,
-    target: super::PseudoElementTarget,
-    read: PseudoElementRead,
-) -> DemandedPseudoElement {
-    style_pseudo_element_inheriting_from(context, node, target, read, None)
-}
-
-/// Style the pseudo-element `target` of `node` as [`style_pseudo_element`] does, inheriting from
-/// `inheritance_parent` rather than from `node` where it names an element.
+/// Style the pseudo-element `target` of `node` for a read of its style, whether or not it
+/// generates a box, from the rules the element matches for it, over the record `context` holds for
+/// `node`, which it inherits from, or for `inheritance_parent` where that names an element. Which
+/// pseudo-elements are styled is what `read` says.
 pub(super) fn style_pseudo_element_inheriting_from(
     context: &PassContext<'_>,
     node: StyleNodeID,
@@ -3120,8 +3221,8 @@ impl Statistics {
             .waiting_with_kept_matches
             .extend(round.waiting_with_kept_matches);
         statistics.waiting_pseudo_elements.extend(round.waiting_pseudo_elements);
-        statistics.pseudo_elements_declined += round.pseudo_elements_declined;
         statistics.styled.extend(round.styled);
+        statistics.traced_outcomes.extend(round.traced_outcomes);
         statistics.moved_custom_properties.extend(round.moved_custom_properties);
         statistics.changed_elements += round.changed_elements;
         statistics.children_moved.extend(round.children_moved);

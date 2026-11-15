@@ -9,9 +9,11 @@ option(ENABLE_ALL_THE_DEBUG_MACROS "Enable all debug macros to validate they sti
 option(INCLUDE_WASM_SPEC_TESTS "Download and include the WebAssembly spec testsuite" OFF)
 option(BUILD_BROWSER_TESTS_ONLY "Only build the tests that run the browser's own executables" OFF)
 
-# The optimizing JIT for JavaScript generates code for x86-64 and AArch64 with the calling conventions of Linux and
-# macOS. Elsewhere, LibJS runs JavaScript in its interpreter alone.
+# The optimizing JIT for JavaScript generates code for x86-64 and AArch64 on Linux and macOS, and for x86-64 on Windows.
+# Elsewhere, LibJS runs JavaScript in its interpreter alone.
 if (((LINUX AND NOT ANDROID) OR APPLE) AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|aarch64|arm64|ARM64)$")
+    set(js_jit_default ON)
+elseif (WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
     set(js_jit_default ON)
 else()
     set(js_jit_default OFF)
@@ -44,11 +46,11 @@ if (LADYBIRD_GENERATE_SYMBOL_FILES AND MSVC)
 endif()
 option(ENABLE_CI_BASELINE_CPU "Use a common CPU baseline for portable binaries and ccache sharing" OFF)
 
-set(LADYBIRD_VERSION "" CACHE STRING "Version of a release: year.month.patch")
+set(LADYBIRD_VERSION "" CACHE STRING "Version of a release, such as 2026.46.0")
 set(LADYBIRD_BROWSER_VERSION "${PROJECT_VERSION}")
 if (NOT LADYBIRD_VERSION STREQUAL "")
-    if (NOT LADYBIRD_VERSION MATCHES "^[0-9][0-9][0-9][0-9]\\.([1-9]|1[0-2])\\.(0|[1-9][0-9]*)$")
-        message(FATAL_ERROR "LADYBIRD_VERSION must be year.month.patch: ${LADYBIRD_VERSION}")
+    if (NOT LADYBIRD_VERSION MATCHES "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$")
+        message(FATAL_ERROR "LADYBIRD_VERSION must be three integers, such as 2026.46.0: ${LADYBIRD_VERSION}")
     endif()
     set(LADYBIRD_BROWSER_VERSION "${LADYBIRD_VERSION}")
 endif()

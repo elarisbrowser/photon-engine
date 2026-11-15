@@ -8,6 +8,7 @@
 #include <AK/Utf16String.h>
 #include <AK/Utf8View.h>
 #include <LibGC/Heap.h>
+#include <LibGC/RootVector.h>
 #include <LibGfx/Font/Font.h>
 #include <LibWeb/ARIA/AriaData.h>
 #include <LibWeb/ARIA/AttributeNames.h>
@@ -46,7 +47,6 @@
 #include <LibWeb/Painting/BoxViews.h>
 #include <LibWeb/Painting/PaintableTypes.h>
 #include <LibWeb/Selection/Selection.h>
-#include <LibWeb/VisualLines.h>
 #include <LibWebCommon/WebView/AccessibilityNodeData.h>
 
 namespace Web::DOM {
@@ -184,18 +184,14 @@ static Gfx::IntRect accessibility_bounds(Layout::BegunRead const& read, Element 
 // unions the text frame's in-flow rects). Empty when the text renders no fragment.
 static Optional<CSSPixelRect> text_bounding_client_rect(Document const& document, Layout::Node const& layout_node)
 {
-    auto rect_to_viewport_transform = Painting::identity_rect_to_viewport_transform();
-    Optional<Compositing::AccumulatedVisualContextTree> visual_context_tree;
-    if (!document.can_compute_client_rects_without_accumulated_visual_contexts_update(layout_node)) {
-        const_cast<Document&>(document).update_paint_and_hit_testing_properties_if_needed();
-        visual_context_tree = document.visual_context_tree();
-        rect_to_viewport_transform = Painting::rect_to_viewport_transform(document, *visual_context_tree);
-    }
+    Layout::RustFFI::FfiViewportMapping viewport_mapping {};
+    if (!document.can_compute_client_rects_without_accumulated_visual_contexts_update(layout_node))
+        viewport_mapping = Painting::viewport_mapping(document);
     Optional<CSSPixelRect> united;
     Layout::RustFFI::layout_script_text_range_rects(
         layout_node.document_host(), Layout::Node::slot_id(&layout_node),
         to_underlying(Painting::SelectionState::Full), 0, 0, 0, NumericLimits<size_t>::max(),
-        rect_to_viewport_transform, &united, [](void* context, CSSPixelRect rect) {
+        viewport_mapping, &united, [](void* context, CSSPixelRect rect) {
             auto& united = *static_cast<Optional<CSSPixelRect>*>(context);
             united = united.has_value() ? united->united(rect) : rect;
         });
@@ -249,27 +245,34 @@ static bool fill_text_geometry(WebView::AccessibilityNodeData& node_data, DOM::T
 
     auto* layout = text_node.layout_node(read);
 
-    // The caret rect at a DOM offset is document-absolute and spans the height of the line the offset
+    // The caret rect at a DOM offset is document-absolute and spans the height of the text on the line the offset
     // renders on, which is what a line's geometry is read from here.
     auto line_rect_at_offset = [&](size_t offset) -> Optional<CSSPixelRect> {
         if (!layout)
             return {};
-        Layout::RustFFI::FfiOptionalCssPixelRect result;
-        Layout::RustFFI::layout_script_text_caret_rect_in_dom_range(
-            layout->document_host(), Layout::Node::slot_id(layout), offset, &result);
-        if (!result.has_value)
+        Compositing::RustFFI::NodeSlotId const no_slot { Compositing::RustFFI::INVALID_NODE_SLOT_INDEX };
+        Layout::RustFFI::FfiCaret caret;
+        Layout::RustFFI::layout_script_caret(layout->document_host(),
+            { .node = Layout::Node::slot_id(layout), .offset = offset, .downstream = true, .child_before = no_slot, .child_before_length = 0, .child_after = no_slot },
+            {}, &caret);
+        if (!caret.found)
             return {};
-        return result.rect;
+        return caret.rect;
     };
 
+    Vector<Layout::RustFFI::FfiVisualLine> lines;
+    if (layout) {
+        Layout::RustFFI::render_state_text_visual_lines(layout->document_host(), Layout::Node::slot_id(layout), &lines,
+            [](void* context, Layout::RustFFI::FfiVisualLine line) {
+                static_cast<Vector<Layout::RustFFI::FfiVisualLine>*>(context)->append(line);
+            });
+    }
     struct RenderedLine {
-        VisualLine line;
+        Layout::RustFFI::FfiVisualLine line;
         CSSPixelRect rect;
     };
     Vector<RenderedLine> rendered_lines;
-    for (auto const& line : collect_visual_lines(read, text_node)) {
-        if (!line.has_fragments)
-            continue;
+    for (auto const& line : lines) {
         if (auto rect = line_rect_at_offset(line.start_offset); rect.has_value())
             rendered_lines.append({ line, *rect });
     }
@@ -467,7 +470,44 @@ static Optional<u64> fill_volatile_fields(WebView::AccessibilityNodeData& node_d
     return keep_text_geometry(node_data, *text_node, document, geometry.release_value());
 }
 
+static bool should_skip_child_in_node_data(AccessibilityTreeNode const& child)
+{
+    if (child.value()->is_uninteresting_whitespace_node())
+        return true;
+    if (child.value()->is_text()) {
+        for (auto* ancestor = child.value()->parent(); ancestor; ancestor = ancestor->parent()) {
+            if (is<HTML::HTMLHeadElement>(*ancestor))
+                return true;
+        }
+    }
+    return false;
+}
+
 void AccessibilityTreeNode::serialize_tree_as_node_data(Vector<WebView::AccessibilityNodeData>& out, Document const& document, Layout::BegunRead const& read, i64 parent_id, AccessibilityChangeTracker* tracker) const
+{
+    // Each node comes out before its subtree, and its children in order: a depth-first walk. It's done with a stack of
+    // its own rather than by recursion, since a page's DOM can be many thousands of levels deep, and a frame per level
+    // would exhaust the thread's stack.
+    // The nodes still to serialize, each with its parent's ID at the same index of pending_parent_ids.
+    GC::RootVector<GC::Ref<AccessibilityTreeNode const>> pending_nodes;
+    Vector<i64> pending_parent_ids;
+    pending_nodes.append(*this);
+    pending_parent_ids.append(parent_id);
+    while (!pending_nodes.is_empty()) {
+        auto node = pending_nodes.take_last();
+        auto node_parent_id = pending_parent_ids.take_last();
+        auto id = node->serialize_node_as_node_data(out, document, read, node_parent_id, tracker);
+        auto children = node->children();
+        for (size_t i = children.size(); i > 0; --i) {
+            if (should_skip_child_in_node_data(*children[i - 1]))
+                continue;
+            pending_nodes.append(*children[i - 1]);
+            pending_parent_ids.append(id);
+        }
+    }
+}
+
+i64 AccessibilityTreeNode::serialize_node_as_node_data(Vector<WebView::AccessibilityNodeData>& out, Document const& document, Layout::BegunRead const& read, i64 parent_id, AccessibilityChangeTracker* tracker) const
 {
     WebView::AccessibilityNodeData node_data;
     node_data.parent_id = parent_id;
@@ -930,32 +970,15 @@ void AccessibilityTreeNode::serialize_tree_as_node_data(Vector<WebView::Accessib
 
     auto my_id = node_data.id;
 
-    auto should_skip_child = [](AccessibilityTreeNode const& child) -> bool {
-        if (child.value()->is_uninteresting_whitespace_node())
-            return true;
-        if (child.value()->is_text()) {
-            for (auto* ancestor = child.value()->parent(); ancestor; ancestor = ancestor->parent()) {
-                if (is<HTML::HTMLHeadElement>(*ancestor))
-                    return true;
-            }
-        }
-        return false;
-    };
-
     for (auto const& child : children()) {
-        if (should_skip_child(*child))
+        if (should_skip_child_in_node_data(*child))
             continue;
         node_data.child_ids.append(static_cast<i64>(child->value()->unique_id().value()));
     }
 
     if (!tracker || tracker->note(node_data, record_version, geometry_version))
         out.append(move(node_data));
-
-    for (auto const& child : children()) {
-        if (should_skip_child(*child))
-            continue;
-        child->serialize_tree_as_node_data(out, document, read, my_id, tracker);
-    }
+    return my_id;
 }
 
 void AccessibilityTreeNode::visit_edges(Visitor& visitor)

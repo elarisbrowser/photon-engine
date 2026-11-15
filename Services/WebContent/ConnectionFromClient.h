@@ -72,12 +72,12 @@ public:
     void did_destroy_compositor_context(Web::CompositorContextId);
 
     Function<void(IPC::TransportHandle const&, Optional<int> client_id, Optional<Utf16String> const& top_level_site)> on_request_server_connection;
-    Function<void(IPC::TransportHandle const&)> on_image_decoder_connection;
 
     // Asks the Browser to spawn this process's MediaServer if it has none, and to connect a client to it.
     ErrorOr<NonnullOwnPtr<IPC::Transport>> request_media_server_transport();
     ErrorOr<NonnullOwnPtr<IPC::Transport>> request_audio_server_transport();
     ErrorOr<NonnullOwnPtr<IPC::Transport>> request_webrtc_client_transport();
+    ErrorOr<NonnullOwnPtr<IPC::Transport>> request_image_decoder_transport();
 
     // Null outside test mode: the UI process connects the test endpoint only when it runs tests.
     TestConnection* test_connection();
@@ -88,25 +88,6 @@ public:
     void pump_and_dispatch_gamepad_events();
 
 private:
-    struct PerformanceDocumentCounters {
-        u64 style_update_microseconds { 0 };
-        u64 style_reaction_elements { 0 };
-        u64 style_reaction_batches { 0 };
-        u64 style_update_submission_microseconds { 0 };
-        u64 style_update_bridge_microseconds { 0 };
-        u64 style_update_apply_microseconds { 0 };
-        u64 style_update_remainder_microseconds { 0 };
-        u64 style_engine_transaction_setup_microseconds { 0 };
-        u64 style_engine_transaction_setups { 0 };
-        u64 full_layout_count { 0 };
-        u64 partial_layout_count { 0 };
-        u64 full_layout_microseconds { 0 };
-        u64 partial_layout_microseconds { 0 };
-    };
-
-    HashMap<void const*, PerformanceDocumentCounters> collect_performance_document_counters() const;
-    JsonObject style_and_layout_diagnostics() const;
-
     ConnectionFromClient(NonnullOwnPtr<IPC::Transport>, bool enable_test_mode);
 
     Optional<PageClient&> page(Web::PageId index, SourceLocation = SourceLocation::current());
@@ -124,8 +105,7 @@ private:
     virtual void content_navigable_completely_finished_loading(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void update_local_root_container_state(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::ReplicatedContainerState) override;
     virtual void close_server() override;
-    virtual void set_task_queue_diagnostics_enabled(bool enabled) override;
-    virtual Messages::WebContentServer::GetTaskQueueDiagnosticsResponse get_task_queue_diagnostics() override;
+    virtual void start_worker_thread(IPC::TransportHandle worker_transport, Web::HTML::AgentType agent_type) override;
     virtual Messages::WebContentServer::GetWindowHandleResponse get_window_handle(Web::PageId page_id) override;
     virtual void set_window_handle(Web::PageId page_id, String handle) override;
     virtual void run_webdriver_command(Web::PageId page_id, u64 command_id, Optional<Web::HTML::CrossProcessId> navigable_id, String name, JsonValue payload, Vector<String> arguments) override;
@@ -137,7 +117,7 @@ private:
     virtual void connect_to_web_ui(Web::PageId page_id, IPC::TransportHandle handle) override;
     virtual void connect_to_request_server(IPC::TransportHandle handle, int client_id, Optional<Utf16String> top_level_site) override;
     virtual void connect_to_test_endpoint(IPC::TransportHandle handle) override;
-    virtual void connect_to_image_decoder(IPC::TransportHandle handle) override;
+    virtual void disconnect_from_image_decoder() override;
     virtual void connect_to_compositor_process(IPC::TransportHandle handle, IPC::TransportHandle render_clock_handle) override;
     virtual void set_site_compatibility_data(JsonValue data) override;
     virtual void set_permission_snapshot(Web::Permissions::PermissionSnapshot snapshot) override;
@@ -272,7 +252,8 @@ private:
     virtual void set_content_blockers(Core::AnonymousBuffer patterns) override;
 
     virtual void set_force_dark_settings(Web::PageId page_id, bool enabled, HashMap<String, bool> per_host) override;
-    virtual void set_autoplay_settings(Web::PageId page_id, Web::HTML::AutoplayPolicy policy, Vector<Utf16String> allowlist) override;
+    virtual void set_force_dark_for_local_roots(Web::PageId page_id, bool enabled) override;
+    virtual void set_autoplay_settings(Web::PageId page_id, Web::HTML::AutoplayPolicy policy, OrderedHashMap<String, Web::HTML::AutoplayPolicy> site_policies) override;
     virtual void set_preferred_color_scheme(Web::PageId page_id, Web::CSS::PreferredColorScheme) override;
     virtual void set_preferred_contrast(Web::PageId page_id, Web::CSS::PreferredContrast) override;
     virtual void set_preferred_motion(Web::PageId page_id, Web::CSS::PreferredMotion) override;
@@ -284,7 +265,6 @@ private:
     virtual void set_geolocation_emulated_position(Web::PageId page_id, WebView::GeolocationPositionData, Optional<u16> error_code) override;
     virtual void geolocation_position_response(Web::PageId page_id, u64 request_id, WebView::GeolocationPositionData, Optional<u16> error_code) override;
     virtual void permission_request_completed(Web::PageId page_id, u64 request_id, Web::Permissions::EffectiveState state) override;
-    virtual void http_credentials_provided(Web::PageId page_id, u64 request_id, Optional<String> username, Optional<String> password) override;
     virtual void notification_shown(Web::PageId page_id, u64 notification_id) override;
     virtual void notification_show_failed(Web::PageId page_id, u64 notification_id) override;
     virtual void notification_clicked(Web::PageId page_id, u64 notification_id) override;
@@ -296,6 +276,7 @@ private:
     virtual void set_is_scripting_enabled(Web::PageId page_id, bool) override;
     virtual void set_zoom_level(Web::PageId page_id, double zoom_level) override;
     virtual void set_maximum_frames_per_second(Web::PageId page_id, double) override;
+    virtual void set_screen_shows_high_dynamic_range(Web::PageId page_id, bool) override;
     virtual void set_frame_rate_capped(Web::PageId page_id, bool) override;
     virtual void set_window_position(Web::PageId page_id, Web::DevicePixelPoint) override;
     virtual void set_window_size(Web::PageId page_id, Web::DevicePixelSize) override;
@@ -304,7 +285,6 @@ private:
     virtual void blob_url_entry_removed(Utf16String url) override;
     virtual void did_delete_all_cookies(Web::PageId page_id, u64 request_id) override;
     virtual void set_system_visibility_state(Web::PageId page_id, Web::HTML::VisibilityState) override;
-    virtual void check_page_responsiveness(Web::PageId page_id, u64 request_id) override;
     virtual void set_browsing_context_group(Web::PageId page_id, u64 browsing_context_group_id) override;
     virtual void update_visibility_state(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::VisibilityState) override;
     virtual void reset_zoom(Web::PageId page_id) override;
@@ -361,7 +341,7 @@ private:
     virtual void find_in_page_end(Web::PageId page_id) override;
 
     virtual void paste(Web::PageId page_id, Utf16String text) override;
-    virtual void paste_from_clipboard(Web::PageId page_id) override;
+    virtual void paste_from_clipboard(Web::PageId page_id, Vector<Web::Clipboard::SystemClipboardItem> system_clipboard_data) override;
     virtual void set_marked_text_from_input_method(Web::PageId page_id, Utf16String text) override;
     virtual void commit_text_from_input_method(Web::PageId page_id, Utf16String text, i32 replacement_start, i32 replacement_length) override;
     virtual void unmark_text_from_input_method(Web::PageId page_id) override;
@@ -381,11 +361,9 @@ private:
     virtual void cookies_changed(Web::PageId page_id, Vector<HTTP::Cookie::Cookie>) override;
     virtual void broadcast_channel_message(Web::HTML::BroadcastChannelMessage message) override;
     virtual void did_worker_agent_fail_loading_script(Web::HTML::WorkerAgentOwnerToken owner_token) override;
-    virtual void did_worker_agent_report_exception(Web::HTML::WorkerAgentOwnerToken owner_token, Utf16String message, Utf16String filename, u32 lineno, u32 colno) override;
     virtual void did_worker_agent_report_content_security_policy_violation(Web::HTML::WorkerAgentOwnerToken owner_token, u64 policy_index, String effective_directive, URL::URL resource) override;
     virtual void did_worker_agent_close(Web::HTML::WorkerAgentOwnerToken owner_token) override;
     virtual void did_worker_agent_die(Web::HTML::WorkerAgentOwnerToken owner_token) override;
-    virtual void did_worker_rtc_transform_encoded_audio_frame_written(Web::HTML::WorkerAgentOwnerToken owner_token, u64 transform_id, ByteBuffer payload, u32 ssrc, u8 payload_type, u32 rtp_timestamp, u16 sequence_number) override;
 
     virtual void request_close(Web::PageId page_id) override;
     virtual void request_close_preflight(Web::PageId page_id, u64 request_id) override;
@@ -414,7 +392,6 @@ private:
 
     Queue<Web::QueuedInputEvent> m_input_event_queue;
     bool m_enable_test_mode { false };
-    HashMap<void const*, PerformanceDocumentCounters> m_task_queue_diagnostics_document_baseline;
 };
 
 }

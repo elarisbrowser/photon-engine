@@ -7,6 +7,7 @@
 
 #include <AK/Atomic.h>
 #include <AK/ByteBuffer.h>
+#include <AK/Diagnostics.h>
 #include <AK/Mutex.h>
 #include <AK/NeverDestroyed.h>
 #include <AK/ScopeGuard.h>
@@ -23,6 +24,7 @@
 #include <LibWeb/Bindings/Wrappable.h>
 #include <LibWeb/Bindings/WrapperWorld.h>
 #include <LibWeb/CSS/CSSFontFaceRule.h>
+#include <LibWeb/CSS/ComputedStyleWorkingSet.h>
 #include <LibWeb/CSS/Enums.h>
 #include <LibWeb/CSS/FontComputer.h>
 #include <LibWeb/CSS/FontFace.h>
@@ -31,15 +33,18 @@
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleSheetState.h>
+#include <LibWeb/CSS/StyleValues/CalculatedStyleValue.h>
 #include <LibWeb/CSS/StyleValues/ComputationContext.h>
 #include <LibWeb/CSS/StyleValues/CustomIdentStyleValue.h>
 #include <LibWeb/CSS/StyleValues/FontSourceStyleValue.h>
 #include <LibWeb/CSS/StyleValues/FontStyleStyleValue.h>
 #include <LibWeb/CSS/StyleValues/NumberStyleValue.h>
+#include <LibWeb/CSS/StyleValues/PercentageStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StringStyleValue.h>
 #include <LibWeb/CSS/StyleValues/StyleValueList.h>
 #include <LibWeb/CSS/StyleValues/UnicodeRangeStyleValue.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/HTML/Scripting/Agent.h>
 #include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/Platform/Timer.h>
@@ -102,6 +107,7 @@ static constexpr Array<FontFaceAttribute, FontFaceState::attribute_count> font_f
     { DescriptorID::AscentOverride, "ascentOverride"sv },
     { DescriptorID::DescentOverride, "descentOverride"sv },
     { DescriptorID::LineGapOverride, "lineGapOverride"sv },
+    { DescriptorID::SizeAdjust, "sizeAdjust"sv },
 } };
 
 static size_t attribute_index(DescriptorID descriptor)
@@ -270,6 +276,7 @@ GC::Ref<FontFace> FontFaceState::create_for_constructor(JS::Object& relevant_glo
     try_set_descriptor(DescriptorID::AscentOverride, descriptors.ascent_override);
     try_set_descriptor(DescriptorID::DescentOverride, descriptors.descent_override);
     try_set_descriptor(DescriptorID::LineGapOverride, descriptors.line_gap_override);
+    try_set_descriptor(DescriptorID::SizeAdjust, descriptors.size_adjust);
     RefPtr<StyleValue const> parsed_source;
     if (auto* source_string = source.get_pointer<Utf16String>()) {
         parsed_source = parse_css_descriptor(parsing_params, AtRuleID::FontFace, DescriptorNameAndID::from_id(DescriptorID::Src), source_string->utf16_view());
@@ -305,7 +312,7 @@ GC::Ref<FontFace> FontFaceState::create_for_constructor(JS::Object& relevant_glo
     if (font_face->m_binary_data.is_empty())
         return cssom_font_face;
 
-    HTML::queue_global_task(HTML::Task::Source::FontLoading, font_face->task_global_object(), GC::create_function(GC::Heap::the(), [font_root = font_face->keep_alive_during_load()] {
+    HTML::queue_global_task(HTML::Task::Source::FontLoading, font_face->task_global_object(), GC::create_function(GC::Heap::the(), GC::captures(font_face->keep_alive_during_load()), [](auto& font_root) {
         auto font_face = font_root->elements().first();
         HTML::TemporaryExecutionContext context(*font_face->m_environment, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes);
         // 1.  Set font face’s status attribute to "loading".
@@ -324,7 +331,7 @@ GC::Ref<FontFace> FontFaceState::create_for_constructor(JS::Object& relevant_glo
 
         font_face->m_font_load_promise->when_resolved([font_root = GC::make_root(font_face->keep_alive_during_load())](auto const& vector_font) -> ErrorOr<void> {
             auto font = font_root->elements().first();
-            HTML::queue_global_task(HTML::Task::Source::FontLoading, font->task_global_object(), GC::create_function(GC::Heap::the(), [font_root = GC::Ref { *font_root }, vector_font] {
+            HTML::queue_global_task(HTML::Task::Source::FontLoading, font->task_global_object(), GC::create_function(GC::Heap::the(), GC::captures(GC::Ref { *font_root }, vector_font), [](auto& font_root, auto& vector_font) {
                 auto font = font_root->elements().first();
                 HTML::TemporaryExecutionContext context(*font->m_environment, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes);
                 // 1. If the load was successful, font face now represents the parsed font;
@@ -348,12 +355,12 @@ GC::Ref<FontFace> FontFaceState::create_for_constructor(JS::Object& relevant_glo
         });
         font_face->m_font_load_promise->when_rejected([font_root = GC::make_root(font_face->keep_alive_during_load())](auto const& error) {
             auto font = font_root->elements().first();
-            HTML::queue_global_task(HTML::Task::Source::FontLoading, font->task_global_object(), GC::create_function(GC::Heap::the(), [font_root = GC::Ref { *font_root }, error = Error::copy(error)] {
+            HTML::queue_global_task(HTML::Task::Source::FontLoading, font->task_global_object(), GC::create_function(GC::Heap::the(), GC::captures(GC::Ref { *font_root }, Utf16String::formatted("Failed to load font: {}", error)), [](auto& font_root, auto& message) {
                 auto font = font_root->elements().first();
                 HTML::TemporaryExecutionContext context(*font->m_environment, HTML::TemporaryExecutionContext::CallbacksEnabled::Yes);
                 // 2. Otherwise, reject font face’s [[FontStatusPromise]] with a DOMException named "SyntaxError"
                 //    and set font face’s status attribute to "error".
-                font->reject_status_promise(WebIDL::SyntaxError::create(Utf16String::formatted("Failed to load font: {}", error)));
+                font->reject_status_promise(WebIDL::SyntaxError::create(message));
 
                 font->did_finish_loading_in_containing_sets(false);
 
@@ -394,16 +401,23 @@ void FontFaceState::reparse_connected_css_font_face_rule_descriptors()
         apply_descriptor(attribute.descriptor, *descriptors.descriptor_or_initial_value(AtRuleID::FontFace, DescriptorNameAndID::from_id(attribute.descriptor)));
 }
 
+// A face belongs to the agent that made it, so an agent only finds its own.
 static HashMap<u64, FontFaceState*>& font_faces_by_id()
 {
-    static NeverDestroyed<HashMap<u64, FontFaceState*>> font_faces;
-    return *font_faces;
+    using FontFaces = HashMap<u64, FontFaceState*>;
+    // NB: Free what this thread kept when it exits.
+#ifdef AK_COMPILER_CLANG
+    AK_IGNORE_DIAGNOSTIC("-Wexit-time-destructors", static thread_local FontFaces font_faces)
+#else
+    static thread_local FontFaces font_faces;
+#endif
+    return font_faces;
 }
 
-static u64 s_next_font_face_id { 1 };
+static Atomic<u64, AK::MemoryOrder::memory_order_relaxed> s_next_font_face_id { 1 };
 
 FontFaceState::FontFaceState(GC::Ref<HTML::EnvironmentSettingsObject> environment)
-    : m_id(s_next_font_face_id++)
+    : m_id(s_next_font_face_id.fetch_add(1))
     , m_environment(environment)
     , m_status(FontFaceLoadStatus::Unloaded)
 {
@@ -452,11 +466,22 @@ private:
 
 static WantedWebFaces& wanted_web_faces()
 {
+    // NB: A thread without a VM is a stage thread, which only ever works for the window agent. The faces of a worker are
+    //     noted and taken on its own thread.
+    if (JS::VM::exists_on_this_thread() && !HTML::surrounding_agent().is_similar_origin_window_agent()) {
+        // NB: Free what this thread kept when it exits.
+#ifdef AK_COMPILER_CLANG
+        AK_IGNORE_DIAGNOSTIC("-Wexit-time-destructors", static thread_local WantedWebFaces wanted_by_worker)
+#else
+        static thread_local WantedWebFaces wanted_by_worker;
+#endif
+        return wanted_by_worker;
+    }
     static NeverDestroyed<WantedWebFaces> wanted;
     return *wanted;
 }
 
-static u32 s_deferred_web_face_load_depth { 0 };
+static thread_local u32 s_deferred_web_face_load_depth { 0 };
 
 void note_wanted_web_face(u64 face_id)
 {
@@ -565,7 +590,7 @@ GC::RootVector<GC::Ref<FontFaceSet>> FontFaceState::containing_sets() const
     return sets;
 }
 
-Optional<ComputationContext> FontFaceState::computation_context() const
+ComputationContext FontFaceState::computation_context() const
 {
     if (m_css_font_face_rule_identity.has_value()) {
         if (auto document = m_source_style_sheet->owning_document())
@@ -573,7 +598,16 @@ Optional<ComputationContext> FontFaceState::computation_context() const
     }
     if (auto document = m_environment->responsible_document())
         return ComputationContext { .length_resolution_context = Length::ResolutionContext::for_document(*document) };
-    return {};
+    auto const& initial_font = FontComputer::initial_font();
+    auto const& pixel_metrics = initial_font.pixel_metrics();
+    Length::FontMetrics font_metrics { CSSPixels { initial_font.pixel_size() }, pixel_metrics, normal_line_height(pixel_metrics) };
+    return ComputationContext {
+        .length_resolution_context = {
+            .viewport_rect = {},
+            .font_metrics = font_metrics,
+            .root_font_metrics = font_metrics,
+        },
+    };
 }
 
 void FontFaceState::disconnect_from_css_rule()
@@ -740,7 +774,7 @@ void FontFaceState::update_font_display_period()
     if (!next_deadline.has_value() || m_font_display_time_for_testing.has_value())
         return;
     if (!m_font_download_timer) {
-        m_font_download_timer = Platform::Timer::create_single_shot(GC::Heap::the(), AK::Duration::from_milliseconds(0), GC::create_function(GC::Heap::the(), [font_root = keep_alive_during_load()] {
+        m_font_download_timer = Platform::Timer::create_single_shot(GC::Heap::the(), AK::Duration::from_milliseconds(0), GC::create_function(GC::Heap::the(), GC::captures(keep_alive_during_load()), [](auto& font_root) {
             font_root->elements().first()->update_font_display_period();
         }));
     }
@@ -815,7 +849,7 @@ WebIDL::ExceptionOr<void> FontFaceState::set_descriptor(DescriptorID descriptor,
     if (auto font_computer = registered_font_computer(); font_computer.has_value()) {
         if (changes_matching_key)
             font_computer->register_font_face(*this);
-        else if (descriptor == DescriptorID::UnicodeRange)
+        else if (first_is_one_of(descriptor, DescriptorID::UnicodeRange, DescriptorID::SizeAdjust))
             font_computer->did_load_font(m_family);
     }
     return {};
@@ -826,9 +860,7 @@ void FontFaceState::apply_descriptor(DescriptorID descriptor, StyleValue const& 
     auto& text = m_descriptor_texts[attribute_index(descriptor)];
     auto absolutized = [&] -> NonnullRefPtr<StyleValue const> {
         auto context = computation_context();
-        NonnullRefPtr<StyleValue const> absolutized_value = value;
-        if (context.has_value())
-            absolutized_value = value.absolutized(*context);
+        auto absolutized_value = value.absolutized(context);
         text = serialize_style_value_to_utf16(*absolutized_value);
         return absolutized_value;
     };
@@ -855,6 +887,13 @@ void FontFaceState::apply_descriptor(DescriptorID descriptor, StyleValue const& 
         m_unicode_ranges.ensure_capacity(ranges.size());
         for (auto const& range : ranges)
             m_unicode_ranges.unchecked_append(range->as_unicode_range().unicode_range());
+        break;
+    }
+    case DescriptorID::SizeAdjust: {
+        auto computed_value = absolutized();
+        m_size_adjust = computed_value->is_percentage()
+            ? computed_value->as_percentage().percentage().as_fraction()
+            : computed_value->as_calculated().resolve_percentage({}).value().as_fraction();
         break;
     }
     case DescriptorID::FontDisplay:
@@ -908,7 +947,7 @@ void FontFaceState::load_for_style()
     //     as if it was the value of a @font-face rule’s src descriptor.
 
     // 5. When the load operation completes, successfully or not, queue a task to run the following steps synchronously:
-    auto on_load = GC::create_function(GC::Heap::the(), [font_root = keep_alive_during_load()](RefPtr<Gfx::Typeface const> maybe_typeface) {
+    auto on_load = GC::create_function(GC::Heap::the(), GC::captures(keep_alive_during_load()), [](auto& font_root, RefPtr<Gfx::Typeface const> maybe_typeface) {
         auto& font = *font_root->elements().first();
         // NB: A resident typeface is available to synchronous layout immediately. Keep the
         //     observable load status, promise settlement, and FontFaceSet notifications in
@@ -924,7 +963,7 @@ void FontFaceState::load_for_style()
             if (auto font_computer = font.font_computer(); font_computer.has_value())
                 font_computer->did_load_font(font.matching_key());
         }
-        HTML::queue_global_task(HTML::Task::Source::FontLoading, font.task_global_object(), GC::create_function(GC::Heap::the(), [font_root, maybe_typeface] {
+        HTML::queue_global_task(HTML::Task::Source::FontLoading, font.task_global_object(), GC::create_function(GC::Heap::the(), GC::captures(font_root, maybe_typeface), [](auto& font_root, auto& maybe_typeface) {
             font_root->elements().first()->did_load(maybe_typeface);
         }));
     });

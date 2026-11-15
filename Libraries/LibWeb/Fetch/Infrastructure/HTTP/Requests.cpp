@@ -15,9 +15,15 @@
 #include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
 #include <LibWeb/HTML/PolicyContainers.h>
-#include <LibWeb/WebDriver/BiDi/Network.h>
 
 namespace Web::Fetch::Infrastructure {
+
+extern "C" {
+
+// Called by Bindings/Rust/src/fetch/infrastructure/http/requests.rs.
+bool web_fetch_request_done(Request*);
+void web_fetch_request_unref(Request*);
+}
 
 NonnullRefPtr<Request> Request::create()
 {
@@ -32,14 +38,11 @@ Request::Request(NonnullRefPtr<HTTP::HeaderList> header_list)
 
 Request::~Request() = default;
 
-RefPtr<WebDriver::BiDi::NetworkRequest> Request::webdriver_bidi_network_request() const
+NonnullRefPtr<NetworkObservation> Request::ensure_network_observation()
 {
-    return m_webdriver_bidi_network_request;
-}
-
-void Request::set_webdriver_bidi_network_request(RefPtr<WebDriver::BiDi::NetworkRequest> state)
-{
-    m_webdriver_bidi_network_request = move(state);
+    if (!m_network_observation)
+        m_network_observation = NetworkObservation::create();
+    return *m_network_observation;
 }
 
 // https://fetch.spec.whatwg.org/#concept-request-url
@@ -89,6 +92,44 @@ void Request::set_policy_container(PolicyContainerType policy_container)
 void Request::set_policy_container(NonnullRefPtr<HTML::PolicyContainer const> policy_container)
 {
     m_policy_container = move(policy_container);
+}
+
+// https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis-22#section-5.2
+HTTP::Cookie::SameSiteStatus Request::same_site_status() const
+{
+    using HTTP::Cookie::SameSiteStatus;
+
+    // 1. The request is not the result of a reload navigation triggered through a user interface element (as defined by
+    //    the user agent; e.g., a request triggered by the user clicking a refresh button on a toolbar).
+    if (m_reloaded_document_same_site_status.has_value()) {
+        // Requests which are the result of a reload navigation triggered through a user interface element are same-site
+        // if the reloaded document was originally navigated to via a same-site request. A request that is not "same-site"
+        // is instead "cross-site".
+        return *m_reloaded_document_same_site_status;
+    }
+
+    // 2. The request's current url's origin is same-site with the request's client's "site for cookies" (which is an
+    //    origin), or if the request has no client or the request's client is null.
+    if (!m_client_snapshot)
+        return SameSiteStatus::SameSite;
+
+    // AD-HOC: Check every URL of the redirect chain, not only the current one, as tested by cookies/samesite.
+    auto const& site_for_cookies = m_client_snapshot->site_for_cookies;
+    for (auto const& url : url_list()) {
+        if (!url.origin().is_same_site(site_for_cookies))
+            return SameSiteStatus::CrossSite;
+    }
+
+    return SameSiteStatus::SameSite;
+}
+
+HTTP::Cookie::SameSiteContext Request::same_site_context() const
+{
+    return {
+        .status = same_site_status(),
+        .is_top_level_navigation = m_mode == Mode::Navigate && m_destination == Destination::Document,
+        .is_safe_method = m_method.is_one_of("GET"sv, "HEAD"sv, "OPTIONS"sv, "TRACE"sv),
+    };
 }
 
 // https://fetch.spec.whatwg.org/#request-destination-script-like
@@ -218,6 +259,7 @@ NonnullRefPtr<Request> Request::clone() const
     new_request->set_client(m_client);
     new_request->set_client_snapshot(m_client_snapshot);
     new_request->set_remote_client_navigation(m_remote_client_navigation);
+    new_request->set_child_navigable_navigation(m_child_navigable_navigation);
     new_request->set_reserved_client_snapshot(m_reserved_client_snapshot);
     new_request->set_replaces_client_id(m_replaces_client_id);
     new_request->set_traversable_for_user_prompts(m_traversable_for_user_prompts);
@@ -241,6 +283,7 @@ NonnullRefPtr<Request> Request::clone() const
     new_request->set_cryptographic_nonce_metadata(m_cryptographic_nonce_metadata);
     new_request->set_parser_metadata(m_parser_metadata);
     new_request->set_reload_navigation(m_reload_navigation);
+    new_request->m_reloaded_document_same_site_status = m_reloaded_document_same_site_status;
     new_request->set_history_navigation(m_history_navigation);
     new_request->set_user_activation(m_user_activation);
     new_request->set_text_directive_user_activation(m_text_directive_user_activation);
@@ -603,6 +646,16 @@ Optional<Request::Priority> request_priority_from_string(Utf16View string)
 Optional<Request::Priority> request_priority_from_string(Utf16String const& string)
 {
     return request_priority_from_string(string.utf16_view());
+}
+
+bool web_fetch_request_done(Request* request)
+{
+    return request->done();
+}
+
+void web_fetch_request_unref(Request* request)
+{
+    request->unref();
 }
 
 }

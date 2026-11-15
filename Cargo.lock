@@ -86,6 +86,7 @@ name = "ak"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "libc",
 ]
 
 [[package]]
@@ -601,6 +602,19 @@ checksum = "4356eba6976435498d05a311ee9fc486da3bc81c200d3f0d7dd9703b41913f92"
 dependencies = [
  "bytes",
  "memchr",
+]
+
+[[package]]
+name = "compositor_core"
+version = "0.1.0"
+dependencies = [
+ "ak",
+ "cbindgen",
+ "ladybird_allocator",
+ "libcompositing_rust",
+ "libgfx_rust",
+ "libipc_rust",
+ "rustc-demangle",
 ]
 
 [[package]]
@@ -1748,6 +1762,7 @@ dependencies = [
  "foldhash 0.2.0",
  "ladybird_allocator",
  "libgfx_rust",
+ "libipc_rust",
  "rustc-demangle",
 ]
 
@@ -1760,6 +1775,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "libcrypto_rust"
+version = "0.1.0"
+dependencies = [
+ "ak",
+]
+
+[[package]]
 name = "libgfx_rust"
 version = "0.1.0"
 dependencies = [
@@ -1768,6 +1790,7 @@ dependencies = [
  "foldhash 0.2.0",
  "hashbrown 0.17.1",
  "ladybird_allocator",
+ "libipc_rust",
  "rustc-demangle",
  "yuv",
 ]
@@ -1794,6 +1817,7 @@ dependencies = [
 name = "libipc_rust"
 version = "0.1.0"
 dependencies = [
+ "ak",
  "libc",
 ]
 
@@ -1818,6 +1842,7 @@ dependencies = [
  "flapc",
  "iced-x86",
  "libc",
+ "libjs_runtime_macros",
 ]
 
 [[package]]
@@ -1844,6 +1869,7 @@ dependencies = [
  "indexmap",
  "ladybird_allocator",
  "libc",
+ "libcompress_rust",
  "libjs_abi",
  "libjs_jit",
  "libjs_runtime_macros",
@@ -1943,6 +1969,7 @@ dependencies = [
  "fARM64",
  "iced-x86",
  "libc",
+ "libjs_runtime_macros",
  "libwasm_engine",
  "libwasm_module",
  "serde_json",
@@ -1961,6 +1988,7 @@ dependencies = [
  "ladybird_allocator",
  "libcompositing_rust",
  "libcompress_rust",
+ "libcrypto_rust",
  "libgfx_rust",
  "libhttp_rust",
  "libipc_rust",
@@ -1973,6 +2001,7 @@ dependencies = [
  "libwebcommon_rust",
  "rustc-demangle",
  "serde_json",
+ "smallvec",
 ]
 
 [[package]]
@@ -2006,7 +2035,9 @@ dependencies = [
  "hashbrown 0.17.1",
  "ladybird_allocator",
  "libcompositing_rust",
+ "libcompress_rust",
  "libgfx_rust",
+ "libipc_rust",
  "liburl_rust",
  "libweb_html_tokenizer",
  "rayon",

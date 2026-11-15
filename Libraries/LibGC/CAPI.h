@@ -108,13 +108,15 @@ GC_API void gc_get_layout(GCLayout*);
 GC_API uintptr_t gc_heap_region_base(void);
 GC_API uintptr_t gc_primitive_storage_cage_base(void);
 
-GC_API GCHeap* gc_heap_create(GCGatherRootsCallback, void* context, bool become_process_default);
+GC_API GCHeap* gc_heap_create(GCGatherRootsCallback, void* context, bool become_thread_default);
 // Finalizes and destroys every remaining cell. Roots created with gc_root_create() must be destroyed first. The final
 // collection also runs every sweep callback and pending post-GC task, with gc_heap_is_collecting_everything() true,
 // so their contexts must stay valid until this returns; nothing they allocate then is destroyed.
 GC_API void gc_heap_destroy(GCHeap*);
 GC_API void gc_heap_collect_garbage(GCHeap*, int collection_type, bool print_report);
 GC_API bool gc_heap_is_collecting_everything(GCHeap const*);
+// Whether the heap gathers its roots and marks the live cells for a collection now, rather than for a graph dump.
+GC_API bool gc_heap_is_marking_for_collection(GCHeap const*);
 GC_API void gc_heap_defer_gc(GCHeap*);
 GC_API void gc_heap_undefer_gc(GCHeap*);
 GC_API void gc_heap_deferral_state(GCHeap*, size_t** deferrals, bool** collect_when_deferrals_end);
@@ -133,7 +135,10 @@ GC_API void gc_heap_did_allocate_external_memory(GCHeap*, size_t);
 GC_API void gc_heap_did_free_external_memory(GCHeap*, size_t);
 
 // The type info and the name must outlive the allocator, and the allocator must outlive every heap it allocated from.
-// The blocks of the allocator hold foreign_type, which LibGC never reads.
+// The blocks of the allocator hold foreign_type, which also names the type of the cells for the whole process:
+// allocators with the same foreign_type and cell size share a pool of blocks, across all heaps, and blocks never leave
+// their pool. Different types must have different ones. An allocator without one has a pool of its own, and must never
+// be destroyed.
 GC_API GCAllocator* gc_allocator_create(GCCellTypeInfo const*, char const* name, size_t name_length, void const* foreign_type);
 GC_API void gc_allocator_destroy(GCAllocator*);
 
@@ -141,9 +146,9 @@ GC_API void gc_allocator_destroy(GCAllocator*);
 // are allocated while an incremental sweep is in progress have to start out marked.
 GC_API GCCell* gc_heap_allocate_cell(GCHeap*, GCAllocator*, bool* must_mark);
 // Like gc_heap_allocate_cell(), for cells that other cells keep their storage in instead of malloc memory: it never
-// collects garbage and does not count towards the next collection, so storage can grow while its owner is between
-// states nothing may observe, and callers can hold on to anything across the growth. Live storage counts once a
-// collection finds it, through the live cell bytes that set the next threshold.
+// collects garbage, so storage can grow while its owner is between states nothing may observe, and callers can hold on
+// to anything across the growth. It still counts towards the next collection, which the next allocation that may
+// collect starts.
 GC_API GCCell* gc_heap_allocate_storage_cell(GCHeap*, GCAllocator*, bool* must_mark);
 // Each allocator takes the free cells of one block at a time into the heap, as a local free list of the cells that were
 // freed and a range of cells that were never allocated, so that allocating is usually popping that list or bumping
@@ -161,7 +166,7 @@ GC_API GCCell* gc_heap_allocate_storage_cell(GCHeap*, GCAllocator*, bool* must_m
 // - Before taking a cell of N bytes (the cell size of the allocator), such code checks that the heap's
 //   allocated_bytes_since_last_gc + N stays within its gc_bytes_threshold, and allocates through the heap otherwise
 //   (which may collect garbage). After taking it, it adds N to allocated_bytes_since_last_gc and total_allocated_bytes;
-//   storage cells (see gc_heap_allocate_storage_cell()) skip the check and add N to total_allocated_bytes only. These
+//   storage cells (see gc_heap_allocate_storage_cell()) skip the check but add N to both as well. These
 //   are size_t fields of the heap, at the offsets gc_get_layout() reports.
 // - It then writes every byte of the cell, as after gc_heap_allocate_cell(), with a clear mark.
 // Returns where the head of the allocator's list in the heap is, which stays valid as long as the heap. The list and
@@ -189,8 +194,6 @@ GC_API void gc_visitor_visit_cells(GCVisitor*, GCCell* const*, size_t count);
 GC_API void gc_visitor_visit_values(GCVisitor*, uint64_t const*, size_t count);
 // Visits a NaN-boxed value that is reachable only while key is, such as a WeakMap entry's.
 GC_API void gc_visitor_visit_ephemeron(GCVisitor*, GCCell* key, uint64_t const* value);
-// Treats every aligned word in the range as a possible pointer to a cell or NaN-boxed cell value.
-GC_API void gc_visitor_visit_possible_values(GCVisitor*, uint8_t const*, size_t size);
 
 // Primitive storage holds byte buffers inside the cage that starts at gc_primitive_storage_cage_base(), so that the
 // interpreter can reach any of their bytes as a cage offset masked with primitive_storage_cage_offset_mask. Like the
@@ -227,7 +230,6 @@ GC_API bool gc_primitive_storage_reserve(size_t size, size_t capacity, bool zero
 // Maps the first size bytes of the shared memory object behind fd into the cage. The mapping keeps the memory alive by
 // itself, so the caller keeps ownership of fd and may close it at any time. Fails if size is 0. Growing the storage
 // would replace the mapping with private memory, so shared storage keeps its size.
-GC_API bool gc_primitive_storage_adopt_shared_fd(int fd, size_t size, GCPrimitiveStorageHandle* out_handle, GCPrimitiveStorageLayout* out_layout);
 
 // The resizing functions return false and leave the storage as it was if the handle names no storage or memory runs
 // out. Within the capacity, the storage stays where it is; beyond it, the bytes move to new storage, which changes the
@@ -251,22 +253,6 @@ GC_API size_t gc_primitive_storage_capacity(GCPrimitiveStorageHandle);
 // The bytes from the offset on that are backed by memory.
 GC_API size_t gc_primitive_storage_committed_size(GCPrimitiveStorageHandle);
 GC_API uint8_t* gc_primitive_storage_data(GCPrimitiveStorageHandle);
-
-// Creates a zero-filled shared memory object of size bytes, made the way the C++ runtime makes the memory of a
-// fixed-length SharedArrayBuffer: sealed against resizing where the platform supports seals, so that another process
-// holding it cannot shrink it under this one. On success, *out_fd is a new close-on-exec descriptor that the caller owns and must
-// close, and that can be passed to other processes and to gc_primitive_storage_adopt_shared_fd(). On failure, *out_fd
-// is -1.
-GC_API bool gc_shared_memory_create(size_t size, int* out_fd);
-
-// Maps the first size bytes of the shared memory object behind fd outside the cage, for a platform where
-// gc_primitive_storage_adopt_shared_fd() cannot place the mapping inside it, as on Windows. The view keeps a duplicate
-// of fd, so the caller keeps ownership of fd. Returns null if size is 0, the object is smaller than size bytes, or
-// mapping fails.
-typedef struct GCSharedMemoryViewOutsideCage GCSharedMemoryViewOutsideCage;
-GC_API GCSharedMemoryViewOutsideCage* gc_shared_memory_view_outside_cage_create(int fd, size_t size);
-GC_API uint8_t* gc_shared_memory_view_outside_cage_data(GCSharedMemoryViewOutsideCage*);
-GC_API void gc_shared_memory_view_outside_cage_destroy(GCSharedMemoryViewOutsideCage*);
 
 #ifdef __cplusplus
 }

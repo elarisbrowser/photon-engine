@@ -222,6 +222,27 @@ Optional<StyleProperty const&> CSSStyleProperties::custom_property(Utf16FlyStrin
     return custom_properties().get(custom_property_name);
 }
 
+void CSSStyleProperties::set_computed_properties(OrderedHashMap<PropertyNameAndID, NonnullRefPtr<StyleValue const>> const& properties)
+{
+    prepare_to_update_style_attribute();
+    bool updated = false;
+    for (auto const& [property, value] : properties) {
+        if (property.is_custom_property()) {
+            auto existing = custom_property(property.name());
+            if (!existing.has_value() || existing->important != Important::No || *existing->value != *value) {
+                m_declarations.set_custom(property.name(), { .important = Important::No, .property_id = property.id(), .value = value });
+                updated = true;
+            }
+        } else {
+            updated |= m_declarations.set_expanding_shorthands(property.id(), *value, Important::No);
+        }
+    }
+    if (updated) {
+        update_style_attribute();
+        invalidate_owners();
+    }
+}
+
 // https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-setproperty
 WebIDL::ExceptionOr<void> CSSStyleProperties::set_property(Utf16FlyString const& property_name, Utf16View value, Utf16View priority)
 {
@@ -524,7 +545,7 @@ static void ensure_pseudo_element_style_for_cssom(Layout::BegunRead const& read,
     // A highlight pseudo-element inherits from its parent element's, which is only kept current near an active
     // highlight, so the chain is computed outermost first.
     if (is_highlight_pseudo_element(*pseudo_element)) {
-        GC::ConservativeVector<DOM::AbstractElement> ancestors;
+        GC::RootVector<DOM::AbstractElement> ancestors;
         for (auto ancestor = abstract_element.element().element_to_inherit_style_from({}); ancestor; ancestor = ancestor->element_to_inherit_style_from({}))
             ancestors.append({ *ancestor, pseudo_element });
         for (auto& ancestor : ancestors.in_reverse())

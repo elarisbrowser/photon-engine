@@ -21,7 +21,7 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering, fence};
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 #[derive(Clone)]
 pub(crate) struct DeclaredProperty {
@@ -525,7 +525,8 @@ impl Drop for SharedDeclarationBlock {
         if self.references.fetch_sub(1, Ordering::Release) != 1 {
             return;
         }
-        fence(Ordering::Acquire);
+        // NB: This load orders us after every earlier decrement, as a fence would. ThreadSanitizer does not model fences.
+        let _ = self.references.load(Ordering::Acquire);
         if let Some(cascade) = NonNull::new(self.cascade.load(Ordering::Acquire)) {
             // SAFETY: The block held the data, which it frees once.
             unsafe { BlockCascadeData::free(cascade) };
@@ -581,7 +582,12 @@ pub(crate) struct DeclarationBlockBuilder {
 }
 
 impl DeclarationBlockBuilder {
-    pub(crate) fn finish(self) -> SharedDeclarationBlock {
+    pub(crate) fn finish(mut self) -> SharedDeclarationBlock {
+        self.finish_and_reuse()
+    }
+
+    /// Freezes the declarations into a block, and keeps the memory of the builder for the next one.
+    pub(crate) fn finish_and_reuse(&mut self) -> SharedDeclarationBlock {
         let property_count = u32::try_from(self.properties.len()).expect("declaration block too large");
         let custom_property_count = u32::try_from(self.custom_properties.len()).expect("declaration block too large");
         let layout = block_layout(self.properties.len(), self.custom_properties.len());
@@ -619,11 +625,11 @@ impl DeclarationBlockBuilder {
             let entries = base.add(layout.entries).cast::<DeclarationEntry>();
             let custom_properties = self
                 .custom_properties
-                .into_iter()
+                .drain(..)
                 .map(|property| (Some(property.name), property.declaration));
             let declarations = self
                 .properties
-                .into_iter()
+                .drain(..)
                 .map(|property| (None, property))
                 .chain(custom_properties);
             for (index, (name, declaration)) in declarations.enumerate() {

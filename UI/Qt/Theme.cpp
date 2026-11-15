@@ -5,6 +5,8 @@
  */
 
 #include <AK/Array.h>
+#include <AK/Math.h>
+#include <LibWebView/Settings.h>
 #include <UI/Qt/Theme.h>
 
 #include <QAccessibilityHints>
@@ -15,8 +17,24 @@
 
 namespace Ladybird::Theme {
 
+static WebView::ThemePreference s_interface_theme { WebView::ThemePreference::System };
+
+void set_interface_theme(WebView::ThemePreference theme)
+{
+    s_interface_theme = theme;
+}
+
 bool is_dark()
 {
+    switch (s_interface_theme) {
+    case WebView::ThemePreference::Light:
+        return false;
+    case WebView::ThemePreference::Dark:
+        return true;
+    case WebView::ThemePreference::System:
+        break;
+    }
+
     auto color_scheme = QGuiApplication::styleHints()->colorScheme();
     if (color_scheme != Qt::ColorScheme::Unknown)
         return color_scheme == Qt::ColorScheme::Dark;
@@ -46,10 +64,11 @@ static ChromeColors const light_chrome {
     .field_focused = rgb(0xffffff),
     .text = rgb(0x1d1d1f),
     .muted = rgb(0x5d5d64),
-    .tab_title = rgb(0x3a3a40),
+    .tab_title = rgb(0x55555c),
     .icon = rgb(0x3a3a40),
     .disabled = rgb(0xb3b3b9),
     .hover = rgba(0, 0, 0, 0.06),
+    .strip_hover = rgba(0, 0, 0, 0.06),
     .row_title = rgb(0x3f3f45),
     .separator = rgb(0xbcbcc2),
     .divider = rgb(0xd2d2d6),
@@ -69,10 +88,11 @@ static ChromeColors const dark_chrome {
     .field_focused = rgb(0x3a3a3e),
     .text = rgb(0xf2f2f5),
     .muted = rgb(0xacacb4),
-    .tab_title = rgb(0xacacb4),
+    .tab_title = rgb(0x8f8f97),
     .icon = rgb(0xdcdce1),
     .disabled = rgb(0x5b5b61),
     .hover = rgba(255, 255, 255, 0.06),
+    .strip_hover = rgba(255, 255, 255, 0.06),
     .row_title = rgb(0xcfcfd6),
     .separator = rgb(0x3d3d42),
     .divider = rgb(0x0a0a0c),
@@ -85,17 +105,19 @@ static ChromeColors const dark_chrome {
 };
 
 static ChromeColors const private_chrome {
-    .strip = rgb(0x1d1430),
+    .strip = rgb(0x110a20),
     .toolbar = rgb(0x2f2347),
     .sidebar = rgb(0x2f2347),
     .field = rgba(255, 255, 255, 0.09),
     .field_focused = rgb(0x3b2e55),
     .text = rgb(0xf3f0fa),
     .muted = rgb(0xb3aac4),
-    .tab_title = rgb(0xb3aac4),
+    .tab_title = rgb(0x958ca8),
     .icon = rgb(0xe2dcef),
     .disabled = rgb(0x5e566e),
     .hover = rgba(255, 255, 255, 0.07),
+    // NB: The strip and the active tab are close in lightness here, so the normal hover would look like the active tab.
+    .strip_hover = rgba(255, 255, 255, 0.06),
     .row_title = rgb(0xd5cee2),
     .separator = rgb(0x4a3d63),
     .divider = rgb(0x0f0a19),
@@ -119,6 +141,7 @@ static ChromeColors const light_increased_contrast_chrome {
     .icon = rgb(0x1d1d1f),
     .disabled = rgb(0x8e8e93),
     .hover = rgba(0, 0, 0, 0.10),
+    .strip_hover = rgba(0, 0, 0, 0.10),
     .row_title = rgb(0x1d1d1f),
     .separator = rgb(0x8e8e93),
     .divider = rgb(0x6e6e73),
@@ -142,6 +165,7 @@ static ChromeColors const dark_increased_contrast_chrome {
     .icon = rgb(0xf2f2f5),
     .disabled = rgb(0x8a8a90),
     .hover = rgba(255, 255, 255, 0.14),
+    .strip_hover = rgba(255, 255, 255, 0.14),
     .row_title = rgb(0xf2f2f5),
     .separator = rgb(0x8a8a90),
     .divider = rgb(0x8a8a90),
@@ -191,11 +215,146 @@ static PanelColors const dark_panel {
     .information = rgba(10, 122, 255, 0.22),
 };
 
+// How saturated the surfaces are in the tint's hue, and the text and icons on them, which take on only a trace of it.
+static constexpr float SURFACE_TINT_SATURATION = 0.22f;
+static constexpr float INK_TINT_SATURATION = 0.12f;
+
+// A color theme is made from one or two base colors. Its chrome and panel colors are derived from those of the neutral
+// theme, by giving each surface the tint's hue while keeping its lightness, so contrast stays as it is.
+// NB: Dark violet surfaces mark private windows, so no theme should tint with a deep violet hue. Lavender is bluer and
+//     lighter than the private windows' violet, and its dark surfaces are less saturated to stay clear of them.
+struct ColorThemeDefinition {
+    // The hue the surfaces take on, or none to keep them neutral.
+    Optional<QColor> tint;
+    // The color of focus rings, selection and selected rows, or none to follow the system's accent color.
+    Optional<QColor> accent;
+    // How saturated the surfaces of the dark appearance are in the tint's hue.
+    float dark_surface_saturation { SURFACE_TINT_SATURATION };
+};
+
+// Each tinted theme is made from a single base color, which is both its tint and its accent.
+static ColorThemeDefinition color_theme_definition(WebView::ColorTheme theme)
+{
+    auto from_base_color = [](QRgb base_color) {
+        return ColorThemeDefinition { .tint = rgb(base_color), .accent = rgb(base_color) };
+    };
+
+    switch (theme) {
+    case WebView::ColorTheme::Neutral:
+        return {};
+    case WebView::ColorTheme::Harbor:
+        return from_base_color(0x2f6fd6);
+    case WebView::ColorTheme::Glacier:
+        return from_base_color(0x1798b8);
+    case WebView::ColorTheme::Lagoon:
+        return from_base_color(0x12957f);
+    case WebView::ColorTheme::Moss:
+        return from_base_color(0x3b8f3e);
+    case WebView::ColorTheme::Saffron:
+        return from_base_color(0xc99500);
+    case WebView::ColorTheme::Copper:
+        return from_base_color(0xd0631c);
+    case WebView::ColorTheme::Cherry:
+        return from_base_color(0xd1344b);
+    case WebView::ColorTheme::Blossom:
+        return from_base_color(0xd2459a);
+    case WebView::ColorTheme::Lavender: {
+        auto definition = from_base_color(0x7563d4);
+        definition.dark_surface_saturation = 0.14f;
+        return definition;
+    }
+    }
+    VERIFY_NOT_REACHED();
+}
+
+// NB: Translucent fills, such as hovers and the address field, stay neutral, and take on the tint of the surface below.
+static void tint(QColor& color, QColor const& tint, float saturation)
+{
+    if (color.alpha() != 255)
+        return;
+    color = QColor::fromHslF(tint.hslHueF(), saturation, color.lightnessF());
+}
+
+static ChromeColors derive_chrome(ChromeColors const& neutral, Optional<QColor> const& tint_color, float surface_saturation)
+{
+    auto colors = neutral;
+    if (!tint_color.has_value())
+        return colors;
+    for (auto* surface : { &colors.strip, &colors.toolbar, &colors.sidebar, &colors.field_focused, &colors.separator, &colors.divider })
+        tint(*surface, *tint_color, surface_saturation);
+    for (auto* ink : { &colors.text, &colors.muted, &colors.tab_title, &colors.icon, &colors.disabled, &colors.row_title })
+        tint(*ink, *tint_color, INK_TINT_SATURATION);
+    return colors;
+}
+
+// https://www.w3.org/TR/WCAG21/#dfn-relative-luminance
+static float relative_luminance(QColor const& color)
+{
+    auto linear = [](float channel) { return channel <= 0.04045f ? channel / 12.92f : AK::pow((channel + 0.055f) / 1.055f, 2.4f); };
+    return (0.2126f * linear(color.redF())) + (0.7152f * linear(color.greenF())) + (0.0722f * linear(color.blueF()));
+}
+
+// https://www.w3.org/TR/WCAG21/#dfn-contrast-ratio
+static float contrast_ratio(QColor const& a, QColor const& b)
+{
+    auto lighter = max(relative_luminance(a), relative_luminance(b));
+    auto darker = min(relative_luminance(a), relative_luminance(b));
+    return (lighter + 0.05f) / (darker + 0.05f);
+}
+
+enum class Adjustment {
+    Darken,
+    Lighten,
+};
+
+// Steps the color's lightness until it has at least the given contrast with the background.
+static QColor with_contrast(QColor color, QColor const& background, float minimum_ratio, Adjustment adjustment)
+{
+    auto step = adjustment == Adjustment::Darken ? -0.02f : 0.02f;
+    while (contrast_ratio(color, background) < minimum_ratio) {
+        auto lightness = color.lightnessF() + step;
+        if (lightness <= 0 || lightness >= 1)
+            break;
+        color = QColor::fromHslF(color.hslHueF(), color.hslSaturationF(), lightness);
+    }
+    return color;
+}
+
+static PanelColors derive_panel(PanelColors const& neutral, Optional<QColor> const& tint_color, float surface_saturation)
+{
+    auto colors = neutral;
+    if (!tint_color.has_value())
+        return colors;
+    for (auto* surface : { &colors.surface, &colors.separator, &colors.separator_soft, &colors.page })
+        tint(*surface, *tint_color, surface_saturation);
+    for (auto* ink : { &colors.text, &colors.body, &colors.muted, &colors.shortcut })
+        tint(*ink, *tint_color, INK_TINT_SATURATION);
+    // NB: The tint can take the shortcuts, which are as small as other text, below what text needs on the panel.
+    colors.shortcut = with_contrast(colors.shortcut, colors.surface, 4.5f, colors.surface.lightnessF() < 0.5f ? Adjustment::Lighten : Adjustment::Darken);
+    return colors;
+}
+
+static ColorThemeDefinition s_color_theme;
+static ChromeColors s_light_chrome = light_chrome;
+static ChromeColors s_dark_chrome = dark_chrome;
+static PanelColors s_light_panel = light_panel;
+static PanelColors s_dark_panel = dark_panel;
+
+void set_color_theme(WebView::ColorTheme theme)
+{
+    s_color_theme = color_theme_definition(theme);
+    s_light_chrome = derive_chrome(light_chrome, s_color_theme.tint, SURFACE_TINT_SATURATION);
+    s_dark_chrome = derive_chrome(dark_chrome, s_color_theme.tint, s_color_theme.dark_surface_saturation);
+    s_light_panel = derive_panel(light_panel, s_color_theme.tint, SURFACE_TINT_SATURATION);
+    s_dark_panel = derive_panel(dark_panel, s_color_theme.tint, s_color_theme.dark_surface_saturation);
+}
+
+// NB: With increased contrast, the chrome stays neutral whatever the color theme.
 ChromeColors const& chrome()
 {
     if (has_increased_contrast())
         return is_dark() ? dark_increased_contrast_chrome : light_increased_contrast_chrome;
-    return is_dark() ? dark_chrome : light_chrome;
+    return is_dark() ? s_dark_chrome : s_light_chrome;
 }
 
 static constexpr auto PRIVATE_WINDOW_PROPERTY = "ladybirdPrivateWindow";
@@ -243,7 +402,7 @@ bool is_dark(QWidget const& widget)
 
 PanelColors const& panel()
 {
-    return is_dark() ? dark_panel : light_panel;
+    return is_dark() ? s_dark_panel : s_light_panel;
 }
 
 struct AccentColor {
@@ -284,10 +443,30 @@ static AccentColor const& system_accent_color()
     return *closest;
 }
 
+static Optional<QColor> s_desktop_accent;
+
+void set_desktop_accent(Optional<QColor> color)
+{
+    s_desktop_accent = move(color);
+}
+
+Optional<QColor> const& desktop_accent()
+{
+    return s_desktop_accent;
+}
+
+// The theme's accent clears 3:1 on the toolbar, darker on the light appearance and lighter on the dark one.
+static QColor accent(bool dark, QColor const& toolbar)
+{
+    if (auto const& base_color = s_color_theme.accent.has_value() ? s_color_theme.accent : s_desktop_accent; base_color.has_value())
+        return with_contrast(*base_color, toolbar, 3, dark ? Adjustment::Lighten : Adjustment::Darken);
+    auto const& accent = system_accent_color();
+    return dark ? accent.dark : accent.light;
+}
+
 QColor accent()
 {
-    auto const& accent = system_accent_color();
-    return is_dark() ? accent.dark : accent.light;
+    return accent(is_dark(), chrome().toolbar);
 }
 
 // On the dark appearance, the focus ring is a lighter tint of the accent, as the accent itself is too deep there.
@@ -315,27 +494,69 @@ QColor focus_ring()
     return color;
 }
 
-QColor selection()
+static TextSelectionColors text_selection(QPalette::ColorGroup group, bool dark, QColor const& toolbar, QColor const& text)
 {
-    auto color = accent();
-    color.setAlphaF(is_dark() ? 0.40f : 0.22f);
-    return color;
+    // NB: The system's colors suit only chrome of the system's own appearance, which a private window may not have. A
+    //     desktop accent is tinted like a theme's, as the desktop's own text fields show it.
+    if (!s_color_theme.accent.has_value() && !s_desktop_accent.has_value()) {
+        auto system_palette = QGuiApplication::palette();
+        auto system_is_dark = system_palette.color(QPalette::Window).lightness() < 128;
+        if (system_is_dark == dark)
+            return { system_palette.color(group, QPalette::Highlight), system_palette.color(group, QPalette::HighlightedText) };
+    }
+
+    if (group != QPalette::Active)
+        return { dark ? rgba(255, 255, 255, 0.14) : rgba(0, 0, 0, 0.10), text };
+
+    auto background = accent(dark, toolbar);
+    background.setAlphaF(dark ? 0.40f : 0.28f);
+    return { background, text };
+}
+
+TextSelectionColors address_field_text_selection(QPalette const& palette, QPalette::ColorGroup group)
+{
+    auto const& colors = chrome(palette);
+    return text_selection(group, is_dark(palette), colors.toolbar, colors.text);
+}
+
+TextSelectionColors panel_text_selection(QPalette::ColorGroup group, QColor const& text)
+{
+    return text_selection(group, is_dark(), chrome().toolbar, text);
+}
+
+// The accent fills primary buttons, selected rows and checked buttons deep enough that white text on them clears 4.5:1.
+QColor accent_fill()
+{
+    if (auto const& base_color = s_color_theme.accent.has_value() ? s_color_theme.accent : s_desktop_accent; base_color.has_value())
+        return with_contrast(*base_color, Qt::white, 4.5f, Adjustment::Darken);
+    auto const& accent = system_accent_color();
+    return with_contrast(is_dark() ? accent.dark : accent.light, Qt::white, 4.5f, Adjustment::Darken);
 }
 
 QColor primary()
 {
+    if (s_color_theme.accent.has_value())
+        return accent_fill();
     return rgb(0x0a66d0);
 }
 
 // A selected row is filled with the primary blue, a little softer on the dark appearance.
 QColor selected_row()
 {
+    if (s_color_theme.accent.has_value())
+        return accent_fill();
     return is_dark() ? rgb(0x2463b8) : primary();
 }
 
-QColor brand()
+// A tinted theme's logomark clears 4.5:1 on both the strip and the toolbar, as the Ladybird button sits on either,
+// depending on where the tabs are.
+QColor logomark()
 {
-    return is_dark() ? rgb(0x7a4ce6) : rgb(0x6a39db);
+    if (!s_color_theme.accent.has_value())
+        return is_dark() ? rgb(0xa684ff) : rgb(0x4b22ad);
+    auto adjustment = is_dark() ? Adjustment::Lighten : Adjustment::Darken;
+    auto color = with_contrast(*s_color_theme.accent, chrome().strip, 4.5f, adjustment);
+    return with_contrast(color, chrome().toolbar, 4.5f, adjustment);
 }
 
 }

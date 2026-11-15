@@ -113,6 +113,7 @@ StringView Node::class_name() const
         LAYOUT_NODE_KIND_NAME_CASE(CanvasBox)
         LAYOUT_NODE_KIND_NAME_CASE(CheckBox)
         LAYOUT_NODE_KIND_NAME_CASE(FieldSetBox)
+        LAYOUT_NODE_KIND_NAME_CASE(FrameSetBox)
         LAYOUT_NODE_KIND_NAME_CASE(GeneratedTextNode)
         LAYOUT_NODE_KIND_NAME_CASE(ImageBox)
         LAYOUT_NODE_KIND_NAME_CASE(InlineNode)
@@ -170,16 +171,6 @@ void Node::pin_style_record_for_detachment()
 void Node::prepare_subtree_for_detach_from_layout_tree()
 {
     RustFFI::render_state_prepare_subtree_for_detach(document_host(), slot_id(this));
-}
-
-Node* Node::topmost_layout_node_of_top_layer_placement()
-{
-    auto* direct_viewport_child_candidate = this;
-    while (direct_viewport_child_candidate->parent() && direct_viewport_child_candidate->parent()->is_anonymous())
-        direct_viewport_child_candidate = direct_viewport_child_candidate->parent();
-    if (!direct_viewport_child_candidate->parent() || !direct_viewport_child_candidate->parent()->is_viewport())
-        return nullptr;
-    return direct_viewport_child_candidate;
 }
 
 bool NodeWithStyle::establishes_an_absolute_positioning_containing_block() const
@@ -651,7 +642,6 @@ void NodeWithStyle::publish_style_record_to_node_data()
         auto const installed = RustFFI::render_state_installed_style_record(document_host(), slot_id(this));
         VERIFY(installed == 0 || installed == m_style_record_identity.value());
     }
-    ++document().style_invalidation_counters().layout_style_record_publications;
     auto const style = document().style_computer().install_style(held_read(), m_style_record_identity);
     VERIFY(style);
     m_style_record = style.groups();
@@ -847,7 +837,7 @@ CSS::UserSelect Node::user_select_used_value() const
     return CSS::UserSelect::Text;
 }
 
-void Node::set_needs_layout_update(DOM::SetNeedsLayoutReason reason, LayoutUpdatePropagation propagation)
+void Node::set_needs_layout_update(DOM::SetNeedsLayoutReason reason)
 {
     if constexpr (UPDATE_LAYOUT_DEBUG) {
         // NOTE: We check some conditions here to avoid debug spam in documents that don't do layout.
@@ -857,8 +847,7 @@ void Node::set_needs_layout_update(DOM::SetNeedsLayoutReason reason, LayoutUpdat
                 dbgln_if(UPDATE_LAYOUT_DEBUG, "NEED LAYOUT {}", DOM::to_string(reason));
         }
     }
-    RustFFI::render_state_set_needs_layout_update(document_host(), slot_id(this),
-        propagation == LayoutUpdatePropagation::ThroughAncestors);
+    RustFFI::render_state_set_needs_layout_update(document_host(), slot_id(this));
 }
 
 }

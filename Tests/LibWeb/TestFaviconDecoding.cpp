@@ -10,9 +10,11 @@
 #include <LibWeb/Bindings/MainThreadVM.h>
 #include <LibWeb/Bindings/PrincipalHostDefined.h>
 #include <LibWeb/DOM/Document.h>
+#include <LibWeb/Fetch/Fetching/FetchEngine.h>
 #include <LibWeb/HTML/HTMLHeadElement.h>
 #include <LibWeb/HTML/HTMLLinkElement.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
+#include <LibWeb/HTML/Scripting/Agent.h>
 #include <LibWeb/Platform/FontPlugin.h>
 #include <LibWeb/Platform/ImageCodecPlugin.h>
 
@@ -52,6 +54,8 @@ TEST_CASE(each_favicon_is_decoded_once)
     Web::Platform::ImageCodecPlugin::install(image_codec);
 
     auto realm = Web::Bindings::create_a_principal_javascript_realm();
+    auto& agent = Web::HTML::surrounding_agent();
+    agent.fetch_executor = Web::Fetch::Fetching::create_inline_fetch_executor(agent.network_activity_observers);
     auto& page = Web::Bindings::principal_host_defined_page(*realm);
     auto traversable = Web::HTML::LocalTraversableNavigable::create_a_new_top_level_traversable(page, nullptr, {});
     page.set_top_level_traversable(traversable);
@@ -65,7 +69,7 @@ TEST_CASE(each_favicon_is_decoded_once)
         link.set_rel("icon"_utf16);
         link.set_href(source);
         MUST(document->head()->append_child(element));
-        Web::HTML::main_thread_event_loop().spin_until(GC::create_function(document->heap(), [link = GC::Ref { link }] {
+        Web::HTML::main_thread_event_loop().spin_until(GC::create_function(document->heap(), GC::captures(GC::Ref { link }), [](auto& link) {
             return link->has_loaded_icon();
         }));
         ++expected_decode_count;

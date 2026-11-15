@@ -10,7 +10,7 @@
 #include <AK/Optional.h>
 #include <AK/Utf16String.h>
 #include <AK/Variant.h>
-#include <LibGC/ConservativeHashMap.h>
+#include <LibGC/RootHashMap.h>
 #include <LibGC/RootVector.h>
 #include <LibWeb/Animations/TimeValue.h>
 #include <LibWeb/Bindings/AnimationEffect.h>
@@ -63,7 +63,7 @@ struct AnimationUpdateContext {
     void publish();
 
     // NOTE: This is lazily populated by KeyframeEffects as their respective animations are applied to an element.
-    GC::ConservativeHashMap<DOM::AbstractElement, ElementData> elements;
+    GC::RootHashMap<DOM::AbstractElement, ElementData> elements;
 };
 
 // https://www.w3.org/TR/web-animations-1/#the-animationeffect-interface
@@ -136,7 +136,11 @@ public:
         Optional<TimeValue> active_time;
         Optional<double> overall_progress;
     };
-    ResolvedTiming resolve_timing() const;
+    enum class EndpointInclusiveActiveInterval {
+        No,
+        Yes,
+    };
+    ResolvedTiming resolve_timing(EndpointInclusiveActiveInterval = EndpointInclusiveActiveInterval::No) const;
 
     Phase previous_phase() const { return m_previous_phase; }
     void set_previous_phase(Phase value) { m_previous_phase = value; }
@@ -145,7 +149,7 @@ public:
 
     Optional<double> current_iteration() const;
     Optional<double> current_iteration(ResolvedTiming const&) const;
-    Optional<double> transformed_progress() const;
+    Optional<double> transformed_progress(EndpointInclusiveActiveInterval = EndpointInclusiveActiveInterval::No) const;
 
     void normalize_specified_timing();
 
@@ -173,7 +177,7 @@ protected:
     GC::Ptr<AnimationTimeline> associated_timeline() const;
     Optional<TimeValue> timeline_duration() const;
 
-    Phase phase(Optional<TimeValue> const& local_time) const;
+    Phase phase(Optional<TimeValue> const& local_time, EndpointInclusiveActiveInterval = EndpointInclusiveActiveInterval::No) const;
     bool is_at_timeline_boundary() const;
     Optional<TimeValue> active_time_for_phase(Phase, Optional<TimeValue> const& local_time, Bindings::FillMode) const;
     Optional<double> overall_progress_for_phase(Phase, Optional<TimeValue> const& active_time) const;

@@ -88,7 +88,6 @@ pub struct GcInterface {
     pub gc_root_create: unsafe extern "C" fn(cell: *mut c_void) -> *mut c_void,
     pub gc_root_destroy: unsafe extern "C" fn(root: *mut c_void),
     pub gc_visitor_visit_cell: unsafe extern "C" fn(visitor: *mut c_void, cell: *mut c_void),
-    pub gc_visitor_visit_possible_values: unsafe extern "C" fn(visitor: *mut c_void, data: *const u8, size: usize),
     pub gc_primitive_storage_reserve: unsafe extern "C" fn(
         size: usize,
         capacity: usize,
@@ -186,11 +185,14 @@ pub enum CellType {
     Entity(usize),
 }
 
-pub use crate::abi::OBJECT_DATA_SIZE_CLASSES;
+pub use crate::abi::OBJECT_CELL_SIZE_CLASSES;
 
-/// The size class of objects with `size` bytes of data, or None if the data does not fit inline.
-pub fn object_size_class(size: usize) -> Option<usize> {
-    OBJECT_DATA_SIZE_CLASSES.iter().position(|&class| class >= size)
+/// The size class of object cells of at least `size` bytes, which is at most the largest class.
+pub fn object_size_class(size: usize) -> usize {
+    OBJECT_CELL_SIZE_CLASSES
+        .iter()
+        .position(|&class| class >= size)
+        .expect("object cells are at most the largest class")
 }
 
 /// The allocators of the runtime's cell types, which LibGC requires to outlive every heap, so there is one set of
@@ -203,7 +205,7 @@ struct Allocators {
     entities: Vec<*mut c_void>,
 }
 
-// The allocators are only handles, which LibGC only uses from the thread of the heap it allocates from.
+// The allocators are only handles: LibGC never changes them, and keeps what it allocates with in each heap.
 unsafe impl Send for Allocators {}
 unsafe impl Sync for Allocators {}
 
@@ -261,7 +263,12 @@ fn type_info(cell_type: CellType) -> (&'static CellTypeInfo, &'static str) {
         };
     let info = Box::leak(Box::new(CellTypeInfo {
         cell_size: cell_size(cell_type) as u32,
-        alignment: 16,
+        // NB: Objects come in sizes 8 bytes apart, and their fields are aligned to at most 8 bytes.
+        alignment: if matches!(cell_type, CellType::Object(_)) {
+            8
+        } else {
+            16
+        },
         kind: CELL_KIND_OTHER,
         visit_edges,
         finalize: None,
@@ -279,7 +286,7 @@ impl Allocators {
             unsafe { (interface.gc_allocator_create)(info, name.as_ptr().cast(), name.len(), core::ptr::null()) }
         };
         Self {
-            objects: (0..OBJECT_DATA_SIZE_CLASSES.len())
+            objects: (0..OBJECT_CELL_SIZE_CLASSES.len())
                 .map(|class| create(CellType::Object(class)))
                 .collect(),
             rtt: create(CellType::Rtt),
@@ -305,7 +312,7 @@ impl Allocators {
 /// The size of a cell of a type.
 pub fn cell_size(cell_type: CellType) -> usize {
     match cell_type {
-        CellType::Object(class) => crate::abi::OBJECT_INLINE_DATA_OFFSET + OBJECT_DATA_SIZE_CLASSES[class],
+        CellType::Object(class) => OBJECT_CELL_SIZE_CLASSES[class],
         CellType::Rtt => CELL_HEADER_SIZE + size_of::<crate::abi::Rtt>().next_multiple_of(16),
         CellType::Exception => super::gc::EXCEPTION_CELL_SIZE,
         CellType::StoreRoot => 32,
@@ -318,6 +325,8 @@ pub struct GcHeap {
     pub interface: GcInterface,
     layout: GcLayout,
     allocators: &'static Allocators,
+    /// How many defer_gc() calls have no matching undefer_gc() yet.
+    deferrals: core::cell::Cell<u32>,
 }
 
 pub enum Heap {
@@ -353,6 +362,7 @@ impl Heap {
             interface,
             layout,
             allocators,
+            deferrals: core::cell::Cell::new(0),
         }))
     }
 
@@ -415,14 +425,21 @@ impl Heap {
     /// does not look.
     pub fn defer_gc(&self) {
         if let Self::Gc(heap) = self {
+            heap.deferrals.set(heap.deferrals.get() + 1);
             unsafe { (heap.interface.gc_heap_defer_gc)(heap.interface.heap) };
         }
     }
 
     pub fn undefer_gc(&self) {
         if let Self::Gc(heap) = self {
+            heap.deferrals.set(heap.deferrals.get() - 1);
             unsafe { (heap.interface.gc_heap_undefer_gc)(heap.interface.heap) };
         }
+    }
+
+    /// Whether this runtime deferred garbage collection, with defer_gc().
+    pub fn is_gc_deferred(&self) -> bool {
+        matches!(self, Self::Gc(heap) if heap.deferrals.get() != 0)
     }
 }
 
@@ -483,17 +500,7 @@ impl Visitor {
         if reference == 0 || reference & 1 != 0 {
             return;
         }
-        if reference & 3 == 2 {
-            // An embedder's host value, which LibGC only follows if it points into a cell.
-            unsafe {
-                ((*self.interface).gc_visitor_visit_possible_values)(
-                    self.raw,
-                    (&raw const reference).cast(),
-                    size_of::<u64>(),
-                );
-            }
-            return;
-        }
-        self.visit_cell(reference as *mut u8);
+        // NB: An embedder's host value is the address of one of its cells, with bit 1 set.
+        self.visit_cell((reference & !3) as *mut u8);
     }
 }

@@ -5,20 +5,35 @@
  */
 
 #include <LibGC/Heap.h>
+#include <LibJS/HostClassBuilder.h>
 #include <LibJS/Runtime/VM.h>
-#include <LibWeb/Fetch/Engine/NetworkTransportHandle.h>
+#include <LibWeb/Fetch/Engine/EngineCommand.h>
+#include <LibWeb/Fetch/Engine/FetchExecutor.h>
 #include <LibWeb/Fetch/Fetching/PendingResponse.h>
 #include <LibWeb/Fetch/Infrastructure/FetchAlgorithms.h>
 #include <LibWeb/Fetch/Infrastructure/FetchController.h>
 #include <LibWeb/Fetch/Infrastructure/FetchParams.h>
 #include <LibWeb/HTML/EventLoop/EventLoop.h>
+#include <LibWeb/HTML/Scripting/Agent.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/StructuredSerialize.h>
+#include <LibWeb/Page/Page.h>
 #include <LibWeb/Page/RenderingStats.h>
 #include <LibWeb/WebDriver/BiDi/BiDi.h>
 #include <LibWeb/WebDriver/BiDi/Network.h>
 #include <LibWeb/WebIDL/DOMException.h>
 
 namespace Web::Fetch::Infrastructure {
+
+extern "C" {
+
+// Called by Bindings/Rust/src/fetch/infrastructure/fetch_controller.rs.
+FetchController* web_fetch_controller_create(JSObject* global_object);
+void web_fetch_controller_terminate(FetchController*);
+void web_fetch_controller_abort(FetchController*, void* realm);
+bool web_fetch_controller_has_report_timing_steps(FetchController*);
+void web_fetch_controller_report_timing(FetchController*, JSObject* global_object);
+}
 
 GC_DEFINE_ALLOCATOR(FetchController);
 
@@ -43,6 +58,8 @@ void FetchController::visit_edges(JS::Cell::Visitor& visitor)
     visitor.visit(m_next_manual_redirect_steps);
     visitor.visit(m_algorithms);
     visitor.visit(m_task_destination);
+    visitor.visit(m_page);
+    visitor.visit(m_preflighted_fetch_controller);
     visitor.visit(m_pending_preloaded_response);
     visitor.visit(m_stop_steps);
     visitor.visit(m_pending_responses);
@@ -75,9 +92,15 @@ void FetchController::set_original_fetch_params(Badge<FetchParams>, FetchParams 
     m_original_fetch_params = fetch_params;
 }
 
+void FetchController::set_network_observation(Badge<FetchParams>, NonnullRefPtr<NetworkObservation> network_observation)
+{
+    VERIFY(!m_network_observation);
+    m_network_observation = move(network_observation);
+}
+
 void FetchController::report_webdriver_bidi_fetch_error(StringView error_text) const
 {
-    if (!WebDriver::BiDi::g_network_events_enabled)
+    if (!WebDriver::BiDi::network_events_enabled())
         return;
     if (auto fetch_params = m_original_fetch_params.strong_ref())
         WebDriver::BiDi::network_fetch_error(*fetch_params, error_text);
@@ -102,25 +125,20 @@ GC::Ref<FetchAlgorithms const> FetchController::algorithms() const
     return *m_algorithms;
 }
 
-void FetchController::set_network_transport(Engine::NetworkTransportHandle& network_transport)
+GC::Ref<Page> FetchController::page() const
 {
-    set_body_transport(network_transport);
-    m_control_block->set_has_started_request({});
+    VERIFY(m_page);
+    return *m_page;
 }
 
-void FetchController::set_body_transport(Engine::FetchBodyDeliveryGate::Transport& body_transport)
+void FetchController::set_report_timing_steps(GC::Ref<GC::Function<void(JS::Object&)>> report_timing_steps)
 {
-    m_body_transport = body_transport;
+    m_report_timing_steps = report_timing_steps;
 }
 
-void FetchController::set_report_timing_steps(Function<void(JS::Object&)> report_timing_steps)
+void FetchController::set_next_manual_redirect_steps(GC::Ref<GC::Function<void()>> next_manual_redirect_steps)
 {
-    m_report_timing_steps = GC::create_function(GC::Heap::the(), move(report_timing_steps));
-}
-
-void FetchController::set_next_manual_redirect_steps(Function<void()> next_manual_redirect_steps)
-{
-    m_next_manual_redirect_steps = GC::create_function(GC::Heap::the(), move(next_manual_redirect_steps));
+    m_next_manual_redirect_steps = next_manual_redirect_steps;
 }
 
 // https://fetch.spec.whatwg.org/#finalize-and-report-timing
@@ -207,9 +225,14 @@ void FetchController::terminate()
     stop_request();
 }
 
+void FetchController::set_started_fetch(Engine::FetchId fetch_id, Engine::FetchExecutor& fetch_executor)
+{
+    m_started_fetch = StartedFetch { fetch_id, fetch_executor };
+}
+
 void FetchController::stop_fetch()
 {
-    if (state() == State::Aborted || state() == State::Terminated)
+    if (m_control_block->is_canceled())
         return;
 
     m_control_block->set_state({}, State::Stopped);
@@ -222,7 +245,7 @@ void FetchController::stop_fetch()
     //         cancelling any queued fetch tasks and then ignoring any callbacks.
     auto ongoing_fetch_tasks = move(m_ongoing_fetch_tasks);
 
-    HTML::main_thread_event_loop().task_queue().remove_tasks_matching([&](auto const& task) {
+    HTML::current_event_loop().task_queue().remove_tasks_matching([&](auto const& task) {
         return ongoing_fetch_tasks.remove_all_matching([&](u64, HTML::TaskID task_id) {
             return task.id() == task_id;
         });
@@ -239,26 +262,32 @@ void FetchController::stop_fetch()
     }
 }
 
-// Stops the network request of a fetch that is no longer ongoing. HTTP-network fetch reads a response's body in steps
-// that "abort when fetchParams is canceled" (step 18.1) — and once aborted, "the user agent should close connection
-// unless it would be bad for performance to do so" (step 18.2.4). So a canceled fetch's request has to stop as well as
-// a stopped one's: otherwise it streams on until the server ends the response, and its callbacks root the fetch's realm
-// for all that time.
-// https://fetch.spec.whatwg.org/#concept-http-network-fetch
+static Engine::EngineCommand stop_command(FetchControlBlock::State state, Engine::FetchId fetch_id)
+{
+    switch (state) {
+    case FetchControlBlock::State::Aborted:
+        return Engine::Command::Abort { fetch_id };
+    case FetchControlBlock::State::Terminated:
+        return Engine::Command::Terminate { fetch_id };
+    case FetchControlBlock::State::Stopped:
+        return Engine::Command::Stop { fetch_id };
+    case FetchControlBlock::State::Ongoing:
+        break;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+// Posts the command that stops the network request of a fetch that is no longer ongoing, to the executor the fetch was
+// started on.
 void FetchController::stop_request()
 {
     end_rendering_pending_operation(this);
-    VERIFY(state() != State::Ongoing);
+    VERIFY(!m_control_block->is_ongoing());
     m_awaited_network_completion.clear();
-    stop_body_transport();
-}
 
-void FetchController::stop_body_transport()
-{
-    if (auto body_transport = m_body_transport.strong_ref()) {
-        m_body_transport = nullptr;
-        body_transport->stop();
-    }
+    if (!m_started_fetch.has_value())
+        return;
+    m_started_fetch->fetch_executor->post(stop_command(state(), m_started_fetch->fetch_id));
 }
 
 void FetchController::fetch_task_queued(u64 fetch_task_id, HTML::TaskID event_id)
@@ -295,6 +324,32 @@ void FetchControllerHolder::visit_edges(JS::Cell::Visitor& visitor)
 {
     Base::visit_edges(visitor);
     visitor.visit(m_controller);
+}
+
+FetchController* web_fetch_controller_create(JSObject* global_object)
+{
+    auto& relevant_agent = HTML::relevant_agent(*JS::HostABI::object_from_abi(global_object));
+    return FetchController::create(relevant_agent.fetch_controller_registry).ptr();
+}
+
+void web_fetch_controller_terminate(FetchController* controller)
+{
+    controller->terminate();
+}
+
+void web_fetch_controller_abort(FetchController* controller, void* realm)
+{
+    controller->abort(*static_cast<JS::Realm*>(realm), {});
+}
+
+bool web_fetch_controller_has_report_timing_steps(FetchController* controller)
+{
+    return controller->has_report_timing_steps();
+}
+
+void web_fetch_controller_report_timing(FetchController* controller, JSObject* global_object)
+{
+    controller->report_timing(*JS::HostABI::object_from_abi(global_object));
 }
 
 }

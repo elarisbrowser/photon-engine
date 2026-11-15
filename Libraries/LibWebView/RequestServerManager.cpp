@@ -21,7 +21,7 @@
 #include <LibWebView/RequestServerManager.h>
 #include <LibWebView/RequestServerSiteBindings.h>
 #include <LibWebView/WebContentClient.h>
-#include <LibWebView/WorkerProcessManager.h>
+#include <LibWebView/WorkerAgentManager.h>
 
 namespace WebView {
 
@@ -245,9 +245,7 @@ void RequestServerManager::did_lose_process(RequestServerInstance& instance)
         return IterationDecision::Continue;
     };
     WebContentClient::for_each_client([&](WebContentClient& client) { return reconnect(client.request_server_site_bindings()); });
-    WorkerProcessManager::the().for_each_request_server_site_bindings([&](RequestServerSiteBindings& bindings) { return reconnect(bindings); });
-    if (Application::the().on_request_server_restarted)
-        Application::the().on_request_server_restarted();
+    WorkerAgentManager::the().for_each_request_server_site_bindings([&](RequestServerSiteBindings& bindings) { return reconnect(bindings); });
 }
 
 void RequestServerManager::retire(RequestServerInstance& instance)
@@ -270,7 +268,7 @@ void RequestServerManager::retire_idle_instances()
 
 void RequestServerManager::disk_cache_settings_changed()
 {
-    auto const& settings = Application::settings().browsing_data_settings().disk_cache_settings;
+    auto settings = Application::settings().disk_cache_settings();
     for (auto& instance : m_instances)
         instance->control_client().async_set_disk_cache_settings(settings);
 
@@ -543,7 +541,7 @@ HashMap<ByteString, RequestServerManager::DormantSiteCache>& RequestServerManage
 u64 RequestServerManager::maximum_disk_cache_size() const
 {
     // Apply the per-server free-space limit to the combined caches too.
-    auto maximum_size = Application::settings().browsing_data_settings().disk_cache_settings.maximum_size;
+    auto maximum_size = Application::settings().disk_cache_settings().maximum_size;
     auto disk_space = FileSystem::compute_disk_space(LexicalPath { Application::request_server_options().cache_path });
     if (disk_space.is_error())
         return maximum_size;

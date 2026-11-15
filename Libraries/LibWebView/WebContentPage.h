@@ -20,7 +20,6 @@
 #include <LibGfx/Rect.h>
 #include <LibGfx/SharedImage.h>
 #include <LibWebCommon/HTML/CrossProcessId.h>
-#include <LibWebCommon/HTML/Scripting/EnvironmentId.h>
 #include <LibWebCommon/Page/InputEvent.h>
 #include <LibWebCommon/Page/PageId.h>
 #include <LibWebCommon/PermissionsPolicy/PermissionsPolicy.h>
@@ -95,6 +94,7 @@ public:
     // Whether the document of an environment the page hosts has a cross-site ancestor, or nothing if the page hosts no
     // such environment.
     Optional<bool> hosted_environment_has_cross_site_ancestor(Web::HTML::EnvironmentId const& environment_id) const;
+    Optional<bool> hosted_environment_is_cross_origin_isolated(Web::HTML::EnvironmentId const& environment_id) const;
     bool hosts_an_environment_with_storage_key(Web::StorageAPI::StorageKey const&) const;
     void spoof_document_origin_for_testing(Web::HTML::EnvironmentId const& environment_id, URL::Origin);
     // Clears the bottle an environment of this page names, the way the browser's own clearing does: through the jar.
@@ -111,6 +111,9 @@ public:
     // Whether the AudioServer has recently heard the page, muted or not.
     Audio::Audibility audibility() const { return m_audibility; }
     void set_audibility(Audio::Audibility);
+    // Whether the AudioServer holds a capture stream for the page.
+    bool is_capturing_audio() const { return m_capturing_audio; }
+    void set_capturing_audio(bool);
 
     // The channel to the WebUI this page shows, if it shows one. Each page has its own, so two WebUI pages in one
     // process each keep theirs.
@@ -164,9 +167,9 @@ public:
     bool handle_and_dispatch_mouse_event_in_compositor(Web::MouseEvent const&);
     void did_consume_input_event_in_compositor(u64 event_id);
     void did_not_dispatch_input_event_through_compositor(u64 event_id);
-    void did_detect_history_swipe_candidate(u64 gesture_id, bool back, float unconsumed_delta);
-    void did_present_bitmap(Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id, double device_pixel_ratio, u64 presentation_signal_value = 0);
     void did_dispatch_input_event_through_compositor(u64 event_id, bool performed_default_action);
+    void did_present_bitmap(Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id, double device_pixel_ratio);
+    void did_present_frame_in_remote_layer(Gfx::IntRect content_rect, Gfx::IntRect damage_rect, double device_pixel_ratio);
     void did_present_backing_stores(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores);
     void did_add_backing_stores(Vector<i32> bitmap_ids, Vector<Gfx::SharedImage> backing_stores);
     void did_retire_backing_stores(ReadonlySpan<i32> bitmap_ids);
@@ -177,7 +180,7 @@ public:
         Vector<Gfx::SharedImage> backing_stores;
     };
     Optional<PresentedBackingStores> take_presented_backing_stores();
-    void release_presented_bitmap(i32 bitmap_id, bool consumer_gpu_work_complete = false);
+    void release_presented_bitmap(i32 bitmap_id);
     void fail_renderer_owned_downloads();
     void reset_state_for_testing();
 
@@ -202,6 +205,7 @@ private:
     virtual void did_request_navigation_of_navigable(Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId source_navigable_id, Web::HTML::CrossProcessId source_document_id, Web::HTML::PreparedNavigationDescriptor navigation) override;
     virtual void did_post_message_to_navigable(Web::HTML::CrossProcessId navigable_id, Web::HTML::PostedMessageDescriptor posted_message) override;
     virtual void did_report_navigation_violation(Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id, u64 policy_index, Web::ContentSecurityPolicy::RemoteViolationDirective, bool url_is_https) override;
+    virtual void did_report_container_document_navigation_violation(Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id, u64 policy_index, Web::ContentSecurityPolicy::RemoteViolationDirective, bool url_is_https) override;
     virtual void did_request_focusing_steps_for_navigable(Web::HTML::CrossProcessId navigable_id, Web::HTML::FocusTrigger focus_trigger) override;
     virtual void did_request_window_focus_of_navigable(Web::HTML::CrossProcessId navigable_id) override;
     virtual void did_request_set_opener_of_navigable(Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId opener_navigable_id) override;
@@ -211,12 +215,9 @@ private:
     virtual void did_set_browser_zoom(double factor) override;
     virtual void did_set_device_pixel_ratio_for_testing(double device_pixel_ratio) override;
     virtual void did_find_in_page(size_t current_match_index, Optional<size_t> total_match_count) override;
-    virtual void did_request_refresh() override;
     virtual void did_request_cursor_change(Gfx::Cursor cursor) override;
     virtual void did_update_editing_history_state(bool can_undo, bool can_redo) override;
     virtual void did_set_text_fragment_indication_visibility(bool visible) override;
-    virtual void did_request_tooltip_override(Gfx::IntPoint position, ByteString title) override;
-    virtual void did_stop_tooltip_override() override;
     virtual void did_enter_tooltip_area(ByteString title) override;
     virtual void did_leave_tooltip_area() override;
     virtual void did_hover_link(URL::URL url) override;
@@ -260,10 +261,11 @@ private:
     virtual void did_request_dismiss_dialog() override;
     virtual void did_request_document_cookie_version_index(Web::HTML::EnvironmentId environment_id, i64 document_id, String domain) override;
     virtual void did_set_cookie(Optional<Web::HTML::EnvironmentId>, URL::URL, HTTP::Cookie::ParsedCookie, HTTP::Cookie::Source) override;
-    virtual void did_remove_blob_url_entries(Web::HTML::EnvironmentId environment_id, Vector<Utf16String> urls) override;
+    void did_remove_blob_url_entries(Web::HTML::EnvironmentId environment_id, Vector<Utf16String> urls);
     Messages::WebContentClient::ConnectToStorageAreaResponse connect_to_storage_area(Web::StorageAPI::StorageEndpointType storage_endpoint, Web::HTML::EnvironmentId environment_id);
     virtual void did_change_needs_beforeunload_check(bool needs_beforeunload_check) override;
     virtual void did_consume_user_activation(Web::HTML::UserActivationConsumption consumption) override;
+    virtual void did_notify_about_user_activation(Web::HTML::CrossProcessId document_id) override;
     virtual void webdriver_user_prompt_handling_complete(u64 request_id, Web::WebDriver::Response response) override;
     virtual void webdriver_did_set_current_browsing_context(u64 command_id, Web::HTML::CrossProcessId navigable_id) override;
     virtual void webdriver_command_complete(u64 command_id, Web::WebDriver::Response response) override;
@@ -288,8 +290,6 @@ private:
     virtual void did_start_geolocation_position_watch(u64 request_id, Web::HTML::CrossProcessId document_id) override;
     virtual void did_stop_geolocation_position_watch(u64 request_id) override;
     virtual void did_request_permission(u64 request_id, Web::HTML::CrossProcessId document_id, Utf16String name) override;
-    virtual void did_request_http_credentials(u64 request_id, URL::URL url, String realm) override;
-    virtual void did_fail_certificate_verification(URL::URL url) override;
     virtual void did_request_show_notification(u64 notification_id, Web::HTML::CrossProcessId document_id, Web::NotificationsAPI::NotificationData data, Optional<Gfx::ShareableBitmap> icon) override;
     virtual void did_request_close_notification(u64 notification_id) override;
     virtual void did_abandon_notification(u64 notification_id) override;
@@ -302,7 +302,7 @@ private:
     virtual void did_update_input_method_state(Optional<Web::DevicePixelRect> caret_rect, bool is_enabled, i32 cursor_position, i32 anchor_position, Utf16String text_before_cursor, Utf16String text_after_cursor) override;
     virtual void did_change_theme_color(Gfx::Color color) override;
     virtual void did_change_background_color(Gfx::Color color) override;
-    virtual void did_insert_clipboard_item(Web::Clipboard::SystemClipboardItem item, String) override;
+    virtual void did_insert_clipboard_item(Web::Clipboard::SystemClipboardItem item, String, Optional<Web::HTML::CrossProcessId> writing_document_id) override;
     virtual void did_change_screen_wake_lock_state(Web::ScreenWakeLockState wake_lock_state) override;
     virtual void did_start_using_gamepads() override;
     virtual void did_update_session_history_entry_navigation_api_state(Web::HTML::CrossProcessId navigable_id, Web::HTML::SessionHistoryEntryIdentity entry_identity, Web::HTML::StorageSerializationRecord navigation_api_state) override;
@@ -338,14 +338,15 @@ private:
     virtual void did_complete_js_console_input(u64 request_id, Optional<Vector<String>> matches, String match_prop) override;
     virtual void did_receive_network_response_headers(u64 request_id, u32 status_code, Optional<String> reason_phrase, Vector<HTTP::Header> response_headers, Requests::CacheState cache_state) override;
     virtual void did_update_indexed_database(String update) override;
-    virtual void did_request_clipboard_entries(u64 request_id) override;
+    virtual void did_request_clipboard_entries_for_paste(u64 request_id) override;
+    virtual void did_request_clipboard_entries(u64 request_id, Web::HTML::CrossProcessId reading_document_id) override;
+    virtual void did_request_paste_from_clipboard_for_testing() override;
     virtual void did_request_spell_check(u64 request_id, Utf16String text) override;
     virtual void did_request_writing_suggestion(u64 request_id, Utf16String text, u32 caret_offset) override;
     virtual void did_get_translation_language_sample(u64 request_id, Web::TranslationLanguageSample sample) override;
     virtual void did_request_translation(Web::TranslationUnit unit) override;
     virtual void did_request_set_system_focus(bool has_system_focus) override;
     virtual void did_request_set_system_visibility_state(Web::HTML::VisibilityState visibility_state) override;
-    virtual void did_respond_to_page_responsiveness_check(u64 request_id) override;
     virtual void did_request_navigation_start(Web::HTML::CrossProcessId navigable_id, Web::NavigationTarget target, URL::URL url, Utf16String navigation_id, Optional<Web::HTML::NavigationStartRequest> start_request) override;
     virtual void did_complete_navigation_unload_check(Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id) override;
     virtual void did_finish_navigation_params_creation(Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id, Optional<Web::HTML::NavigationPopulationResult> result) override;
@@ -360,7 +361,7 @@ private:
     virtual void did_forward_pinch_event_to_child_frame(Web::HTML::CrossProcessId frame_id, Web::PinchEvent) override;
     virtual void did_destroy_child_frame(Web::HTML::CrossProcessId frame_id) override;
     Messages::WebContentClient::DidStartDownloadWithoutRequestResponse did_start_download_without_request(URL::URL url, ByteString suggested_filename, Optional<u64> total_size);
-    Messages::WebContentClient::DidStartDownloadResponse did_start_download(Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> navigation_id, URL::URL url, ByteString suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data,
+    Messages::WebContentClient::DidStartDownloadResponse did_start_download(Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> navigation_id, URL::URL url, ByteString suggested_filename, Optional<u64> total_size, HTTP::Cookie::SameSiteContext same_site_context, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data,
         JsonValue network_response);
     virtual void did_receive_download_data(u64 download_id, ByteBuffer data) override;
     virtual void did_finish_download(u64 download_id) override;
@@ -394,12 +395,9 @@ private:
     virtual void did_request_pinch_event_for_testing(Web::HTML::CrossProcessId local_root_id, Web::PinchEvent event) override;
     virtual void request_unload_check(Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId check_id) override;
     Messages::WebContentClient::StartWorkerAgentResponse start_worker_agent(Web::HTML::WorkerAgentStartRequest request);
+    void register_dedicated_worker(Web::HTML::WorkerAgentStartRequest request, IPC::TransportHandle worker_transport);
     Messages::WebContentClient::DidRequestStorageUsageResponse did_request_storage_usage(Web::HTML::EnvironmentId environment_id);
     virtual void did_post_broadcast_channel_message(Web::HTML::PostedBroadcastChannelMessage message) override;
-    virtual void close_worker_agent(Web::HTML::WorkerAgentId agent_id, Web::HTML::WorkerAgentOwnerToken owner_token) override;
-    virtual void rtc_transform_init(Web::HTML::WorkerAgentId agent_id, u64 transform_id, Web::HTML::SerializedTransferRecord options_record) override;
-    virtual void rtc_transform_teardown(Web::HTML::WorkerAgentId agent_id, u64 transform_id) override;
-    virtual void rtc_transform_encoded_audio_frame(Web::HTML::WorkerAgentId agent_id, u64 transform_id, ByteBuffer payload, u32 ssrc, u8 payload_type, u32 rtp_timestamp, u16 sequence_number) override;
     Messages::WebContentClient::DidRequestCookieResponse did_request_cookie(Optional<Web::HTML::EnvironmentId> const&, URL::URL, HTTP::Cookie::Source);
     Messages::WebContentClient::DidRequestAllCookiesCookiestoreResponse did_request_all_cookies_cookiestore(Web::HTML::EnvironmentId const&, URL::URL);
     Messages::WebContentClient::DidAddBlobUrlEntryResponse did_add_blob_url_entry(Web::HTML::EnvironmentId environment_id, Utf16String url, Web::FileAPI::SerializedBlobURLEntry);
@@ -413,8 +411,13 @@ private:
     Messages::WebContentTestClient::DidRequestSiteIsolationProcessTreeForTestingResponse did_request_site_isolation_process_tree_for_testing();
     Messages::WebContentTestClient::DidRequestTabIsPlayingAudioForTestingResponse did_request_tab_is_playing_audio_for_testing();
     Messages::WebContentTestClient::DidRequestTabIsHeardPlayingAudioForTestingResponse did_request_tab_is_heard_playing_audio_for_testing();
-    Messages::WebContentTestClient::DidRequestTabAudibilityChangeCountForTestingResponse did_request_tab_audibility_change_count_for_testing();
+    Messages::WebContentTestClient::DidRequestTabIsUsingMicrophoneForTestingResponse did_request_tab_is_using_microphone_for_testing();
+    Messages::WebContentTestClient::DidRequestTabIsCapturingAudioForTestingResponse did_request_tab_is_capturing_audio_for_testing();
+    void report_audio_capture_for_testing(Web::PageId labelled_page_id, bool capturing);
+    void retire_picture_in_picture_window_for_testing();
+    Messages::WebContentTestClient::DidRequestTabAudibilityTransitionsForTestingResponse did_request_tab_audibility_transitions_for_testing();
     virtual void did_request_crash_of_remote_frame_processes_for_testing() override;
+    virtual void did_request_close_tab_for_testing() override;
     virtual void did_request_stop_loading_for_testing() override;
     virtual void did_request_reload_for_testing(bool bypass_cache) override;
     virtual void did_request_traverse_history_by_delta_for_testing(i32 delta) override;
@@ -423,8 +426,8 @@ private:
     Messages::WebContentTestClient::DidRequestHasPopulatedDocumentForTestingResponse did_request_has_populated_document_for_testing(Web::HTML::CrossProcessId navigable_id) const;
     Messages::WebContentTestClient::DidRequestCaptureSessionHistorySnapshotForTestingResponse did_request_capture_session_history_snapshot_for_testing();
     Messages::WebContentTestClient::DidRequestRestoreSessionHistorySnapshotForTestingResponse did_request_restore_session_history_snapshot_for_testing();
-    Messages::WebContentTestClient::DidRequestRegisterSessionStoreTabForTestingResponse did_request_register_session_store_tab_for_testing();
-    Messages::WebContentTestClient::DidRequestSessionStoreTabStateForTestingResponse did_request_session_store_tab_state_for_testing();
+    Messages::WebContentTestClient::DidRequestRecordReportedSessionHistoryForTestingResponse did_request_record_reported_session_history_for_testing();
+    Messages::WebContentTestClient::DidRequestReportedSessionHistoryForTestingResponse did_request_reported_session_history_for_testing();
 
     WeakPtr<WebContentClient> m_client;
     Web::PageId m_id;
@@ -432,6 +435,7 @@ private:
     bool m_is_open { true };
     RefPtr<WebUI> m_web_ui;
     Audio::Audibility m_audibility { Audio::Audibility::Inaudible };
+    bool m_capturing_audio { false };
     Optional<PresentedBackingStores> m_presented_backing_stores;
     bool m_needs_beforeunload_check { true };
     bool m_detached_close_pending { false };

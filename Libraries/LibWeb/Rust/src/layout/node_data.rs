@@ -167,6 +167,7 @@ pub enum NodeKind {
     TextNode = 35,
     VideoBox = 37,
     Viewport = 38,
+    FrameSetBox = 39,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -183,6 +184,8 @@ pub enum NodeFlag {
     HasScrollOffset = 1 << 5,
     IsBody = 1 << 6,
     NeedsLayoutUpdate = 1 << 7,
+    /// A style change altered geometry-determining properties of this node itself, so a partial relayout must re-resolve
+    /// its own size and position instead of reusing them.
     NeedsOwnGeometryUpdate = 1 << 8,
     AbsposDescendantEscapes = 1 << 9,
     CompensatesForHorizontalScroll = 1 << 10,
@@ -212,6 +215,19 @@ pub enum NodeFlag {
 impl NodeFlag {
     /// The flags that say what node a row stands for. A row is built with them, and installing a style changes none.
     pub(crate) const IDENTITY: u32 = Self::Anonymous as u32 | Self::IsBody as u32 | Self::IsDocumentElement as u32;
+    /// The flags a box is built with from what its element is, which no style change changes: see
+    /// `node_facts::construction_flags`.
+    pub(crate) const CONSTRUCTION: u32 = Self::Anonymous as u32
+        | Self::HasStyle as u32
+        | Self::IsReplacedElement as u32
+        | Self::IsHtmlInputElement as u32
+        | Self::IsHtmlHtmlElement as u32
+        | Self::IsDocumentElement as u32
+        | Self::IsInUserAgentShadowTree as u32
+        | Self::UsesButtonLayout as u32
+        | Self::IsEditingHost as u32
+        | Self::IsBody as u32
+        | Self::ReplacedBoxCanHaveChildren as u32;
 }
 
 /// Facts a node takes from its ancestors. They are derived when the node is attached or its

@@ -113,10 +113,6 @@ static_assert(sizeof(ComputedValues::MiscInteractionValues) == sizeof(ComputedVa
 static_assert(alignof(ComputedValues::MiscInteractionValues) == alignof(ComputedValuesFFI::MiscInteractionValues));
 static_assert(to_underlying(ListStylePosition::Outside) == 1);
 
-static_assert(sizeof(TextIndentData) == sizeof(ComputedValuesFFI::ComputedTextIndent));
-static_assert(offsetof(TextIndentData, length_percentage) == offsetof(ComputedValuesFFI::ComputedTextIndent, length_percentage));
-static_assert(offsetof(TextIndentData, each_line) == offsetof(ComputedValuesFFI::ComputedTextIndent, each_line));
-static_assert(offsetof(TextIndentData, hanging) == offsetof(ComputedValuesFFI::ComputedTextIndent, hanging));
 static_assert(sizeof(ComputedValues::InheritedTextValues) == sizeof(ComputedValuesFFI::InheritedTextValues));
 static_assert(alignof(ComputedValues::InheritedTextValues) == alignof(ComputedValuesFFI::InheritedTextValues));
 static_assert(sizeof(ComputedValues::AnimationValues) == sizeof(ComputedValuesFFI::AnimationValues));
@@ -377,13 +373,7 @@ Vector<RefPtr<AbstractImageStyleValue const>> ComputedValues::MaskValues::mask_i
     return abstract_image_items(mask_image);
 }
 
-ComputedValues::Statistics ComputedValues::s_statistics;
-
-ComputedValues::ComputedValues()
-{
-    ++s_statistics.live_instance_count;
-    ++s_statistics.total_instances_created;
-}
+ComputedValues::ComputedValues() = default;
 
 StyleRecordRef::StyleRecordRef(void const* record)
     : m_record(record)
@@ -399,16 +389,11 @@ StyleRecordRef::~StyleRecordRef()
 }
 
 ComputedValues::ComputedValues(BorrowedStyleRecord)
-    : m_is_style_record_view(true)
 {
     m_ref_count = 0;
 }
 
-ComputedValues::~ComputedValues()
-{
-    if (!m_is_style_record_view)
-        --s_statistics.live_instance_count;
-}
+ComputedValues::~ComputedValues() = default;
 
 bool ComputedValues::is_property_important(PropertyID property_id) const
 {
@@ -418,9 +403,21 @@ bool ComputedValues::is_property_important(PropertyID property_id) const
     return ComputedValuesFFI::rust_style_record_importance_bits(m_record.get())[index / 8] & (1 << (index % 8));
 }
 
-void ComputedValues::Mutator::set_animated_properties(AnimatedProperties const* value)
+NonnullRefPtr<ComputedValues const> ComputedValues::clone() const
 {
-    m_values.m_animated_properties = value;
+    auto copy = adopt_ref(*new ComputedValues);
+    copy->m_inherited = m_inherited;
+    copy->m_noninherited = m_noninherited;
+    copy->m_record = m_record;
+    if (m_borrowed_base_values)
+        copy->m_base_values = m_borrowed_base_values->clone();
+    else
+        copy->m_base_values = m_base_values;
+    copy->m_animated_properties = m_animated_properties;
+    copy->m_depends_on_viewport_metrics = m_depends_on_viewport_metrics;
+    copy->m_font_metrics_depend_on_viewport_metrics = m_font_metrics_depend_on_viewport_metrics;
+    copy->m_in_display_none_subtree = m_in_display_none_subtree;
+    return copy;
 }
 
 RefPtr<StyleValue const> ComputedValues::style_value_from_handle(PropertyID property_id, RustStyleValueHandle const& handle) const
@@ -435,7 +432,6 @@ RefPtr<StyleValue const> ComputedValues::style_value_from_handle(PropertyID prop
             return it->value;
     }
     auto value = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(handle.data()));
-    count_longhand_wrapper_mint();
     if (!m_style_value_cache)
         m_style_value_cache = make<HashMap<PropertyID, NonnullRefPtr<StyleValue const>>>();
     m_style_value_cache->set(property_id, value);
@@ -536,7 +532,6 @@ RefPtr<StyleValue const> ComputedValues::computed_style_value(PropertyID propert
             return it->value;
     }
     auto value = StyleValue::adopt_rust_style_value_data(StyleValueFFI::rust_style_value_retain(static_cast<StyleValueFFI::StyleValueData const*>(stored)));
-    count_longhand_wrapper_mint();
     if (!m_style_value_cache)
         m_style_value_cache = make<HashMap<PropertyID, NonnullRefPtr<StyleValue const>>>();
     m_style_value_cache->set(property_id, value);

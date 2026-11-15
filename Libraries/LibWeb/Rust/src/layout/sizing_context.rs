@@ -572,15 +572,38 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         // If it has a preferred aspect ratio:
         if facts.has_preferred_aspect_ratio() {
             if let Some(size) = constraints.definite_size_in_ratio_determining_axis {
-                // If the available space is definite in the inline axis, use the stretch fit into that size for the inline size
-                // and calculate the block size using the aspect ratio.
-                //
-                // NB: This helper is only for the max-content size, which has no definite available inline size. Callers may
-                //     still know a definite used size in the opposite axis when the box lacks a natural size in that axis.
                 return Some(if is_inline_axis {
                     self.content_inline_size_from_aspect_ratio(sized, size)
                 } else {
                     self.content_block_size_from_aspect_ratio(sized, size)
+                });
+            }
+
+            if is_inline_axis && let Some(height) = natural_size.height {
+                let height = constraints
+                    .minimum_block_size
+                    .map_or(height, |minimum| height.max(minimum));
+                let width = self.content_inline_size_from_aspect_ratio(sized, height);
+                return Some(
+                    constraints
+                        .minimum_inline_size
+                        .map_or(width, |minimum| width.max(minimum)),
+                );
+            }
+
+            // If the available space is definite in the inline axis, use the stretch fit into that size for the inline
+            // size and calculate the block size using the aspect ratio.
+            if let Some(inline_size) = constraints.stretch_fit_inline_size {
+                let inline_size = constraints
+                    .minimum_inline_size
+                    .map_or(inline_size, |minimum| inline_size.max(minimum));
+                let inline_size = constraints.minimum_block_size.map_or(inline_size, |minimum| {
+                    inline_size.max(self.content_inline_size_from_aspect_ratio(sized, minimum))
+                });
+                return Some(if is_inline_axis {
+                    inline_size
+                } else {
+                    self.content_block_size_from_aspect_ratio(sized, inline_size)
                 });
             }
 
@@ -629,17 +652,23 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
                 (Some(inline), Some(block)) => Some(inline.max(block)),
                 (Some(inline), None) => Some(inline),
                 (None, Some(block)) => Some(block),
-                (None, None) => Some(if is_inline_axis {
-                    // Otherwise use an inline size matching the corresponding dimension of the initial containing block and calculate
-                    // the other dimension using the aspect ratio.
+                (None, None) => {
+                    // Otherwise use an inline size matching the corresponding dimension of the initial containing block
+                    // and calculate the other dimension using the aspect ratio.
                     //
-                    // NOTE: This author-controllable behavior is made possible by the new auto value for the min size properties.
-                    //       This is believed to be a better behavior, but it is not yet clear if it is Web-compatible, so please
-                    //       send feedback to the CSSWG if there are any problems.
-                    facts.initial_containing_block_inline_size()
-                } else {
-                    self.content_block_size_from_aspect_ratio(sized, facts.initial_containing_block_inline_size())
-                }),
+                    // AD-HOC: Use zero for intrinsic contributions, so ratio-only images don't expand shrink-to-fit
+                    // containers to the viewport. Percentage inline sizes use the default size for compatibility.
+                    let inline_size = if style.width().contains_percentage() {
+                        self.default_replaced_size(SizingAxis::Inline)
+                    } else {
+                        CssPixels::default()
+                    };
+                    Some(if is_inline_axis {
+                        inline_size
+                    } else {
+                        self.content_block_size_from_aspect_ratio(sized, inline_size)
+                    })
+                }
             };
         }
 
@@ -1234,6 +1263,12 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         facts.is_anonymous_button_content_wrapper() || facts.is_anonymous_button_content_box()
     }
 
+    // Whether node is a button whose content sits in the anonymous wrapper that lays it out.
+    fn hosts_anonymous_button_content(&self, node: Node) -> bool {
+        let wrapper = self.first_child(node);
+        !wrapper.is_invalid() && self.facts(wrapper).is_anonymous_button_content_wrapper()
+    }
+
     fn anonymous_button_content_box(&self, button: Node) -> Option<Node> {
         let wrapper = self.first_child(button);
         if wrapper.is_invalid() {
@@ -1370,6 +1405,10 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
             || facts.is_table_wrapper()
         {
             Some(metrics.content_block_size())
+        } else if self.hosts_anonymous_button_content(containing_block) {
+            // NB: A button lays out its content as a flex container rather than as a block container, so step 4 ends
+            //     the search at it, where an auto block size leaves its content no basis.
+            None
         } else if facts.lays_out_in_columns() {
             None
         } else if facts.parent_is_flex_or_grid_container() && metrics.has_definite_block_size() {
@@ -1547,7 +1586,7 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         // https://drafts.csswg.org/css-sizing-3/#cyclic-percentage-contribution
         if size.contains_percentage() {
             match formatting_context::cyclic_percentage_intrinsic_contribution(
-                self.facts(node).is_replaced_box(),
+                self.facts(node).resolves_cyclic_percentages_like_replaced_box(),
                 true,
                 available_space.inline_size,
                 formatting_context::CyclicPercentageSizeProperty::PreferredOrMaxSize,
@@ -1690,10 +1729,23 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         available_space: AvailableSpace,
         constraints: ContainingBlockConstraints,
     ) -> Option<TransferredInlineSizeLimits> {
+        // NB: Replaced boxes transfer their limits as part of replaced element sizing.
+        if self.facts(sized.node).is_replaced_box() {
+            return None;
+        }
+        self.transferred_inline_size_limits_of_any_box(sized, available_space, constraints)
+    }
+
+    /// The limits that [`Self::transferred_inline_size_limits`] gives, for a replaced box too.
+    fn transferred_inline_size_limits_of_any_box(
+        &self,
+        sized: SizedBox<'_>,
+        available_space: AvailableSpace,
+        constraints: ContainingBlockConstraints,
+    ) -> Option<TransferredInlineSizeLimits> {
         let node = sized.node;
         let facts = self.facts(node);
-        // NB: Replaced boxes transfer their limits as part of replaced element sizing.
-        if facts.is_replaced_box() || !self.should_treat_inline_size_as_auto(sized, available_space) {
+        if !self.should_treat_inline_size_as_auto(sized, available_space) {
             return None;
         }
         let ratio = facts.preferred_aspect_ratio()?;
@@ -1733,7 +1785,13 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         // First, any definite minimum size is converted and transferred from the origin to destination axis. This
         // transferred minimum is capped by any definite preferred or maximum size in the destination axis.
         let mut minimum = to_inline_size(definite_block_size(style.min_height()).unwrap_or_default());
-        if !self.should_treat_max_inline_size_as_none(node, available_space.inline_size, constraints) {
+        // NB: Under an intrinsic sizing constraint, an intrinsic maximum resolves through the very measurement these limits
+        //     apply to. The measurement's caller applies that maximum after them.
+        let maximum_resolves_through_this_measurement = style.max_width().is_intrinsic_sizing_constraint()
+            && available_space.inline_size.is_intrinsic_sizing_constraint();
+        if !maximum_resolves_through_this_measurement
+            && !self.should_treat_max_inline_size_as_none(node, available_space.inline_size, constraints)
+        {
             minimum = minimum.min(self.calculate_inner_inline_size(
                 sized,
                 available_space.inline_size,
@@ -1960,7 +2018,14 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
             SizingAxis::Block => {
                 (!self.should_treat_max_block_size_as_none(node, available_space.block_size, constraints)
                     && !style.max_height().is_auto())
-                .then(|| self.calculate_inner_block_size(sized, available_space, style.max_height(), constraints))
+                .then(|| {
+                    // NB: In the ratio-dependent axis, every intrinsic size of the box is its transferred size. Measuring
+                    //     it instead would ask for the box's intrinsic block size — which uses this minimum.
+                    if style.max_height().is_intrinsic_sizing_constraint() {
+                        return transferred_size;
+                    }
+                    self.calculate_inner_block_size(sized, available_space, style.max_height(), constraints)
+                })
             }
         };
         Some(maximum.map_or(minimum, |maximum| minimum.min(maximum)))
@@ -2271,7 +2336,7 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         self.pass
             .arena()
             .with_current_committed_fragment_link(node, |link| {
-                used.update_cells(|cells| cells.take_box_metrics_of_committed_link(link));
+                used.update_cells(|cells| cells.take_box_metrics_of_committed_link(link, sized_cells.frame));
             })
             .is_some()
     }
@@ -2749,23 +2814,15 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         sized: SizedBox<'_>,
         constraints: ContainingBlockConstraints,
     ) -> Option<CssPixels> {
-        let node = sized.node;
         if !self.intrinsic_inline_sizes_are_transferred(sized, constraints) {
             return None;
         }
-        let facts = self.facts(node);
         let available_space = self.transferred_intrinsic_inline_sizing_space(sized);
-        // NB: Replaced elements resolve their sizes here without a percentage basis.
-        let sizing_constraints = if facts.is_replaced_box() {
-            ContainingBlockConstraints::default()
-        } else {
-            constraints
-        };
         // https://drafts.csswg.org/css2/#inline-replaced-width
         // "(used height) * (intrinsic ratio)"
-        let inline_size = self.compute_inline_size_for_replaced_element(sized, available_space, sizing_constraints);
+        let inline_size = self.compute_inline_size_for_replaced_element(sized, available_space, constraints);
         // https://drafts.csswg.org/css-sizing-4/#aspect-ratio-minimum
-        let block_size = self.compute_block_size_for_replaced_element(sized, available_space, sizing_constraints);
+        let block_size = self.compute_block_size_for_replaced_element(sized, available_space, constraints);
         let minimum = self.automatic_minimum_size_from_aspect_ratio(
             sized,
             SizingAxis::Inline,
@@ -2861,6 +2918,29 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         )
     }
 
+    pub(crate) fn calculate_max_content_inline_size_with_available_space(
+        &self,
+        sized: SizedBox<'_>,
+        available: AvailableSize,
+        constraints: ContainingBlockConstraints,
+    ) -> CssPixels {
+        if self.facts(sized.node).is_replaced_box()
+            && let AvailableSize::Definite(basis) = available
+            && let Some(answer) = self.max_content_inline_size_answered_without_measuring_content(
+                sized,
+                constraints,
+                self.definite_block_size_of_replaced_box_in_held_metrics(sized),
+                Some(self.stretch_fit_inner_size(sized, SizingAxis::Inline, basis, constraints)),
+            )
+        {
+            let answer =
+                self.with_transferred_limits(sized, answer, IntrinsicSizeCacheKind::MaxContentInline, constraints);
+            self.charge_content_sizing_scope_with(sized.node, answer.dependencies);
+            return answer.size;
+        }
+        self.calculate_max_content_inline_size(sized, constraints)
+    }
+
     fn definite_block_size_of_replaced_box_in_held_metrics(&self, sized: SizedBox<'_>) -> Option<CssPixels> {
         let node = sized.node;
         if !self.facts(node).is_replaced_box() {
@@ -2920,7 +3000,7 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
                 self.min_content_inline_size_answered_without_measuring_content(sized, constraints, block_size)
             }
             IntrinsicSizeCacheKind::MaxContentInline => {
-                self.max_content_inline_size_answered_without_measuring_content(sized, constraints, block_size)
+                self.max_content_inline_size_answered_without_measuring_content(sized, constraints, block_size, None)
             }
             IntrinsicSizeCacheKind::MaxContentBlock => {
                 unreachable!("content inline size kind must use the inline axis")
@@ -3007,8 +3087,15 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
             inline_size: available,
             block_size: AvailableSize::Indefinite,
         };
-        self.transferred_inline_size_limits(sized, available_space, constraints)
-            .map_or(inline_size, |limits| limits.clamp(inline_size))
+        let Some(limits) = self.transferred_inline_size_limits_of_any_box(sized, available_space, constraints) else {
+            return inline_size;
+        };
+        // Replaced element sizing already raises a replaced box to a transferred minimum, but never lowers its natural
+        // size to a transferred maximum.
+        if self.facts(node).is_replaced_box() {
+            return limits.maximum.map_or(inline_size, |maximum| inline_size.min(maximum));
+        }
+        limits.clamp(inline_size)
     }
 
     fn min_content_inline_size_answered_without_measuring_content(
@@ -3023,8 +3110,10 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         let answered_from_style = |size| Some(self.content_inline_size_answered_from_style(node, block_size, size));
         // https://drafts.csswg.org/css-sizing-3/#min-content-zero
         // input with any type that is not "button-like"; this can vary depending on the UA.
-        // NB: Text entry inputs are compressible even when their layout boxes are not replaced boxes.
-        let is_compressible_text_input = facts.is_text_input() && style.width().contains_percentage();
+        // NB: Text entry inputs and textareas are compressible even though their layout boxes are not replaced boxes.
+        let is_compressible_text_input = facts.resolves_cyclic_percentages_like_replaced_box()
+            && !facts.is_replaced_box()
+            && style.width().contains_percentage();
         if is_compressible_text_input
             || (facts.is_replaced_box()
                 && (style.width().contains_percentage() || style.max_width().contains_percentage()))
@@ -3059,6 +3148,14 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         if let Some(width) = auto_size.width {
             return answered_from_style(width);
         }
+        if facts.is_replaced_box() && facts.has_preferred_aspect_ratio() && auto_size.height.is_some() {
+            return self.max_content_inline_size_answered_without_measuring_content(
+                sized,
+                constraints,
+                block_size,
+                None,
+            );
+        }
         if facts.is_replaced_box()
             && !facts.has_preferred_aspect_ratio()
             && let Some(fallback) = self.max_content_size_for_replaced_element_without_natural_size(
@@ -3078,6 +3175,7 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         sized: SizedBox<'_>,
         constraints: ContainingBlockConstraints,
         block_size: Option<CssPixels>,
+        stretch_fit_inline_size: Option<CssPixels>,
     ) -> Option<ContentInlineSizeAnswer> {
         let node = sized.node;
         let facts = self.facts(node);
@@ -3178,6 +3276,7 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
             );
             let replaced_constraints = formatting_context::ReplacedMaxContentSizeLimits {
                 definite_size_in_ratio_determining_axis: definite_block_size,
+                stretch_fit_inline_size,
                 minimum_inline_size: definite_minimum_inline_size,
                 minimum_block_size: definite_minimum_block_size,
             };
@@ -3308,6 +3407,21 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         if let Some(answer) = self.content_inline_size_ignoring_content(node) {
             return ContentInlineSizeAnswers::of_both(answer);
         }
+        // NB: Sizes that depend on the container are not cached on the node, which may be measured on its own too.
+        //     They are measured in a run of their own, so their dependencies are assumed as for a skipped child.
+        if block_size.is_none()
+            && let Some(child_run_shapes) = self.child_run_shapes
+            && let Some(sizes) = child_run_shapes.child_content_inline_sizes(node, constraints)
+        {
+            return ContentInlineSizeAnswers::from_measurement(IntrinsicInlineSizeMeasurement {
+                min_content_inline_size: sizes.min,
+                max_content_inline_size: sizes.max,
+                first_line_max_content: FirstLineMaxContent::without_floats(sizes.max),
+                depends_on_percentage_block_size: self.skipped_child_depends_on_percentage_block_size(node),
+                depends_on_percentage_inline_basis: self.measurement_root_observes_percentage_inline_basis(node),
+                depends_on_block_size: self.intrinsic_inline_size_may_depend_on_block_size(node),
+            });
+        }
         let key = self.intrinsic_size_cache_key(block_size, constraints);
         if let Some(cached) = self.intrinsic_inline_measurement_cache_get(node, key) {
             self.pass.layout_trace().intrinsic_size_hit(node, kind);
@@ -3351,7 +3465,8 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
                 ),
                 formatting_context::FormattingContextType::Svg
                 | formatting_context::FormattingContextType::InternalReplaced
-                | formatting_context::FormattingContextType::ReplacedWithChildren => (
+                | formatting_context::FormattingContextType::ReplacedWithChildren
+                | formatting_context::FormattingContextType::FrameSet => (
                     "REPLACED CONTENT",
                     intrinsic_sizing::content_sizes_of_replaced_content(self.pass, &scope()),
                 ),
@@ -3805,15 +3920,14 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
             table_box,
             self.pass.in_flow_containing_block(table_box),
             |state, pass| {
-                let table_run = FormattingContextRun {
+                let table_run = FormattingContextRun::new(
                     state,
-                    box_: table_box,
+                    table_box,
                     pass,
-                    should_collect_devtools_layout_data: false,
-                    treat_block_axis_percentage_insets_as_auto_beyond_root: false,
-                    fragments: None,
-                    fragmentainer: None,
-                };
+                    formatting_context::RunMode::Measure,
+                    false,
+                    None,
+                );
                 size_table(&table_run, table_cells)
             },
         )
@@ -3989,6 +4103,17 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         }
     }
 
+    /// The inline size at which to measure the intrinsic block sizes of `sized`: its own content inline size once
+    /// that's resolved, since its contents are laid out in it, and otherwise the available inline size.
+    fn inline_size_for_intrinsic_block_size(&self, sized: SizedBox<'_>, available_space: AvailableSpace) -> CssPixels {
+        let metrics = sized.metrics();
+        if metrics.has_definite_inline_size() {
+            metrics.content_inline_size()
+        } else {
+            available_space.inline_size.to_px_or_zero()
+        }
+    }
+
     pub(crate) fn calculate_fit_content_size(
         &self,
         sized: SizedBox<'_>,
@@ -4003,7 +4128,11 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
                 // max-content size) (i.e. max(min-content size, min(max-content size, stretch-fit size))).
                 if let AvailableSize::Definite(basis) = available_space.inline_size {
                     let stretch = self.stretch_fit_inner_size(sized, SizingAxis::Inline, basis, constraints);
-                    let max_content = self.calculate_max_content_inline_size(sized, constraints);
+                    let max_content = self.calculate_max_content_inline_size_with_available_space(
+                        sized,
+                        available_space.inline_size,
+                        constraints,
+                    );
                     if max_content <= stretch {
                         return max_content;
                     }
@@ -4017,7 +4146,7 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
                 self.calculate_max_content_inline_size(sized, constraints)
             }
             SizingAxis::Block => {
-                let inline_size = available_space.inline_size.to_px_or_zero();
+                let inline_size = self.inline_size_for_intrinsic_block_size(sized, available_space);
                 // https://drafts.csswg.org/css-sizing-3/#fit-content-size
                 // If the available space in a given axis is definite,
                 // equal to clamp(min-content size, stretch-fit size, max-content size)
@@ -4306,7 +4435,7 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
                 constraints,
             ))
         } else if preferred_size.is_max_content() {
-            Some(self.calculate_max_content_inline_size(sized, constraints))
+            Some(self.calculate_max_content_inline_size_with_available_space(sized, available, constraints))
         } else if preferred_size.is_min_content() {
             Some(self.calculate_min_content_inline_size(sized, constraints))
         } else {
@@ -4389,9 +4518,11 @@ impl<'pass, 'container> SizingContext<'pass, 'container> {
         } else if preferred_size.is_fit_content() {
             Some(self.calculate_fit_content_size(sized, SizingAxis::Block, available_space, constraints))
         } else if preferred_size.is_max_content() {
-            Some(self.calculate_max_content_block_size(sized, available_space.inline_size.to_px_or_zero(), constraints))
+            let inline_size = self.inline_size_for_intrinsic_block_size(sized, available_space);
+            Some(self.calculate_max_content_block_size(sized, inline_size, constraints))
         } else if preferred_size.is_min_content() {
-            Some(self.calculate_min_content_block_size(sized, available_space.inline_size.to_px_or_zero(), constraints))
+            let inline_size = self.inline_size_for_intrinsic_block_size(sized, available_space);
+            Some(self.calculate_min_content_block_size(sized, inline_size, constraints))
         } else {
             None
         };

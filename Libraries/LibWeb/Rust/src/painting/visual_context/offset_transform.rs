@@ -99,7 +99,7 @@ fn containing_block_inset_shape(arena: &impl PaintRead, node: NodeSlotId) -> Own
         v3: zero(),
         v4: RetainedStyleValueData::from_owned(radii),
         fill_rule: 0,
-        points: crate::css::style_value::RetainedShapePointList::from_retained_points(Vec::new()),
+        points: crate::css::style_value::RetainedShapePointList::from_vec(Vec::new()),
         path: crate::css::css_path::CssPath::none(),
         commands: crate::css::style_value::ShapeCommands::default(),
     })
@@ -159,7 +159,7 @@ pub(crate) fn compute_offset_transform(
     style: ComputedValuesView<'_>,
     arena: &impl PaintRead,
     node: NodeSlotId,
-    geometry: &impl super::node_values::TransformGeometry,
+    geometry: &impl crate::layout::used_transform::TransformGeometry,
     reference_box: CssPixelRect,
     origin: (f64, f64),
 ) -> Option<FloatMatrix4x4> {

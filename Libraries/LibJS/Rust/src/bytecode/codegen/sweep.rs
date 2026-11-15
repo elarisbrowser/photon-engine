@@ -27,10 +27,12 @@ use crate::parser::OutOfStack;
 use crate::parser::columns::NONE;
 use crate::parser::columns::function_flag;
 use crate::parser::columns::tag;
+use crate::parser::token::N_ARGUMENTS;
 use crate::parser::token::N_PROTO;
 
 use super::context::Generator;
 use super::nodes::*;
+use super::stream::TargetBinding;
 use super::stream::ValKind;
 use crate::bytecode::constant_fold::ascii_code_units_to_string;
 
@@ -124,8 +126,12 @@ impl Generator<'_> {
             self.current_source_offset = SourceOffset(position);
             match row_tag {
                 tag::IDENT => {
-                    let ident = self.identifier_of(Name(a));
-                    self.value_of_identifier(ident);
+                    if let Some(kind) = (a == N_ARGUMENTS).then(|| self.arguments_from_frame()).flatten() {
+                        self.value_of_arguments_from_frame(kind);
+                    } else {
+                        let ident = self.identifier_of(Name(a));
+                        self.value_of_identifier(ident);
+                    }
                 }
                 tag::IDENT_CALLEE => {
                     let ident = self.identifier_of(Name(a));
@@ -141,11 +147,11 @@ impl Generator<'_> {
                 }
                 tag::IDENT_TARGET => {
                     let ident = self.identifier_of(Name(a));
-                    self.target_of_identifier(ident);
+                    self.target_of_identifier(ident, TargetBinding::MightAppear);
                 }
                 tag::IDENT_READ_TARGET => {
                     let ident = self.identifier_of(Name(a));
-                    self.target_of_identifier(ident);
+                    self.target_of_identifier(ident, TargetBinding::Known);
                     self.read_target(Some(ident));
                 }
                 tag::IDENT_DECLARATION => {
@@ -216,12 +222,12 @@ impl Generator<'_> {
                 tag::PAREN => {}
                 tag::CALL | tag::OPT_CALL => self.call(tree.node_list(b).len()),
                 tag::NEW => self.construct(tree.node_list(b).len()),
-                tag::CALL_SPREAD => self.call_with_array(),
+                tag::CALL_ARRAY => self.call_with_array(),
                 tag::CALL_DIRECT_EVAL => self.direct_eval(tree.node_list(b).len()),
-                tag::CALL_DIRECT_EVAL_SPREAD => self.direct_eval_with_array(),
-                tag::NEW_SPREAD => self.construct_with_array(),
+                tag::CALL_DIRECT_EVAL_ARRAY => self.direct_eval_with_array(),
+                tag::NEW_ARRAY => self.construct_with_array(),
                 tag::ARRAY_SPREAD => {}
-                tag::MARK_SPREAD_START => self.spread_begin(a as usize),
+                tag::MARK_ARRAY_START => self.array_begin(a as usize),
                 tag::SPREAD => self.append_element(true),
                 tag::MARK_APPEND => self.append_element(false),
                 tag::OBJECT_SPREAD => self.object_spread(),
@@ -241,14 +247,14 @@ impl Generator<'_> {
                 tag::SUPER => self.value_of_super_this(),
                 tag::SUPER_CALLEE => self.value_of_super_constructor(),
                 tag::SUPER_CALL => {
-                    if !tree
-                        .node_list(b)
-                        .iter()
-                        .any(|argument| tree.node_tag(argument) == tag::SPREAD)
+                    let arguments = tree.node_list(b);
+                    if arguments.len() <= super::inline_argument_limit(self.builtin_abstract_operations_enabled)
+                        && !arguments.iter().any(|argument| tree.node_tag(argument) == tag::SPREAD)
                     {
-                        self.array(tree.node_list(b).len());
+                        self.super_call_with_operands(arguments.len());
+                    } else {
+                        self.super_call();
                     }
-                    self.super_call();
                 }
                 tag::SUPER_MEMBER => self.value_of_super_property(Some(Name(b)), false),
                 tag::SUPER_MEMBER_CALLEE => self.value_of_super_property(Some(Name(b)), true),
@@ -314,7 +320,8 @@ impl Generator<'_> {
                         row += 1;
                         continue;
                     }
-                    let value_is_used = next_tag(tags, row) != tag::EXPR_STMT && !self.is_unused_value_row(row);
+                    let value_is_used = (next_tag(tags, row) != tag::EXPR_STMT || self.tracks_completion())
+                        && !self.is_unused_value_row(row);
                     self.update(tree.update_operator(node), row_tag == tag::PREFIX_UPDATE, value_is_used);
                 }
                 tag::CONDITIONAL => self.conditional_end(),
@@ -635,6 +642,42 @@ fn is_proto_key(tree: &SyntaxTree, key: NodeId) -> bool {
 /// Whether the function at `function` has no name of its own.
 pub(super) fn is_anonymous(tree: &SyntaxTree, function: NodeId) -> bool {
     tree.script.index.name[tree.node_b(function) as usize] == NONE
+}
+
+/// https://tc39.es/ecma262/#sec-static-semantics-isfunctiondefinition
+#[inline(always)]
+fn is_function_definition(tree: &SyntaxTree, expression: NodeId) -> bool {
+    matches!(tree.node_tag(expression), tag::FUNCTION | tag::CLASS)
+}
+
+/// https://tc39.es/ecma262/#sec-static-semantics-hasname
+#[inline(always)]
+fn has_name(tree: &SyntaxTree, expression: NodeId) -> bool {
+    match tree.node_tag(expression) {
+        tag::FUNCTION => !is_anonymous(tree, expression),
+        tag::CLASS => tree.node_a(expression) != NONE,
+        _ => false,
+    }
+}
+
+/// https://tc39.es/ecma262/#sec-isanonymousfunctiondefinition
+pub(super) fn is_anonymous_function_definition(tree: &SyntaxTree, expression: NodeId) -> bool {
+    // NB: IsFunctionDefinition and HasName of a ParenthesizedExpression are those of the expression in it.
+    let expression = tree.skip_parens(expression);
+
+    // 1. If IsFunctionDefinition of expr is false, return false.
+    if !is_function_definition(tree, expression) {
+        return false;
+    }
+
+    // 2. Let hasName be HasName of expr.
+    // 3. If hasName is true, return false.
+    if has_name(tree, expression) {
+        return false;
+    }
+
+    // 4. Return true.
+    true
 }
 
 /// The operator of a logical assignment, by the token that it is.

@@ -1328,10 +1328,8 @@ Vector<Gfx::DoubleRect> Range::client_rects()
     document.update_layout(DOM::UpdateLayoutReason::RangeGetClientRects);
     Layout::ForcedReadScope read { document };
     Vector<Gfx::DoubleRect> rects;
-    Optional<Compositing::AccumulatedVisualContextTree> visual_context_tree;
-    auto rect_to_viewport_transform = Painting::identity_rect_to_viewport_transform();
+    Optional<Layout::RustFFI::FfiViewportMapping> viewport_mapping;
 
-    // FIXME: take Range collapsed into consideration
     // 2. Iterate the node included in Range
     auto next_after_subtree = [](Node& node) -> GC::Ptr<Node> {
         for (auto* current = &node; current; current = current->parent_node()) {
@@ -1371,10 +1369,7 @@ Vector<Gfx::DoubleRect> Range::client_rects()
         auto const is_end_container = node.ptr() == m_end_container.ptr();
         auto selection_state = Painting::SelectionState::Full;
         if (is_start_container && is_end_container) {
-            if (m_start_offset == m_end_offset)
-                selection_state = Painting::SelectionState::None;
-            else
-                selection_state = Painting::SelectionState::StartAndEnd;
+            selection_state = Painting::SelectionState::StartAndEnd;
         } else if (is_start_container) {
             selection_state = Painting::SelectionState::Start;
         } else if (is_end_container) {
@@ -1395,19 +1390,14 @@ Vector<Gfx::DoubleRect> Range::client_rects()
             // 2. For each Text node selected or partially selected by the range (including when the boundary-points
             // are identical), include scaled DOMRect object (for the part that is selected, not the whole line box).
             auto const& text = static_cast<DOM::Text const&>(*node);
-            if (selection_state == Painting::SelectionState::None)
-                continue;
 
             // A text node without a box renders nothing, so it has no rects.
             auto const* layout_node = text.layout_node(read);
             if (!layout_node)
                 continue;
 
-            if (!visual_context_tree.has_value() && !document.can_compute_client_rects_without_accumulated_visual_contexts_update(*layout_node)) {
-                document.update_paint_and_hit_testing_properties_if_needed();
-                visual_context_tree = document.visual_context_tree();
-                rect_to_viewport_transform = Painting::rect_to_viewport_transform(document, *visual_context_tree);
-            }
+            if (!viewport_mapping.has_value() && !document.can_compute_client_rects_without_accumulated_visual_contexts_update(*layout_node))
+                viewport_mapping = Painting::viewport_mapping(document);
 
             size_t filter_dom_start = 0;
             size_t filter_dom_end = NumericLimits<size_t>::max();
@@ -1431,7 +1421,7 @@ Vector<Gfx::DoubleRect> Range::client_rects()
             Layout::RustFFI::layout_script_text_range_rects(
                 layout_node->document_host(), Layout::Node::slot_id(layout_node),
                 to_underlying(selection_state), start_offset(), end_offset(), filter_dom_start, filter_dom_end,
-                rect_to_viewport_transform, &rects, [](void* context, CSSPixelRect rect) {
+                viewport_mapping.value_or(Layout::RustFFI::FfiViewportMapping {}), &rects, [](void* context, CSSPixelRect rect) {
                     static_cast<Vector<Gfx::DoubleRect>*>(context)->append(rect.to_type<float>().to_type<double>());
                 });
         }
@@ -1473,7 +1463,7 @@ Gfx::DoubleRect Range::bounding_client_rect()
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-range-createcontextualfragment
 // NB: The steps after node, compliantString and compliantOptions have been determined.
-static WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> create_contextual_fragment_for_node(GC::Ref<Node> node, StringView string, GC::Ptr<TrustedTypes::TrustedHTMLParserOptions> trusted_options)
+static WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> create_contextual_fragment_for_node(GC::Ref<Node> node, StringView string, GC::Ptr<TrustedTypes::TrustedHTMLParserOptions> trusted_options, HTML::ParserScriptingMode scripting_mode)
 {
     // 3. Let element be null.
     GC::Ptr<Element> element = nullptr;
@@ -1499,7 +1489,7 @@ static WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> create_contextual_fragment
     // 7. Return the result of invoking the fragment parsing algorithm steps given element, compliantString,
     //    compliantOptions, and Legacy.
     auto markup = Utf16String::from_utf8(string);
-    return Element::parse_fragment(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>> { *element }, markup.utf16_view(), HTML::ParserScriptingMode::Fragment, HTML::FragmentFastPath::Allow, trusted_options);
+    return Element::parse_fragment(Variant<GC::Ref<Element>, GC::Ref<DocumentFragment>> { *element }, markup.utf16_view(), scripting_mode, HTML::FragmentFastPath::Allow, trusted_options);
 }
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-range-createcontextualfragment
@@ -1516,14 +1506,14 @@ WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> Range::create_contextual_fragment
     //       prevent scripts from executing when inserting the returned fragment.
     auto const [compliant_string, trusted_options] = TRY(HTML::get_trusted_type_compliant_input_for_legacy_sink(node, string, TrustedTypes::InjectionSink::Range_createContextualFragment, HTML::LegacySinkRunScripts::Yes));
 
-    return create_contextual_fragment_for_node(node, compliant_string.to_utf8_but_should_be_ported_to_utf16(), trusted_options);
+    return create_contextual_fragment_for_node(node, compliant_string.to_utf8_but_should_be_ported_to_utf16(), trusted_options, HTML::ParserScriptingMode::Fragment);
 }
 
 // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-range-createcontextualfragment
-WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> Range::create_contextual_fragment(StringView string, GC::Ptr<TrustedTypes::TrustedHTMLParserOptions> trusted_options)
+WebIDL::ExceptionOr<GC::Ref<DocumentFragment>> Range::create_contextual_fragment(StringView string, HTML::ParserScriptingMode scripting_mode)
 {
     // 1. Let node be this's start node.
-    return create_contextual_fragment_for_node(*start_container(), string, trusted_options);
+    return create_contextual_fragment_for_node(*start_container(), string, nullptr, scripting_mode);
 }
 
 }

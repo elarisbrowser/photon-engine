@@ -34,7 +34,7 @@ GC_DEFINE_ALLOCATOR(IntersectionObserver);
 GC::Ref<WebIDL::CallbackType> create_lazy_load_intersection_observer_callback(DOM::Document& document)
 {
     auto& realm = document.relevant_settings_object().realm();
-    auto callback = JS::NativeFunction::create(realm, Utf16FlyString {}, [&document](JS::VM& vm) -> JS::ThrowCompletionOr<JS::Value> {
+    auto callback = JS::NativeFunction::create(realm, Utf16FlyString {}, GC::create_function(GC::Heap::the(), GC::captures(document), [](DOM::Document& document, JS::VM& vm) -> JS::ThrowCompletionOr<JS::Value> {
         auto& entries = as<JS::Array>(vm.argument(0).as_object());
         auto entries_length = MUST(MUST(entries.get(vm.names.length)).to_length(vm));
 
@@ -49,7 +49,7 @@ GC::Ref<WebIDL::CallbackType> create_lazy_load_intersection_observer_callback(DO
 
         document.process_lazy_load_intersection_observer_entries(intersection_observer_entries);
         return JS::js_undefined();
-    });
+    }));
 
     return GC::Heap::the().allocate<WebIDL::CallbackType>(callback, realm);
 }
@@ -346,7 +346,7 @@ GC::Ref<DOM::Node> IntersectionObserver::intersection_root_node() const
 }
 
 // https://www.w3.org/TR/intersection-observer/#intersectionobserver-root-intersection-rectangle
-CSSPixelRect IntersectionObserver::root_intersection_rectangle(Layout::BegunRead const& read, Compositing::AccumulatedVisualContextTree const* visual_context_tree) const
+CSSPixelRect IntersectionObserver::root_intersection_rectangle(Layout::BegunRead const& read, Optional<MonotonicTime> visual_animation_sample_time) const
 {
     // If the IntersectionObserver is an implicit root observer,
     //    it’s treated as if the root were the top-level browsing context’s document, according to the following rule for document.
@@ -387,8 +387,8 @@ CSSPixelRect IntersectionObserver::root_intersection_rectangle(Layout::BegunRead
 
         // Otherwise,
         //    it’s the result of getting the bounding box for the intersection root.
-        rect = visual_context_tree
-            ? element->bounding_client_rect_assuming_layout_clean(read, *visual_context_tree)
+        rect = visual_animation_sample_time.has_value()
+            ? element->bounding_client_rect_assuming_layout_clean(read, *visual_animation_sample_time)
             : element->bounding_client_rect_assuming_layout_clean();
         if (auto const* layout_node = element->layout_node(read); layout_node && Painting::has_committed_box(*layout_node))
             intersection_root_is_scrollable = layout_node->is_scroll_container();

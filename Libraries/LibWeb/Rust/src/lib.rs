@@ -22,6 +22,8 @@ pub(crate) mod fork_vec;
 #[cfg(test)]
 mod gfx_test_stubs;
 pub(crate) mod heap_size;
+#[cfg(test)]
+mod url_test_stubs;
 pub(crate) use libcompositing_rust::fast_hash;
 
 pub(crate) mod css;
@@ -33,6 +35,7 @@ pub(crate) mod stage;
 pub(crate) mod stage_thread;
 pub(crate) mod style_layout_pool;
 pub(crate) mod svg;
+pub mod web_audio;
 
 // What libweb_bindings_rust, whose interfaces are implemented in Rust, uses of this crate.
 pub use css::font_feature_values::FontFeatureValuesRuleKind;

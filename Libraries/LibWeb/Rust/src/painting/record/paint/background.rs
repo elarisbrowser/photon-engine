@@ -568,6 +568,37 @@ fn paint_image_layer<O: Observer>(
         );
     };
 
+    let scroll_node = recorder.data(paintable).own_scroll_node_index;
+    if layer.attachment == css_enums::background_attachment::LOCAL
+        && recorder.source.node_kind_if_live(paintable) != Some(NodeKind::Viewport)
+        && scroll_node != VISUAL_VIEWPORT_NODE_INDEX
+        && !recorder.recorder.is_recording_inside_group()
+        && let Some(scrollable_area) =
+            crate::painting::paintable_geometry::scrollable_overflow_rect(recorder.source, paintable)
+    {
+        // https://drafts.csswg.org/css-backgrounds-3/#valdef-background-attachment-local
+        // "the background scrolls with the box's contents"
+        // NB: Keep the box's clips outside its scrolling space, and record every part scrolling can reveal.
+        let previous_context = recorder.recorder.accumulated_visual_context();
+        let previous_inline_clips = recorder
+            .recorder
+            .move_ambient_inline_clips_to_space(previous_context.spatial);
+        recorder.recorder.set_accumulated_visual_context(ContextRef {
+            spatial: scroll_node,
+            clip: recorder.data(paintable).accumulated_visual_context_for_descendants.clip,
+            ..previous_context
+        });
+        paint_in_current_space(
+            recorder,
+            scrollable_area,
+            recorder.converter.enclosing_device_rect(scrollable_area),
+            None,
+        );
+        recorder.recorder.set_accumulated_visual_context(previous_context);
+        recorder.recorder.replace_ambient_inline_clips(previous_inline_clips);
+        return;
+    }
+
     if layer.attachment != css_enums::background_attachment::FIXED
         || recorder.recorder.is_recording_inside_group()
         || !background_has_fixed_attachment(
@@ -657,7 +688,9 @@ fn paint_image_layer_in_current_space<O: Observer>(
 
     match layer.attachment {
         css_enums::background_attachment::LOCAL
-            if recorder.source.node_kind_if_live(paintable) != Some(NodeKind::Viewport) =>
+            if recorder.source.node_kind_if_live(paintable) != Some(NodeKind::Viewport)
+                && recorder.recorder.accumulated_visual_context().spatial
+                    != recorder.data(paintable).own_scroll_node_index =>
         {
             let scroll_offset = recorder.own_scroll_container_offset(paintable);
             background_positioning_area = background_positioning_area.translated(-scroll_offset.x, -scroll_offset.y);
@@ -749,6 +782,18 @@ fn paint_image_layer_in_current_space<O: Observer>(
         )
     });
 
+    let tile_device_rect = |rect: CssPixelRect| -> IntRect {
+        let mut rect = converter.rounded_device_rect(rect);
+        // If the image's dimensions were rounded to zero then they need to be restored to avoid a crash.
+        if rect.width == 0 {
+            rect.width = 1;
+        }
+        if rect.height == 0 {
+            rect.height = 1;
+        }
+        rect
+    };
+
     let device_rects = |image_rect: CssPixelRect| -> Vec<IntRect> {
         let mut rects = Vec::new();
         let mut rect = image_rect;
@@ -758,14 +803,7 @@ fn paint_image_layer_in_current_space<O: Observer>(
             let mut image_x = initial_image_x;
             while image_x < css_clip_rect.right() {
                 rect.x = image_x;
-                let mut image_device_rect = converter.rounded_device_rect(rect);
-                // If the image's dimensions were rounded to zero then they need to be restored to avoid a crash.
-                if image_device_rect.width == 0 {
-                    image_device_rect.width = 1;
-                }
-                if image_device_rect.height == 0 {
-                    image_device_rect.height = 1;
-                }
+                let image_device_rect = tile_device_rect(rect);
                 if visible_device_rect.is_none_or(|visible| !visible.intersected(image_device_rect).is_empty()) {
                     rects.push(image_device_rect);
                 }
@@ -796,27 +834,35 @@ fn paint_image_layer_in_current_space<O: Observer>(
 
     let inline_operator = compositing_and_blending_operator;
 
-    if let (None, Some(single_pixel_color)) = (&resolved_gradient, facts.single_pixel_color) {
-        // OPTIMIZATION: If the image is a single pixel, we can just fill the whole area with it.
-        //               However, we must first figure out the real coverage area, taking repeat etc into account.
-
-        // FIXME: This could be written in a far more efficient way.
-        let mut fill_rect: Option<IntRect> = None;
-        for image_device_rect in device_rects(image_rect) {
-            fill_rect = Some(match fill_rect {
-                None => image_device_rect,
-                Some(current) => current.united(image_device_rect),
-            });
+    if let (None, Some(single_pixel_color)) = (&resolved_gradient, facts.single_pixel_color)
+        && !repeat_x_has_gap
+        && !repeat_y_has_gap
+    {
+        // OPTIMIZATION: The first and last tiles bound the fill, without enumerating every tile in the scrollable area.
+        // Round both tiles separately to preserve the one-device-pixel minimum size at the end of each repeated axis.
+        let mut fill_rect = IntRect::default();
+        if image_rect.x < css_clip_rect.right() && image_rect.y < css_clip_rect.bottom() {
+            let mut last_tile = image_rect;
+            if repeat_x {
+                last_tile.x =
+                    first_css_tile_start(image_rect.x, css_clip_rect.right() - CssPixels::from_raw(1), x_step);
+            }
+            if repeat_y {
+                last_tile.y =
+                    first_css_tile_start(image_rect.y, css_clip_rect.bottom() - CssPixels::from_raw(1), y_step);
+            }
+            fill_rect = tile_device_rect(image_rect).united(tile_device_rect(last_tile));
+            if let Some(visible) = visible_device_rect {
+                fill_rect = fill_rect.intersected(visible);
+            }
         }
         if inline_operator == CompositingAndBlendingOperator::Normal {
-            recorder.recorder.fill_rect(
-                fill_rect.unwrap_or_default(),
-                single_pixel_color,
-                ForceDarkRole::Background,
-            );
+            recorder
+                .recorder
+                .fill_rect(fill_rect, single_pixel_color, ForceDarkRole::Background);
         } else {
             recorder.recorder.fill_rect_with_compositing_and_blending_operator(
-                fill_rect.unwrap_or_default(),
+                fill_rect,
                 single_pixel_color,
                 inline_operator,
                 ForceDarkRole::Background,
@@ -872,6 +918,7 @@ fn paint_image_layer_in_current_space<O: Observer>(
                     1.0,
                     *content_identity,
                     recorder.vector_image_color_scheme(vector_image_source.owner()),
+                    recorder.vector_image_force_dark(),
                 ),
             );
             let tile_size = IntSize {
@@ -1146,28 +1193,42 @@ fn append_text_clip_paths<O: Observer>(recorder: &mut PaintRecorder<'_, O>, frag
             fragment_absolute_device_rect,
             scale,
         );
-        recorder.recorder.draw_glyph_run(
-            emission.baseline_start,
-            crate::painting::display_list::recorder::GlyphRunForRecording {
-                font_smoothing: recorder
-                    .source
-                    .node_style_if_live(fragment.style_source)
-                    .unwrap()
-                    .inherited_text()
-                    .font_smoothing,
-                font_id: crate::painting::display_list::commands::FontResourceId(font_id),
-                glyphs: run
-                    .glyphs
-                    .placed()
-                    .map(crate::painting::display_list::commands::DisplayListGlyph::from),
-            },
-            libgfx_rust::Color::from_rgb(0, 0, 0),
-            fragment_absolute_device_rect,
-            scale,
-            emission.orientation,
-            emission.glyph_bounding_rect,
-            ForceDarkRole::None,
-        );
+        let stroke_width = recorder
+            .source
+            .node_style_if_live(fragment.style_source)
+            .unwrap()
+            .inherited_text()
+            .webkit_text_stroke_width
+            * scale;
+        for width in [0.0, stroke_width as f32]
+            .into_iter()
+            .take(if stroke_width > 0.0 { 2 } else { 1 })
+        {
+            recorder.recorder.draw_glyph_run(
+                emission.baseline_start,
+                crate::painting::display_list::recorder::GlyphRunForRecording {
+                    font_smoothing: recorder
+                        .source
+                        .node_style_if_live(fragment.style_source)
+                        .unwrap()
+                        .inherited_text()
+                        .font_smoothing,
+                    font_id: crate::painting::display_list::commands::FontResourceId(font_id),
+                    glyphs: run
+                        .glyphs
+                        .placed()
+                        .filter(|placed| placed.glyph.should_paint())
+                        .map(crate::painting::display_list::commands::DisplayListGlyph::from),
+                },
+                libgfx_rust::Color::from_rgb(0, 0, 0),
+                width,
+                fragment_absolute_device_rect,
+                scale,
+                emission.orientation,
+                emission.glyph_bounding_rect,
+                ForceDarkRole::None,
+            );
+        }
     }
 }
 

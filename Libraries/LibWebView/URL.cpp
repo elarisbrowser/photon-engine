@@ -7,6 +7,7 @@
  */
 
 #include <AK/CharacterTypes.h>
+#include <AK/Debug.h>
 #include <AK/IPv4Address.h>
 #include <AK/IPv6Address.h>
 #include <AK/String.h>
@@ -111,6 +112,13 @@ ClassifiedUserInput classify_user_input(StringView location, AppendTLD append_tl
             return { UserInputClassification::InternalURL, URL::create_with_file_scheme(path.value()) };
         return {};
     }
+
+    return classify_user_input_ignoring_local_files(location, append_tld);
+}
+
+ClassifiedUserInput classify_user_input_ignoring_local_files(StringView location, AppendTLD append_tld)
+{
+    location = location.trim_whitespace();
 
     bool https_scheme_was_guessed = false;
     bool input_has_explicit_port = false;
@@ -233,23 +241,6 @@ Optional<URL::URL> url_from_text(StringView text)
     return sanitize_url(trimmed_text);
 }
 
-bool autocomplete_urls_match(StringView left, StringView right)
-{
-    auto parse_destination = [](StringView value) {
-        auto classified_input = classify_user_input(value);
-        if (classified_input.url.has_value())
-            return classified_input.url;
-        return URL::Parser::basic_parse(MUST(String::formatted("https://{}", value)));
-    };
-
-    auto left_url = parse_destination(left);
-    auto right_url = parse_destination(right);
-    if (!left_url.has_value() || !right_url.has_value())
-        return false;
-
-    return left_url->equals(*right_url);
-}
-
 bool autocomplete_url_can_complete(StringView query, StringView suggestion)
 {
     auto suggestion_url = URL::Parser::basic_parse(suggestion);
@@ -307,11 +298,8 @@ Vector<URL::URL> sanitize_urls(ReadonlySpan<ByteString> raw_urls)
     return sanitized_urls;
 }
 
-String url_for_display(URL::URL const& url)
+String authority_for_display(URL::URL const& url)
 {
-    if (!url.scheme().is_one_of("http"sv, "https"sv))
-        return url.serialize();
-
     StringBuilder builder;
 
     if (!url.username().is_empty() || !url.password().is_empty()) {
@@ -330,6 +318,17 @@ String url_for_display(URL::URL const& url)
 
     if (url.port().has_value())
         builder.appendff(":{}", *url.port());
+
+    return MUST(builder.to_string());
+}
+
+String url_for_display(URL::URL const& url)
+{
+    if (!url.scheme().is_one_of("http"sv, "https"sv))
+        return url.serialize();
+
+    StringBuilder builder;
+    builder.append(authority_for_display(url));
 
     auto path = url.serialize_path();
     if (path != "/"sv || url.query().has_value() || url.fragment().has_value())
@@ -461,6 +460,35 @@ ByteString image_filename_with_extension(ByteString filename, StringView image_m
     if (filename.is_empty())
         filename = "download"sv;
     return ByteString::formatted("{}{}", filename, *extension);
+}
+
+// History records web pages and local files only. The browser opens what its history lists, and a javascript: URL would
+// run in whatever document opened it, such as about:history. A store holds other URLs only if something other than the
+// browser wrote to it, so the queries listing and suggesting entries skip them too.
+static bool is_browsable_url(URL::URL const& url)
+{
+    return url.scheme().is_one_of("http"sv, "https"sv, "file"sv);
+}
+
+Optional<String> normalize_url_for_history(URL::URL const& url)
+{
+    if (url.scheme().is_empty()) {
+        dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Skipping history entry without a scheme: {}", url);
+        return {};
+    }
+
+    if (!is_browsable_url(url)) {
+        dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Skipping non-browsable history URL: {}", url);
+        return {};
+    }
+
+    auto normalized_url = url.serialize(URL::ExcludeFragment::Yes);
+    if (normalized_url.is_empty()) {
+        dbgln_if(WEBVIEW_HISTORY_DEBUG, "[History] Skipping history entry with an empty normalized URL: {}", url);
+        return {};
+    }
+
+    return normalized_url;
 }
 
 }

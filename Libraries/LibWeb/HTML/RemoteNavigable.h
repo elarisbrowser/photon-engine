@@ -55,7 +55,6 @@ public:
     Vector<GC::Root<Navigable>> document_tree_child_navigables();
 
     virtual GC::Ptr<WindowProxy> active_window_proxy() override;
-    GC::Ref<WindowProxy> active_window_proxy_in_realm_of(Window&);
     GC::Ref<RemoteWindow> active_window();
     virtual Utf16String const& target_name() const override { return m_replicated_state.target_name; }
     virtual Optional<u64> browsing_context_group_id() const override { return m_replicated_state.browsing_context_group_id; }
@@ -65,6 +64,7 @@ public:
 
     virtual Optional<URL::URL> active_document_url() const override { return m_replicated_state.active_document_url; }
     virtual Optional<URL::Origin> active_document_origin() const override { return m_replicated_state.active_document_origin; }
+    virtual SandboxingFlagSet active_document_sandboxing_flag_set() const override { return m_replicated_state.active_document_sandboxing_flag_set; }
     virtual bool active_document_is_fully_active() const override { return m_replicated_state.active_document_is_fully_active; }
     virtual bool active_document_is_completely_loaded() const override { return m_replicated_state.active_document_is_completely_loaded; }
     virtual bool active_document_is(DOM::Document const&) const override { return false; }

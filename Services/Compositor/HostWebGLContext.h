@@ -41,7 +41,8 @@ public:
 
     static OwnPtr<HostWebGLContext> create(RefPtr<Gfx::SkiaBackendContext>, OpenGLContext::WebGLVersion, OpenGLContext::DrawingBufferOptions, Gfx::IntSize initial_size);
 
-    using UploadSource = Variant<Gfx::DecodedImageFrame, NonnullRefPtr<Media::VideoFrame>>;
+    struct MissingVideoFrame { };
+    using UploadSource = Variant<Gfx::DecodedImageFrame, NonnullRefPtr<Media::VideoFrame>, MissingVideoFrame>;
     ErrorOr<void> execute_commands(ReadonlyBytes, Vector<UploadSource> const&);
 
     void set_shared_command_buffer(Compositing::WebGL::WebGLSharedCommandBuffer shared_command_buffer) { m_shared_command_buffer = move(shared_command_buffer); }
@@ -54,6 +55,7 @@ public:
     ErrorOr<NonnullRefPtr<Gfx::PaintingSurface>> prepare_for_compositing(bool preserve_drawing_buffer);
     void clear_drawing_buffer();
     RefPtr<Gfx::PaintingSurface> presented_surface();
+    RefPtr<PresentableSurface> presented_presentable_surface() { return m_gl_context->presented_presentable_surface(); }
 
     OpenGLContext& gl_context() { return *m_gl_context; }
 

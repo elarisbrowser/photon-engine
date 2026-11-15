@@ -15,11 +15,13 @@
 #include <LibJS/Heap/Cell.h>
 #include <LibJS/Runtime/VM.h>
 #include <LibWeb/Export.h>
-#include <LibWeb/Fetch/Engine/FetchBodyDeliveryGate.h>
 #include <LibWeb/Fetch/Engine/FetchByteChannel.h>
+#include <LibWeb/Fetch/Engine/FetchExecutor.h>
+#include <LibWeb/Fetch/Engine/Ids.h>
 #include <LibWeb/Fetch/Infrastructure/FetchControlBlock.h>
 #include <LibWeb/Fetch/Infrastructure/FetchControllerRegistry.h>
 #include <LibWeb/Fetch/Infrastructure/FetchTimingInfo.h>
+#include <LibWeb/Fetch/Infrastructure/NetworkObservation.h>
 #include <LibWeb/Fetch/Infrastructure/Task.h>
 #include <LibWeb/Forward.h>
 #include <LibWeb/HTML/EventLoop/Task.h>
@@ -47,8 +49,8 @@ public:
     [[nodiscard]] WeakPtr<FetchControllerRegistry> const& registry() const { return m_registry; }
     [[nodiscard]] FetchControlBlock& control_block() const { return *m_control_block; }
 
-    void set_report_timing_steps(Function<void(JS::Object&)> report_timing_steps);
-    void set_next_manual_redirect_steps(Function<void()> next_manual_redirect_steps);
+    void set_report_timing_steps(GC::Ref<GC::Function<void(JS::Object&)>> report_timing_steps);
+    void set_next_manual_redirect_steps(GC::Ref<GC::Function<void()>> next_manual_redirect_steps);
 
     [[nodiscard]] State state() const { return m_control_block->state(); }
     [[nodiscard]] RefPtr<FetchTimingInfo> full_timing_info() const { return m_control_block->full_timing_info(); }
@@ -73,8 +75,18 @@ public:
     void set_original_fetch_params(Badge<FetchParams>, FetchParams const&);
     [[nodiscard]] RefPtr<FetchParams> original_fetch_params() const;
 
+    // The network observation of the request the controller's fetch params were created with.
+    void set_network_observation(Badge<FetchParams>, NonnullRefPtr<NetworkObservation>);
+    [[nodiscard]] RefPtr<NetworkObservation> const& network_observation() const { return m_network_observation; }
+
     [[nodiscard]] TaskDestination const& task_destination() const { return m_task_destination; }
     void set_task_destination(TaskDestination task_destination) { m_task_destination = move(task_destination); }
+
+    // The page of the realm that started the fetch.
+    [[nodiscard]] GC::Ref<Page> page() const;
+    void set_page(Page& page) { m_page = page; }
+
+    void set_preflighted_fetch_controller(FetchController& controller) { m_preflighted_fetch_controller = controller; }
 
     // Moves the fetch, before its response has arrived, to another task destination and body intent.
     void retarget(TaskDestination, Engine::BodyIntent);
@@ -86,16 +98,15 @@ public:
     [[nodiscard]] GC::Ptr<Fetching::PendingResponse> pending_preloaded_response() const { return m_pending_preloaded_response; }
     void set_pending_preloaded_response(GC::Ptr<Fetching::PendingResponse> pending_preloaded_response) { m_pending_preloaded_response = pending_preloaded_response; }
 
-    void set_network_transport(Engine::NetworkTransportHandle&);
-    void set_body_transport(Engine::FetchBodyDeliveryGate::Transport&);
     bool requires_network() const { return m_control_block->requires_network(); }
     bool has_started_request() const { return m_control_block->has_started_request(); }
     void set_inner_fetch_controller(GC::Ref<FetchController>);
 
+    // The fetch this controller's fetch params started last, and the executor its start was posted to. The controller's
+    // stops are posted there, for that fetch.
+    void set_started_fetch(Engine::FetchId, Engine::FetchExecutor&);
+
     void stop_fetch();
-    void stop_request();
-    // Stops the delivery of the current response's body without ending the fetch.
-    void stop_body_transport();
     void set_stop_steps(GC::Ref<GC::Function<void()>> stop_steps) { m_stop_steps = stop_steps; }
 
     u64 next_fetch_task_id() { return m_next_fetch_task_id++; }
@@ -113,11 +124,13 @@ private:
 
     void report_webdriver_bidi_fetch_error(StringView error_text) const;
     void cancel_webdriver_bidi_network_interception() const;
+    void stop_request();
 
     WeakPtr<FetchControllerRegistry> m_registry;
     FetchControllerToken m_token;
     NonnullRefPtr<FetchControlBlock> m_control_block;
     WeakPtr<FetchParams> m_original_fetch_params;
+    RefPtr<NetworkObservation> m_network_observation;
 
     // https://fetch.spec.whatwg.org/#fetch-controller-report-timing-steps
     // report timing steps (default null)
@@ -162,13 +175,23 @@ private:
     // task destination (default null)
     //     Null, a global object, or a parallel queue.
     TaskDestination m_task_destination;
+    GC::Ptr<Page> m_page;
+
+    // A CORS preflight's controller keeps alive the controller of the fetch the preflight is for, which the
+    // preflight's requests report to.
+    GC::Ptr<FetchController> m_preflighted_fetch_controller;
+
     bool m_is_keepalive { false };
 
     // NB: Assumes one waiting consumer for a pending preloaded response.
     // Widen this if preload handoff ever supports multiple consumers.
     GC::Ptr<Fetching::PendingResponse> m_pending_preloaded_response;
 
-    WeakPtr<Engine::FetchBodyDeliveryGate::Transport> m_body_transport;
+    struct StartedFetch {
+        Engine::FetchId fetch_id;
+        NonnullRefPtr<Engine::FetchExecutor> fetch_executor;
+    };
+    Optional<StartedFetch> m_started_fetch;
 
     HashMap<u64, HTML::TaskID> m_ongoing_fetch_tasks;
     u64 m_next_fetch_task_id { 0 };

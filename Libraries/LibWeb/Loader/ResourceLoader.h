@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <AK/Atomic.h>
 #include <AK/ByteString.h>
 #include <AK/HashMap.h>
 #include <AK/HashTable.h>
@@ -17,26 +18,28 @@
 #include <LibHTTP/HeaderList.h>
 #include <LibRequests/CacheState.h>
 #include <LibRequests/Forward.h>
+#include <LibRequests/NetworkError.h>
 #include <LibRequests/Request.h>
 #include <LibRequests/RequestClient.h>
 #include <LibRequests/RequestTimingInfo.h>
 #include <LibURL/URL.h>
+#include <LibWeb/Fetch/Engine/Ids.h>
 #include <LibWeb/Forward.h>
 #include <LibWebCommon/Loader/NavigatorCompatibilityMode.h>
 
 namespace Web {
 
-// How a failed request describes its network error.
-WEB_API String network_error_description(Requests::NetworkError);
-// Whether a failed request's description says the server's certificate could not be verified.
-WEB_API bool is_certificate_error_description(StringView);
-
+// Each agent has a loader of its own, which holds its connections to the RequestServer and its requests, and only its
+// thread can use it. The static settings are the process's.
 class WEB_API ResourceLoader : public Core::EventReceiver {
     C_OBJECT_ABSTRACT(ResourceLoader)
 
 public:
     static void initialize(GC::Heap&);
     static bool is_initialized();
+
+    // Forgets the loader of this agent, once its requests are stopped.
+    static void shut_down();
     static ResourceLoader& the();
 
     static void set_proxy_autoconfig_url(URL::URL);
@@ -46,10 +49,22 @@ public:
     // for requests without a site or without a client for that site.
     void set_client(Optional<Utf16String> const& top_level_site, NonnullRefPtr<Requests::RequestClient>);
 
+    // A callback's transport is that of the RequestServer request the load started, or null for a load that started
+    // none.
     using OnHeadersReceived = GC::Function<void(Fetch::Engine::NetworkTransportHandle*, HTTP::HeaderList const& response_headers, Optional<u32> status_code, Optional<String> const& reason_phrase, Requests::CacheState cache_state)>;
-    using OnDataReceived = GC::Function<void(Requests::ResponseData data)>;
+    using OnDataReceived = GC::Function<void(Fetch::Engine::NetworkTransportHandle*, Requests::ResponseData data)>;
     using OnCachedBodyAvailable = GC::Function<void(Core::ImmutableBytes data)>;
-    using OnComplete = GC::Function<void(bool success, Requests::RequestTimingInfo const& timing_info, Optional<StringView> error_message)>;
+
+    // What RequestServer reported at the end of the request a load started.
+    struct NetworkRequestEnd {
+        Fetch::Engine::RequestId request_id;
+        u64 total_size { 0 };
+        Optional<Requests::NetworkError> network_error;
+    };
+    using OnComplete = GC::Function<void(bool success, Requests::RequestTimingInfo const& timing_info, Optional<StringView> error_message, Optional<NetworkRequestEnd> const& network_request_end)>;
+
+    // A request keeps roots into the heap of the agent that made it.
+    void stop_all_requests();
 
     RefPtr<Fetch::Engine::NetworkTransportHandle> load(LoadRequest&, GC::Root<OnHeadersReceived>, GC::Root<OnDataReceived>, GC::Root<OnCachedBodyAvailable>, GC::Root<OnComplete>, Requests::RequestClient::TransferLease = Requests::RequestClient::TransferLease::No);
 
@@ -64,9 +79,6 @@ public:
     void preconnect(GC::Ptr<DOM::Document>, URL::URL const&, URL::URL const& source_url);
 
     static bool is_known_hsts_host(Page&, String const& host);
-
-    String const& platform() const { return m_platform; }
-    void set_platform(String platform) { m_platform = move(platform); }
 
     // The engine the navigator claims to be. A process-wide setting, readable before the loader exists: the bindings
     // consult it while they build a realm's global object.
@@ -85,8 +97,8 @@ private:
     };
     template<typename FileHandler, typename ErrorHandler>
     void handle_file_load_request(LoadRequest& request, FileHandler on_file, ErrorHandler on_error);
-    template<typename ResourceHandler, typename ErrorHandler>
-    void handle_about_load_request(LoadRequest const& request, ResourceHandler on_resource, ErrorHandler on_error);
+    template<typename ResourceHandler>
+    void handle_about_load_request(LoadRequest const& request, ResourceHandler on_resource, GC::Ref<GC::Function<void(ByteString const&)>> on_error);
     template<typename ResourceHandler, typename ErrorHandler>
     void handle_resource_load_request(LoadRequest const& request, ResourceHandler on_resource, ErrorHandler on_error);
 
@@ -98,8 +110,7 @@ private:
     HashMap<Utf16String, RefPtr<Requests::RequestClient>> m_site_request_clients;
     HashTable<NonnullRefPtr<Requests::Request>> m_active_requests;
 
-    String m_platform;
-    static NavigatorCompatibilityMode s_navigator_compatibility_mode;
+    static Atomic<NavigatorCompatibilityMode, AK::MemoryOrder::memory_order_relaxed> s_navigator_compatibility_mode;
 };
 
 }

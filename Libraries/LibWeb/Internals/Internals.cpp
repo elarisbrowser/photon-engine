@@ -14,9 +14,8 @@
 #include <AK/Utf16StringBuilder.h>
 #include <LibAudio/ClientConnection.h>
 #include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
-#include <LibCompositing/Scrolling/AsyncScrollTree.h>
-#include <LibCompositing/Scrolling/AsyncScrollingState.h>
 #include <LibCore/EventLoop.h>
+#include <LibCore/System.h>
 #include <LibCore/TimeZone.h>
 #include <LibGC/Heap.h>
 #include <LibGC/RootVector.h>
@@ -54,7 +53,6 @@
 #include <LibWeb/CSS/PseudoElement.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleSheetState.h>
-#include <LibWeb/Compositor/CompositorFrame.h>
 #include <LibWeb/Compositor/CompositorHost.h>
 #include <LibWeb/Compositor/RenderClock.h>
 #include <LibWeb/DOM/Document.h>
@@ -218,107 +216,84 @@ void Internals::force_incompatible_visual_context_tree_rebuild()
     document.schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::VisualContextUpdateScope::FreshTree);
 }
 
-u64 Internals::accumulated_visual_context_incremental_update_count()
+Utf16String Internals::dump_compositor_animations()
 {
     auto& document = window().associated_document();
-    if (!document.has_committed_viewport_box())
-        return 0;
-    return document.paint_state().accumulated_visual_context_tree_incremental_update_count();
+    Layout::ForcedReadScope read { document };
+    struct Context {
+        GC::Ref<CSS::StyleComputer> style_computer;
+        Vector<Utf16String> animations;
+    } context { document.style_computer(), {} };
+    u8 flags = 3;
+    if (document.has_committed_viewport_box()) {
+        flags = Layout::RustFFI::render_state_dump_compositor_animations(document.layout_node_arena().host(), read, Painting::viewport_row_slot(read, document), &context,
+            [](void* raw_context, u8 kind, u32 element) {
+                auto& context = *static_cast<Context*>(raw_context);
+                static constexpr Array kind_names { "opacity"sv, "background-color"sv, "filter"sv, "transform"sv };
+                GC::Ptr<DOM::Element> dom_element;
+                if (element)
+                    dom_element = context.style_computer->element_for_style_node(CSS::StyleNodeID { element });
+                if (dom_element)
+                    context.animations.append(Utf16String::formatted("{} {}", kind_names[kind], dom_element->debug_description()));
+                else
+                    context.animations.append(Utf16String::formatted("{} (no element)", kind_names[kind]));
+            });
+    }
+    quick_sort(context.animations);
+    Utf16StringBuilder builder;
+    for (auto const& animation : context.animations) {
+        builder.append(animation);
+        builder.append_ascii('\n');
+    }
+    if (!context.animations.is_empty() && !(flags & 1))
+        builder.append_ascii("timing anchors differ\n"sv);
+    if (!(flags & 2))
+        builder.append_ascii("an animation drives no live node\n"sv);
+    if (document.compositor_animation_wakeup_timer_is_active())
+        builder.append_ascii("wakeup timer armed\n"sv);
+    if (document.compositor_animation_observation_timer_is_active())
+        builder.append_ascii("observation timer armed\n"sv);
+    return builder.to_string();
 }
 
-u64 Internals::layout_tree_pre_order_label_violation_count()
+Utf16String Internals::dump_visual_context_nodes(DOM::Element& element)
 {
-    // A script reads the render state, which waits for a frame in flight.
-    Layout::ForcedReadScope read { window().associated_document() };
-    auto& document = window().associated_document();
-    return Layout::RustFFI::render_state_pre_order_label_violation_count(
-        document.layout_node_arena().host(), Painting::viewport_row_slot(read, document));
-}
-
-u64 Internals::layout_tree_pre_order_relabel_count()
-{
-    auto& document = window().associated_document();
-    return Layout::RustFFI::render_state_layout_counts(document.layout_node_arena().host()).pre_order_relabels;
-}
-
-u64 Internals::visual_context_tree_node_count()
-{
-    // A script reads the render state, which waits for a frame in flight.
-    Layout::ForcedReadScope read { window().associated_document() };
-    auto& document = window().associated_document();
-    if (!document.has_committed_viewport_box() || !document.paint_state().has_visual_context_tree(read))
-        return 0;
-    auto visual_context_tree = document.paint_state().visual_context_tree(document);
-    return visual_context_tree.live_node_count();
-}
-
-u64 Internals::visual_context_tree_dead_node_count()
-{
-    // A script reads the render state, which waits for a frame in flight.
-    Layout::ForcedReadScope read { window().associated_document() };
-    auto& document = window().associated_document();
-    if (!document.has_committed_viewport_box() || !document.paint_state().has_visual_context_tree(read))
-        return 0;
-    auto visual_context_tree = document.paint_state().visual_context_tree(document);
-    return visual_context_tree.node_count() - visual_context_tree.live_node_count();
-}
-
-u64 Internals::visual_context_tree_structural_epoch()
-{
-    // A script reads the render state, which waits for a frame in flight.
-    Layout::ForcedReadScope read { window().associated_document() };
-    auto& document = window().associated_document();
-    if (!document.has_committed_viewport_box() || !document.paint_state().has_visual_context_tree(read))
-        return 0;
-    return document.paint_state().visual_context_tree(document).structural_epoch();
-}
-
-u64 Internals::visual_context_tree_node_capacity()
-{
-    // A script reads the render state, which waits for a frame in flight.
-    Layout::ForcedReadScope read { window().associated_document() };
-    auto& document = window().associated_document();
-    if (!document.has_committed_viewport_box() || !document.paint_state().has_visual_context_tree(read))
-        return 0;
-    auto visual_context_tree = document.paint_state().visual_context_tree(document);
-    return visual_context_tree.node_count();
-}
-
-GC::Ref<JS::Object> Internals::visual_context_node_indices(DOM::Element& element)
-{
-    auto& realm = window().principal_realm();
     auto& document = window().associated_document();
     Layout::ForcedReadScope read { document };
     document.update_layout(DOM::UpdateLayoutReason::Debugging);
-    document.update_paint_and_hit_testing_properties_if_needed();
     auto const* layout_node = element.layout_node(read);
-    auto owned_indices_as_array = [&](Layout::RustFFI::FfiVisualContextBoxNodeList list) -> GC::Ref<JS::Array> {
-        Vector<u32> indices;
-        if (layout_node)
-            indices = Painting::rust_owned_visual_context_node_indices(*layout_node, list);
-        return JS::Array::create_from<u32>(realm, indices.span(), [](u32 index) { return JS::Value { index }; });
-    };
-    auto object = JS::Object::create(realm, nullptr);
-    object->define_direct_property("spatial"_utf16_fly_string, owned_indices_as_array(Layout::RustFFI::FfiVisualContextBoxNodeList::SpatialNodes), JS::default_attributes);
-    object->define_direct_property("clips"_utf16_fly_string, owned_indices_as_array(Layout::RustFFI::FfiVisualContextBoxNodeList::ClipNodes), JS::default_attributes);
-    object->define_direct_property("effects"_utf16_fly_string, owned_indices_as_array(Layout::RustFFI::FfiVisualContextBoxNodeList::EffectNodes), JS::default_attributes);
-    object->define_direct_property("needsCompositorEffectsLayer"_utf16_fly_string, JS::Value(layout_node && layout_node->needs_compositor_effects_layer()), JS::default_attributes);
-    object->define_direct_property("needsCompositorBackgroundColorFrame"_utf16_fly_string, JS::Value(layout_node && layout_node->needs_compositor_background_color_frame()), JS::default_attributes);
-    Vector<Gfx::Color> background_color_animation_keyframe_colors;
-    if (layout_node) {
-        Layout::BegunRead const& begun_read = read;
-        for (auto effect_node_index : Painting::rust_owned_visual_context_node_indices(*layout_node, Layout::RustFFI::FfiVisualContextBoxNodeList::EffectNodes)) {
-            Layout::RustFFI::render_state_background_color_animation_keyframe_colors(document.layout_node_arena().host(), &begun_read, effect_node_index, &background_color_animation_keyframe_colors, [](void* colors, Gfx::Color color) {
-                static_cast<Vector<Gfx::Color>*>(colors)->append(color);
-            });
-        }
-    }
-    object->define_direct_property("backgroundColorAnimationKeyframes"_utf16_fly_string,
-        JS::Array::create_from<Gfx::Color>(realm, background_color_animation_keyframe_colors.span(), [&](Gfx::Color const& color) {
-            return JS::PrimitiveString::create(realm.vm(), Utf16String::from_utf8(color.to_string()));
-        }),
-        JS::default_attributes);
-    return object;
+    if (!layout_node || !Painting::has_committed_box(*layout_node))
+        return "(no box)"_utf16;
+    struct Context {
+        Layout::BegunRead const& read;
+        GC::Ref<DOM::Document> document;
+        StringBuilder builder;
+    } context { read, document, {} };
+    Layout::RustFFI::render_state_dump_box_visual_context_nodes(layout_node->document_host(), Painting::committed_row_slot(*layout_node), &context,
+        [](void* raw_context, u8 kind, u32 index, u8 const* text, size_t length) {
+            auto& context = *static_cast<Context*>(raw_context);
+            context.builder.appendff("[{}{}] {}", kind == 0 ? 's' : kind == 1 ? 'c'
+                                                                              : 'e',
+                index, StringView { text, length });
+            if (kind == 2) {
+                Vector<Gfx::Color> keyframe_colors;
+                Layout::RustFFI::render_state_background_color_animation_keyframe_colors(context.document->layout_node_arena().host(), &context.read, index, &keyframe_colors, [](void* colors, Gfx::Color color) {
+                    static_cast<Vector<Gfx::Color>*>(colors)->append(color);
+                });
+                if (!keyframe_colors.is_empty()) {
+                    context.builder.append(" keyframes=["sv);
+                    for (size_t i = 0; i < keyframe_colors.size(); ++i)
+                        context.builder.appendff("{}{}", i ? ", "sv : ""sv, keyframe_colors[i].to_string());
+                    context.builder.append(']');
+                }
+            }
+            context.builder.append('\n');
+        });
+    if (layout_node->needs_compositor_effects_layer())
+        context.builder.append("compositor effects layer\n"sv);
+    if (layout_node->needs_compositor_background_color_frame())
+        context.builder.append("compositor background-color frame\n"sv);
+    return Utf16String::from_utf8_without_validation(context.builder.string_view());
 }
 
 void Internals::set_force_dark_enabled(bool enabled)
@@ -356,7 +331,6 @@ void Internals::send_mismatched_visual_context_tree_update_to_compositor()
     // Force a fresh, incompatible rebuild — so the tree is minted with a new structural epoch that the Compositor's installed
     // display list was never recorded against.
     document.schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::VisualContextUpdateScope::FreshTree);
-    document.update_paint_and_hit_testing_properties_if_needed();
 
     // Send a visual-context-tree update carrying that new structural epoch *without* re-recording the display list —
     // deliberately reproducing the peer inconsistency behind issue #10368.
@@ -421,6 +395,11 @@ void Internals::gc()
     window().principal_realm().vm().heap().collect_garbage();
 }
 
+u32 Internals::worker_agent_count() const
+{
+    return Bindings::worker_agent_count();
+}
+
 void Internals::gc_async(GC::Ref<WebIDL::Promise> promise)
 {
     // Queue a LibCore event to run the collection, so that it runs outside the JS execution context with as small a
@@ -476,6 +455,16 @@ bool Internals::initial_paint_had_pending_fonts() const
     return window().associated_document().font_computer().initial_paint_had_pending_fonts();
 }
 
+bool Internals::has_pending_image_loads() const
+{
+    // A shared resource request stays in its fetching state until its image has decoded.
+    for (auto const& it : window().associated_document().shared_resource_requests()) {
+        if (it.value && it.value->is_fetching())
+            return true;
+    }
+    return false;
+}
+
 void Internals::set_font_display_time(CSS::FontFace& font_face, u32 milliseconds)
 {
     font_face.set_font_display_time_for_testing(milliseconds);
@@ -515,14 +504,24 @@ WebIDL::UnsignedLongLong Internals::message_port_pending_outgoing_message_count(
     return port.pending_outgoing_message_count();
 }
 
-WebIDL::UnsignedLongLong Internals::html_collection_cache_generation(DOM::HTMLCollection& collection)
+bool Internals::html_collection_has_valid_cache(DOM::HTMLCollection& collection)
 {
-    return collection.cache_generation_for_testing();
+    return collection.cache_is_valid();
 }
 
 void Internals::fail_next_message_port_transfer(HTML::MessagePort& port)
 {
     port.fail_next_transfer_for_testing();
+}
+
+String Internals::message_port_entanglement_kind(HTML::MessagePort& port)
+{
+    return MUST(String::from_utf8(port.entanglement_kind_for_testing()));
+}
+
+bool Internals::message_port_transport_is_closed(HTML::MessagePort& port)
+{
+    return port.transport_is_closed_for_testing();
 }
 
 bool Internals::message_ports_are_directly_entangled(HTML::MessagePort& first, HTML::MessagePort& second)
@@ -533,7 +532,7 @@ bool Internals::message_ports_are_directly_entangled(HTML::MessagePort& first, H
 GC::Ref<XHR::XMLHttpRequest> Internals::create_xml_http_request_for_document(DOM::Document& document)
 {
     VERIFY(document.window());
-    return XHR::XMLHttpRequest::create(*document.window());
+    return XHR::XMLHttpRequest::create(document.window()->principal_realm());
 }
 
 Optional<Painting::HitTestResult> Internals::hit_test(double x, double y)
@@ -712,6 +711,8 @@ void Internals::grant_transient_activation()
 namespace {
 
 struct MouseEventsTheUIProcessHasNotHandledYet : public RefCounted<MouseEventsTheUIProcessHasNotHandledYet> {
+    GC_HOLDS_NO_CELL_EDGES;
+
     size_t count { 0 };
 };
 
@@ -740,7 +741,7 @@ void Internals::send_mouse_events_through_ui_process(Vector<Web::MouseEvent> eve
     auto unhandled_events = make_ref_counted<MouseEventsTheUIProcessHasNotHandledYet>();
     unhandled_events->count = events.size();
     for (auto& event : events) {
-        page.client().page_did_request_webdriver_mouse_event(local_root_id, move(event), GC::create_function(heap(), [&realm, promise, unhandled_events] {
+        page.client().page_did_request_webdriver_mouse_event(local_root_id, move(event), GC::create_function(heap(), GC::captures(realm, promise, unhandled_events), [](auto& realm, auto& promise, auto& unhandled_events) {
             if (--unhandled_events->count != 0)
                 return;
             HTML::TemporaryExecutionContext execution_context { realm };
@@ -803,17 +804,17 @@ void Internals::perform_actions(Utf16String const& json, GC::Ref<WebIDL::Promise
     let_compositor_take_in_every_rendered_frame(window());
     m_actions_running = true;
     auto executor = WebDriver::dispatch_actions(input_state, actions.release_value(), *window().associated_document().browsing_context(), options,
-        GC::create_function(heap(), [this, promise, realm = GC::Ref { realm }](WebDriver::Response response) {
-            HTML::TemporaryExecutionContext context { *realm };
-            m_actions_running = false;
-            m_actions_executor = {};
+        GC::create_function(heap(), GC::captures(*this, promise, realm), [](auto& self, auto& promise, auto& realm, WebDriver::Response response) {
+            HTML::TemporaryExecutionContext context { realm };
+            self.m_actions_running = false;
+            self.m_actions_executor = {};
             if (response.is_error())
-                WebIDL::reject_promise(*realm, promise, JS::PrimitiveString::create(realm->vm(), Utf16String::from_utf8(response.error().message)));
+                WebIDL::reject_promise(realm, promise, JS::PrimitiveString::create(realm.vm(), Utf16String::from_utf8(response.error().message)));
             else
-                WebIDL::resolve_promise(*realm, promise);
-            if (m_pending_action_test_result.has_value()) {
-                auto text = m_pending_action_test_result.release_value();
-                signal_test_is_done(text);
+                WebIDL::resolve_promise(realm, promise);
+            if (self.m_pending_action_test_result.has_value()) {
+                auto text = self.m_pending_action_test_result.release_value();
+                self.signal_test_is_done(text);
             }
         }));
     if (m_actions_running)
@@ -889,8 +890,7 @@ void Internals::paste(HTML::HTMLElement& target, Utf16String const& text)
 
 void Internals::paste_from_clipboard()
 {
-    if (auto navigable = page().hosted_focused_navigable())
-        navigable->paste_from_clipboard();
+    page().client().page_did_request_paste_from_clipboard_for_testing();
 }
 
 void Internals::commit_text()
@@ -984,11 +984,14 @@ void Internals::wheel(GC::Ref<WebIDL::Promise> promise, double x, double y, doub
             navigable->wait_for_wheel_scrolls(scroll_promises);
     }
     auto& realm = window().principal_realm();
-    auto resolve = [&realm, promise] {
+    auto resolve = GC::create_function(GC::Heap::the(), GC::captures(realm, promise), [](auto& realm, auto& promise) {
         HTML::TemporaryExecutionContext execution_context { realm };
         WebIDL::resolve_promise(realm, promise);
-    };
-    WebIDL::wait_for_all(realm, scroll_promises, [resolve](auto const&) { resolve(); }, [resolve](auto) { resolve(); });
+    });
+    WebIDL::wait_for_all(
+        realm, scroll_promises,
+        GC::create_function(GC::Heap::the(), GC::captures(resolve), [](auto& resolve, Vector<JS::Value> const&) { resolve->function()(); }),
+        GC::create_function(GC::Heap::the(), GC::captures(resolve), [](auto& resolve, JS::Value) { resolve->function()(); }));
 }
 
 void Internals::wheel(double x, double y, double delta_x, double delta_y, bool precise, Bindings::ScrollGesturePhase phase, Bindings::WheelTicks const& ticks, GC::Ref<WebIDL::Promise> promise)
@@ -1060,8 +1063,13 @@ GC::Ref<JS::Object> Internals::compositor_scroll_state(GC::Ptr<DOM::Element> scr
     if (auto navigable = document.navigable(); navigable && navigable->has_compositor_context())
         scroll_state = navigable->compositor_context().scroll_state_for_testing(stretched_scroller);
     auto report = JsonValue::from_string(scroll_state);
-    if (report.is_error() || !report.value().is_object())
-        return scrolling_state_report_to_object(window(), Compositing::async_scrolling_state_to_json({}));
+    if (report.is_error() || !report.value().is_object()) {
+        String empty_scroll_state;
+        Layout::RustFFI::render_state_empty_async_scrolling_state_json(&empty_scroll_state, [](void* receiver, u8 const* bytes, size_t byte_count) {
+            *static_cast<String*>(receiver) = MUST(String::from_utf8(StringView { bytes, byte_count }));
+        });
+        report = JsonValue::from_string(empty_scroll_state);
+    }
     return scrolling_state_report_to_object(window(), report.value().as_object());
 }
 
@@ -1156,7 +1164,8 @@ WebIDL::ExceptionOr<void> Internals::set_clipboard_file(Utf16String const& name,
     HTML::SelectedFile file { name, MUST(ByteBuffer::copy(data_utf8.bytes())) };
     Clipboard::SystemClipboardRepresentation item { move(mime_type_utf8), move(file) };
 
-    page().client().page_did_insert_clipboard_item({ { move(item) } }, "unspecified"sv);
+    // NB: This stands in for another application writing to the clipboard, so no origin wrote it.
+    page().client().page_did_insert_clipboard_item({ { move(item) } }, "unspecified"sv, {});
     return {};
 }
 
@@ -1533,25 +1542,13 @@ void Internals::set_content_blocking_enabled(bool enabled)
     page().set_content_blocking_policy(enabled, {});
 }
 
-WebIDL::UnsignedLongLong Internals::partial_layout_count()
-{
-    return window().associated_document().partial_layout_count();
-}
-
-WebIDL::UnsignedLongLong Internals::full_layout_count()
-{
-    return window().associated_document().full_layout_count();
-}
-
-void Internals::begin_layout_trace()
+void Internals::begin_layout_trace(Bindings::LayoutTraceOptions const& options)
 {
     // A script reads the render state, which waits for a frame in flight.
     Layout::ForcedReadScope read { window().associated_document() };
-    Layout::RustFFI::render_state_begin_layout_trace(window().associated_document().layout_node_arena().host(),
-        [](Layout::RustFFI::DocumentHost const* host, Layout::BegunRead const* read, Compositing::RustFFI::NodeSlotId slot, void* sink, void (*append)(void*, u8 const*, size_t)) {
+    Layout::RustFFI::render_state_begin_layout_trace(window().associated_document().layout_node_arena().host(), [](Layout::RustFFI::DocumentHost const* host, Layout::BegunRead const* read, Compositing::RustFFI::NodeSlotId slot, void* sink, void (*append)(void*, u8 const*, size_t)) {
             auto description = static_cast<Layout::Node const*>(Layout::RustFFI::render_state_node_shell_if_live(host, read, slot))->debug_description();
-            append(sink, description.bytes().data(), description.bytes().size());
-        });
+            append(sink, description.bytes().data(), description.bytes().size()); }, options.tree_builds);
 }
 
 void Internals::update_layout_for_testing()
@@ -1571,14 +1568,6 @@ Utf16String Internals::take_layout_trace()
     return Utf16String::from_utf8_without_validation(builder.string_view());
 }
 
-WebIDL::UnsignedLongLong Internals::accumulated_visual_context_tree_build_count()
-{
-    auto& document = window().associated_document();
-    if (!document.has_committed_viewport_box())
-        return 0;
-    return document.paint_state().accumulated_visual_context_tree_build_count();
-}
-
 void Internals::begin_display_list_trace()
 {
     auto& document = window().associated_document();
@@ -1594,6 +1583,46 @@ Utf16String Internals::take_display_list_trace()
     for (auto const& trace : document.paint_state().take_recording_traces())
         builder.append(trace);
     return Utf16String::from_utf8_without_validation(builder.string_view());
+}
+
+void Internals::begin_visual_context_trace()
+{
+    Layout::RustFFI::render_state_begin_visual_context_trace(window().associated_document().layout_node_arena().host());
+}
+
+Utf16String Internals::take_visual_context_trace()
+{
+    auto& document = window().associated_document();
+    // A script reads the render state, which waits for a frame in flight.
+    Layout::ForcedReadScope read { document };
+    struct Context {
+        GC::Ref<CSS::StyleComputer> style_computer;
+        Utf16StringBuilder builder;
+    } context { document.style_computer(), {} };
+    Layout::RustFFI::render_state_take_visual_context_trace(document.layout_node_arena().host(), read, &context,
+        [](void* raw_context, bool indented, u32 element, u8 const* name, size_t name_length, u8 const* text, size_t text_length) {
+            auto& context = *static_cast<Context*>(raw_context);
+            if (indented)
+                context.builder.append_ascii("  "sv);
+            GC::Ptr<DOM::Element> dom_element;
+            if (element)
+                dom_element = context.style_computer->element_for_style_node(CSS::StyleNodeID { element });
+            if (dom_element)
+                context.builder.appendff("{}", dom_element->debug_description());
+            else
+                context.builder.append_ascii(StringView { name, name_length });
+            context.builder.append_ascii(StringView { text, text_length });
+            context.builder.append_ascii('\n');
+        });
+    return context.builder.to_string();
+}
+
+void Internals::update_visual_contexts_for_testing()
+{
+    auto& document = window().associated_document();
+    Layout::ForcedReadScope read { document };
+    document.update_layout(DOM::UpdateLayoutReason::Debugging);
+    Layout::RustFFI::render_state_prepare_paint_properties_for_testing(document.layout_node_arena().host(), read);
 }
 
 void Internals::begin_input_trace()
@@ -1676,60 +1705,35 @@ GC::Ref<JS::Object> Internals::compositor_wheel_target_at(double x, double y, do
     return first_wheel_step_route_to_object(result.value_or({ .route = { InputRoutingDecision::NoAnswerFromCompositor }, .document_id = {} }));
 }
 
-namespace {
-
-struct RecordedScrollTree {
-    Compositing::AsyncScrollTree scroll_tree;
-    Compositing::AccumulatedVisualContextTree visual_context_tree;
-    Compositing::WheelRoutingAdmission admission;
-};
-
-}
-
-// The scroll tree of the display list the document last recorded, as the compositor builds it once the list reaches it.
-static Optional<RecordedScrollTree> recorded_scroll_tree_of(DOM::Document& document, Layout::BegunRead const& read)
-{
-    auto* display_list = document.paint_state().display_list_used_as_paint_command_cache_source();
-    if (!display_list)
-        return {};
-    RecordedScrollTree recorded {
-        .scroll_tree = {},
-        .visual_context_tree = document.paint_state().visual_context_tree_without_update(read, document),
-        .admission = {},
-    };
-    auto async_scrolling_state = Compositing::async_scrolling_state_from_display_list(*display_list);
-    recorded.admission = Compositing::wheel_routing_admission_for(async_scrolling_state, document.wheel_event_listener_state_generation());
-    recorded.scroll_tree.set_state(move(async_scrolling_state));
-    recorded.scroll_tree.rebuild_wheel_hit_test_targets(display_list, &recorded.visual_context_tree, document.scroll_state_snapshot());
-    return recorded;
-}
-
 GC::Ref<JS::Object> Internals::recorded_display_list_wheel_target_at(double x, double y, double delta_x, double delta_y)
 {
     // A script reads the render state, which waits for a frame in flight.
     Layout::ForcedReadScope read { window().associated_document() };
-    auto recorded = recorded_scroll_tree_of(window().associated_document(), read);
-    if (!recorded.has_value())
-        return first_wheel_step_route_to_object({ .route = { InputRoutingDecision::NoAsyncScrollingState }, .document_id = {} });
-    auto const& scroll_tree = recorded->scroll_tree;
-
+    auto& document = window().associated_document();
     auto position = device_position_as_float_point(page().css_to_device_point({ x, y }));
-    auto delta = Gfx::FloatPoint { static_cast<float>(delta_x), static_cast<float>(delta_y) }.scaled(static_cast<float>(scroll_tree.device_pixels_per_css_pixel()));
-    return first_wheel_step_route_to_object({
-        .route = scroll_tree.route_first_wheel_step(recorded->admission, recorded->visual_context_tree, position, delta),
-        .document_id = scroll_tree.document_id(),
-    });
+    Layout::RustFFI::FfiRecordedFirstWheelStepRoute route {};
+    if (!Layout::RustFFI::render_state_recorded_route_first_wheel_step(document.layout_node_arena().host(), document.wheel_event_listener_state_generation(), position, { static_cast<float>(delta_x), static_cast<float>(delta_y) }, &route))
+        return first_wheel_step_route_to_object({ .route = { InputRoutingDecision::NoAsyncScrollingState }, .document_id = {} });
+    Compositing::FirstWheelStepRouteForTesting result { .route = { static_cast<InputRoutingDecision>(route.decision) }, .document_id = {} };
+    if (route.has_scroller) {
+        result.route.scroller = Web::AsyncScrollNodeStableID {
+            .node_id = Web::UniqueNodeID { route.scroller_node_id },
+            .kind = static_cast<Web::AsyncScrollNodeKind>(route.scroller_kind),
+            .pseudo_element_type = route.scroller_pseudo_element_type,
+        };
+    }
+    if (route.has_document_id)
+        result.document_id = Web::UniqueNodeID { route.document_id };
+    return first_wheel_step_route_to_object(result);
 }
 
 bool Internals::recorded_display_list_blocks_wheel_event_at(double x, double y)
 {
     // A script reads the render state, which waits for a frame in flight.
     Layout::ForcedReadScope read { window().associated_document() };
-    auto recorded = recorded_scroll_tree_of(window().associated_document(), read);
-    if (!recorded.has_value())
-        return false;
+    auto& document = window().associated_document();
     auto position = device_position_as_float_point(page().css_to_device_point({ x, y }));
-    return recorded->scroll_tree.blocks_wheel_event_at_position(recorded->visual_context_tree, position);
+    return Layout::RustFFI::render_state_recorded_blocks_wheel_event_at(document.layout_node_arena().host(), position);
 }
 
 void Internals::record_display_list_for_testing(bool paint_overlay, bool cold)
@@ -1742,7 +1746,7 @@ void Internals::record_display_list_for_testing(bool paint_overlay, bool cold)
     // A recording against a visual context tree built fresh copies nothing from the published one.
     if (cold)
         document.schedule_full_accumulated_visual_context_rebuild(Layout::RustFFI::VisualContextUpdateScope::FreshTree);
-    (void)document.record_display_list(read, HTML::PaintConfig { .paint_overlay = paint_overlay }, document.navigable()->display_list_resource_storage(), Painting::PaintCommandCacheMode::ReadWrite);
+    (void)document.record_display_list(read, HTML::PaintConfig { .paint_overlay = paint_overlay }, Painting::PaintCommandCacheMode::ReadWrite);
 }
 
 void Internals::set_autoplay_policy(Utf16String const& policy)
@@ -2193,10 +2197,9 @@ Utf16String Internals::stacking_context_structure_verification_report()
     document.update_layout(DOM::UpdateLayoutReason::DumpDisplayList);
     if (!document.has_committed_viewport_box())
         return {};
-    document.update_paint_and_hit_testing_properties_if_needed();
     StringBuilder builder;
     Layout::RustFFI::render_state_stacking_context_structure_verification_report(
-        document.layout_node_arena().host(), Painting::viewport_row_slot(read, document), &builder,
+        document.layout_node_arena().host(), read, Painting::viewport_row_slot(read, document), &builder,
         [](void* context, u8 const* bytes, size_t byte_count) {
             static_cast<StringBuilder*>(context)->append(StringView { bytes, byte_count });
         });
@@ -2341,14 +2344,14 @@ bool Internals::restore_captured_session_history_snapshot()
     return window().associated_document().page().client().page_did_request_restore_session_history_snapshot_for_testing();
 }
 
-bool Internals::register_session_store_tab()
+bool Internals::record_reported_session_history()
 {
-    return window().associated_document().page().client().page_did_request_register_session_store_tab_for_testing();
+    return window().associated_document().page().client().page_did_request_record_reported_session_history_for_testing();
 }
 
-Utf16String Internals::dump_session_store_tab_state()
+Utf16String Internals::dump_reported_session_history()
 {
-    return dump_string_to_utf16(window().associated_document().page().client().page_did_request_session_store_tab_state_for_testing());
+    return dump_string_to_utf16(window().associated_document().page().client().page_did_request_reported_session_history_for_testing());
 }
 
 bool Internals::has_populated_document(HTML::HTMLIFrameElement& iframe)
@@ -2372,6 +2375,37 @@ Utf16String Internals::dump_site_isolation_process_tree()
 void Internals::crash_remote_frame_processes()
 {
     window().associated_document().page().client().crash_remote_frame_processes_for_testing();
+}
+
+i32 Internals::web_content_process_id()
+{
+    return Core::System::getpid();
+}
+
+Vector<String> Internals::documents_in_this_process()
+{
+    Vector<String> urls;
+    for (auto const& document : HTML::main_thread_event_loop().documents_in_this_event_loop_matching([](auto const&) { return true; }))
+        urls.append(document->url().serialize());
+    return urls;
+}
+
+bool Internals::is_in_realm_of_destroyed_document(JS::Object& object)
+{
+    // An object in the empty realm, such as the WindowProxy of a navigable that another process hosts, is in the realm
+    // of no document.
+    if (&HTML::relevant_realm(object) == &object.vm().empty_realm())
+        return false;
+
+    auto* window = HTML::window_from_global_object(HTML::relevant_global_object(object));
+    if (!window)
+        return false;
+    return window->associated_document().has_been_destroyed();
+}
+
+void Internals::close_tab_through_ui_process()
+{
+    window().associated_document().page().client().close_tab_for_testing();
 }
 
 void Internals::stop_loading_through_ui_process()
@@ -2408,7 +2442,7 @@ GC::Ref<WebIDL::Promise> Internals::flush_session_history_traversal_queue()
     navigable->page().history_executor().request_history_operation(
         FlushSessionHistoryTraversalQueueOperationParameters {},
         {
-            .on_complete = GC::create_function(heap(), [&realm, promise] {
+            .on_complete = GC::create_function(heap(), GC::captures(realm, promise), [](auto& realm, auto& promise) {
                 HTML::TemporaryExecutionContext execution_context { realm };
                 WebIDL::resolve_promise(promise);
             }),
@@ -2457,9 +2491,8 @@ void Internals::disconnect_virtual_gamepad(GC::Ref<InternalGamepad> gamepad)
 void Internals::perform_per_test_cleanup()
 {
     // Detach any virtual gamepads
-    for (auto gamepad : m_gamepads)
-        gamepad->disconnect();
-    m_gamepads.clear();
+    while (!m_gamepads.is_empty())
+        m_gamepads.take_last()->disconnect();
 
     // Reset gamepad access, so that no test relies on the gamepad use and gestures of an earlier one
     page().client().reset_gamepad_access_for_testing();
@@ -2518,7 +2551,7 @@ GC::Ref<WebIDL::Promise> Internals::request_permission(Utf16String const& name)
     auto& realm = window().principal_realm();
     auto promise = WebIDL::create_promise_for(window());
     auto& settings = window().associated_document().relevant_settings_object();
-    PermissionsAPI::request_permission_with_user_prompt({ name }, settings, GC::create_function(realm.heap(), [&realm, promise](PermissionsAPI::PermissionState state) {
+    PermissionsAPI::request_permission_with_user_prompt({ name }, settings, GC::create_function(realm.heap(), GC::captures(realm, promise), [](auto& realm, auto& promise, PermissionsAPI::PermissionState state) {
         HTML::TemporaryExecutionContext execution_context { realm };
         WebIDL::resolve_promise(realm, promise, JS::PrimitiveString::create(realm.vm(), Bindings::idl_enum_to_string(state)));
     }));
@@ -2532,7 +2565,7 @@ static GC::Ref<WebIDL::Promise> apply_snapshot_then_resolve(HTML::Window& window
     auto promise = WebIDL::create_promise_for(window);
     if (snapshot.has_value())
         PermissionsAPI::PermissionStore::the().apply_snapshot(snapshot.release_value());
-    HTML::queue_global_task(HTML::Task::Source::Permissions, window.associated_document().relevant_settings_object().global_object(), GC::create_function(window.heap(), [&window, promise] {
+    HTML::queue_global_task(HTML::Task::Source::Permissions, window.associated_document().relevant_settings_object().global_object(), GC::create_function(window.heap(), GC::captures(window, promise), [](auto& window, auto& promise) {
         auto& realm = window.principal_realm();
         HTML::TemporaryExecutionContext execution_context { realm };
         WebIDL::resolve_promise(realm, promise);
@@ -2613,11 +2646,6 @@ bool Internals::html_parser_body_is_exhausted(DOM::Document& document)
     return parser && parser->streaming_body_is_exhausted();
 }
 
-u64 Internals::parser_non_append_insertions()
-{
-    return HTML::parser_non_append_insertions();
-}
-
 bool Internals::media_element_is_fetching(HTML::HTMLMediaElement& element)
 {
     return element.is_fetching();
@@ -2643,9 +2671,49 @@ bool Internals::tab_is_heard_playing_audio()
     return window().associated_document().page().client().page_did_request_tab_is_heard_playing_audio_for_testing();
 }
 
-WebIDL::UnsignedLongLong Internals::tab_audibility_change_count()
+bool Internals::tab_is_using_microphone()
 {
-    return window().associated_document().page().client().page_did_request_tab_audibility_change_count_for_testing();
+    return window().associated_document().page().client().page_did_request_tab_is_using_microphone_for_testing();
+}
+
+bool Internals::tab_is_capturing_audio()
+{
+    return window().associated_document().page().client().page_did_request_tab_is_capturing_audio_for_testing();
+}
+
+void Internals::report_audio_capture_of_unknown_page(bool capturing)
+{
+    report_audio_capture_of_page(NumericLimits<u64>::max(), capturing);
+}
+
+WebIDL::UnsignedLongLong Internals::picture_in_picture_window_page_id()
+{
+    auto window = page().picture_in_picture_controller().open_window();
+    VERIFY(window);
+    return window->traversable().active_document()->page().client().id().value();
+}
+
+void Internals::report_audio_capture_of_page(WebIDL::UnsignedLongLong page_id, bool capturing)
+{
+    page().client().page_did_report_audio_capture_for_testing(Web::PageId { page_id }, capturing);
+}
+
+void Internals::retire_picture_in_picture_window()
+{
+    page().client().page_did_retire_picture_in_picture_window_for_testing();
+}
+
+WebIDL::UnsignedLongLong Internals::audio_capture_stream_count()
+{
+    return Audio::ClientConnection::capture_stream_count_for_testing();
+}
+
+Vector<String> Internals::tab_audibility_transitions()
+{
+    Vector<String> transitions;
+    for (auto shown : window().associated_document().page().client().page_did_request_tab_audibility_transitions_for_testing())
+        transitions.append(shown ? "shown"_string : "hidden"_string);
+    return transitions;
 }
 
 bool Internals::media_element_video_sink_is_ticking(HTML::HTMLMediaElement& element)
@@ -2680,50 +2748,6 @@ void Internals::disconnect_audio_server()
 {
     if (auto connection = Audio::ClientConnection::acquire(); !connection.is_error())
         connection.value()->shutdown();
-}
-
-DOM::Document::StyleInvalidationCounters const& Internals::style_invalidation_counters() const
-{
-    return window().associated_document().style_invalidation_counters();
-}
-
-void Internals::reset_style_invalidation_counters()
-{
-    Layout::ForcedReadScope read { window().associated_document() };
-    window().associated_document().reset_style_invalidation_counters(read);
-}
-
-GC::Ref<JS::Object> Internals::get_rendering_scheduler_counters() const
-{
-    auto& realm = HTML::relevant_realm(window());
-    auto const& counters = HTML::main_thread_event_loop().rendering_scheduler_counters();
-    auto object = JS::Object::create(realm, nullptr);
-    object->define_direct_property("updateRequests"_utf16_fly_string, JS::Value(counters.update_requests), JS::default_attributes);
-    object->define_direct_property("coalescedUpdateRequests"_utf16_fly_string, JS::Value(counters.coalesced_update_requests), JS::default_attributes);
-    object->define_direct_property("updateRequestsWhileRendering"_utf16_fly_string, JS::Value(counters.update_requests_while_rendering), JS::default_attributes);
-    object->define_direct_property("opportunitiesReceived"_utf16_fly_string, JS::Value(counters.opportunities_received), JS::default_attributes);
-    object->define_direct_property("opportunitiesThatQueuedATask"_utf16_fly_string, JS::Value(counters.opportunities_that_queued_a_task), JS::default_attributes);
-    object->define_direct_property("watchdogOpportunities"_utf16_fly_string, JS::Value(counters.watchdog_opportunities), JS::default_attributes);
-    object->define_direct_property("updatesRun"_utf16_fly_string, JS::Value(counters.updates_run), JS::default_attributes);
-    object->define_direct_property("updatesSkippedAsUnnecessary"_utf16_fly_string, JS::Value(counters.updates_skipped_as_unnecessary), JS::default_attributes);
-    object->define_direct_property("updateMicroseconds"_utf16_fly_string, JS::Value(counters.update_microseconds), JS::default_attributes);
-    object->define_direct_property("tasksBetweenUpdates"_utf16_fly_string, JS::Value(counters.tasks_between_updates), JS::default_attributes);
-    object->define_direct_property("taskMicrosecondsBetweenUpdates"_utf16_fly_string, JS::Value(counters.task_microseconds_between_updates), JS::default_attributes);
-    object->define_direct_property("postedMessageTasksBetweenUpdates"_utf16_fly_string, JS::Value(counters.posted_message_tasks_between_updates), JS::default_attributes);
-    object->define_direct_property("postedMessageTaskMicrosecondsBetweenUpdates"_utf16_fly_string, JS::Value(counters.posted_message_task_microseconds_between_updates), JS::default_attributes);
-    object->define_direct_property("timerTasksBetweenUpdates"_utf16_fly_string, JS::Value(counters.timer_tasks_between_updates), JS::default_attributes);
-    object->define_direct_property("timerTaskMicrosecondsBetweenUpdates"_utf16_fly_string, JS::Value(counters.timer_task_microseconds_between_updates), JS::default_attributes);
-    object->define_direct_property("networkingTasksBetweenUpdates"_utf16_fly_string, JS::Value(counters.networking_tasks_between_updates), JS::default_attributes);
-    object->define_direct_property("networkingTaskMicrosecondsBetweenUpdates"_utf16_fly_string, JS::Value(counters.networking_task_microseconds_between_updates), JS::default_attributes);
-    object->define_direct_property("domManipulationTasksBetweenUpdates"_utf16_fly_string, JS::Value(counters.dom_manipulation_tasks_between_updates), JS::default_attributes);
-    object->define_direct_property("domManipulationTaskMicrosecondsBetweenUpdates"_utf16_fly_string, JS::Value(counters.dom_manipulation_task_microseconds_between_updates), JS::default_attributes);
-    object->define_direct_property("paints"_utf16_fly_string, JS::Value(counters.paints), JS::default_attributes);
-    return object;
-}
-
-void Internals::reset_rendering_scheduler_counters()
-{
-    HTML::main_thread_event_loop().reset_rendering_scheduler_counters();
 }
 
 static void inject_clock_tick_at_scroll_offset(DOM::Document& document, double frame_time_ms, Layout::RustFFI::FfiScrollOffset const* scroll_offset)
@@ -2880,12 +2904,18 @@ GC::Ptr<Geometry::DOMRect> Internals::presented_border_box(DOM::Element& element
     return Geometry::DOMRect::create(rect.x().to_double(), rect.y().to_double(), rect.width().to_double(), rect.height().to_double());
 }
 
-Optional<u32> Internals::presented_compositor_animation_count(DOM::Element& element)
+Optional<Vector<String>> Internals::presented_compositor_animations(DOM::Element& element)
 {
-    u32 count = 0;
-    if (!element.style_node_id() || !Layout::RustFFI::document_host_presented_compositor_animation_count(element.document().layout_node_arena().host(), element.style_node_id().value(), &count))
+    u32 properties = 0;
+    if (!element.style_node_id() || !Layout::RustFFI::document_host_presented_compositor_animation_properties(element.document().layout_node_arena().host(), element.style_node_id().value(), &properties))
         return {};
-    return count;
+    static constexpr Array property_names { "opacity"sv, "background-color"sv, "filter"sv, "transform"sv };
+    Vector<String> animated;
+    for (size_t index = 0; index < property_names.size(); ++index) {
+        if (properties & (1u << index))
+            animated.append(MUST(String::from_utf8(property_names[index])));
+    }
+    return animated;
 }
 
 Optional<double> Internals::presented_opacity(DOM::Element& element)
@@ -3033,16 +3063,6 @@ void Internals::request_reentrant_animation_style_flush_for_testing(GC::Ref<DOM:
     window().associated_document().request_reentrant_animation_style_flush_for_testing({}, node);
 }
 
-GC::Ref<JS::Object> Internals::layout_tree_build_stats()
-{
-    auto object = JS::Object::create(window().principal_realm(), nullptr);
-    auto counts = window().associated_document().layout_counts();
-    object->define_direct_property("builds"_utf16_fly_string, JS::Value(counts.tree_builds), JS::default_attributes);
-    object->define_direct_property("lastBuildRebuiltSubtreeRoots"_utf16_fly_string, JS::Value(counts.last_tree_build_rebuilt_subtree_roots), JS::default_attributes);
-    object->define_direct_property("lastBuildEscapedRebuildRoots"_utf16_fly_string, JS::Value(counts.last_tree_build_escaped_rebuild_roots), JS::default_attributes);
-    return object;
-}
-
 GC::Ref<JS::Object> Internals::compare_layout_tree_with_full_rebuild()
 {
     auto& document = window().associated_document();
@@ -3074,19 +3094,14 @@ GC::Ref<JS::Object> Internals::compare_layout_tree_with_full_rebuild()
     return object;
 }
 
-GC::Ref<JS::Object> Internals::style_ffi_counters()
+void Internals::request_full_layout_tree_update()
 {
-    auto object = JS::Object::create(window().principal_realm(), nullptr);
-    auto const counter_count = CSS::StyleValueFFI::rust_style_ffi_counter_count();
-    for (size_t index = 0; index < counter_count; ++index) {
-        auto const* name = reinterpret_cast<char const*>(CSS::StyleValueFFI::rust_style_ffi_counter_name(index));
-        auto const value = CSS::StyleValueFFI::rust_style_ffi_counter_value(index);
-        object->define_direct_property(
-            Utf16FlyString::from_utf8(StringView { name, strlen(name) }),
-            JS::Value(static_cast<double>(value)),
-            JS::default_attributes);
-    }
-    return object;
+    window().associated_document().set_needs_full_layout_tree_update();
+}
+
+void Internals::force_parallel_layout()
+{
+    Layout::RustFFI::render_state_force_parallel_layout(window().associated_document().layout_node_arena().host());
 }
 
 GC::Ref<JS::Object> Internals::style_memory_report()
@@ -3165,40 +3180,25 @@ GC::Ref<JS::Object> Internals::style_engine_counters()
             JS::Value(static_cast<double>(value)),
             JS::default_attributes);
     }
+    auto const& statistics = window().associated_document().style_update_statistics();
+    struct NamedStatistic {
+        StringView name;
+        u64 value;
+    };
+    for (auto const& [key, value] : Array<NamedStatistic, 10> {
+             NamedStatistic { "styleEngineReactionBatchRuns"sv, statistics.style_engine_reaction_batch_runs },
+             NamedStatistic { "styleEngineReactionElements"sv, statistics.style_engine_reaction_elements },
+             NamedStatistic { "styleEnginePublishedReactions"sv, statistics.style_engine_published_reactions },
+             NamedStatistic { "styleEngineTransactionSetups"sv, statistics.style_engine_transaction_setups },
+             NamedStatistic { "styleEngineTransactionSetupMicroseconds"sv, statistics.style_engine_transaction_setup_microseconds },
+             NamedStatistic { "styleUpdateMicroseconds"sv, statistics.style_update_microseconds },
+             NamedStatistic { "styleUpdateSubmissionMicroseconds"sv, statistics.style_update_submission_microseconds },
+             NamedStatistic { "styleUpdateBridgeMicroseconds"sv, statistics.style_update_bridge_microseconds },
+             NamedStatistic { "styleUpdateApplyMicroseconds"sv, statistics.style_update_apply_microseconds },
+             NamedStatistic { "styleUpdateRemainderMicroseconds"sv, statistics.style_update_remainder_microseconds },
+         })
+        object->define_direct_property(Utf16FlyString::from_utf8(key), JS::Value(static_cast<double>(value)), JS::default_attributes);
     return object;
-}
-
-u64 Internals::style_record_identity(DOM::Element& element)
-{
-    return element.style_record_identity().value();
-}
-
-u64 Internals::custom_property_environment_identity(DOM::Element& element)
-{
-    return element.installed_style().custom_property_environment();
-}
-
-u64 Internals::layout_style_record_identity(DOM::Element& element)
-{
-    Layout::ForcedReadScope read { element.document() };
-    element.document().update_layout(DOM::UpdateLayoutReason::Debugging);
-    auto const* layout_node = element.layout_node(read);
-    return layout_node ? layout_node->style_record_identity().value() : 0;
-}
-
-u64 Internals::layout_node_identity(DOM::Node& node)
-{
-    Layout::ForcedReadScope read { node.document() };
-    node.document().update_layout(DOM::UpdateLayoutReason::Debugging);
-    auto const* layout_node = node.layout_node(read);
-    return layout_node ? static_cast<u64>(layout_node->arena_slot_index()) + 1 : 0;
-}
-
-u64 Internals::layout_arena_live_slot_count()
-{
-    auto& document = window().associated_document();
-    document.update_layout(DOM::UpdateLayoutReason::Debugging);
-    return Layout::RustFFI::render_state_layout_counts(document.layout_node_arena().host()).live_slots;
 }
 
 void Internals::panic_render_state_for_testing()
@@ -3206,158 +3206,118 @@ void Internals::panic_render_state_for_testing()
     Layout::RustFFI::render_state_panic_for_testing(window().associated_document().layout_node_arena().host());
 }
 
-u64 Internals::layout_arena_shell_count()
-{
-    auto& document = window().associated_document();
-    document.update_layout(DOM::UpdateLayoutReason::Debugging);
-    return Layout::RustFFI::render_state_shell_count(document.layout_node_arena().host());
-}
-
-GC::Ref<JS::Object> Internals::style_cold_pass(bool verify, u32 threads)
+Vector<String> Internals::style_self_check()
 {
     // A script reads the render state, which waits for a frame in flight.
     Layout::ForcedReadScope read { window().associated_document() };
-    auto& realm = window().principal_realm();
-    auto object = JS::Object::create(realm, nullptr);
     auto& document = window().associated_document();
     auto* root = document.document_element();
-    if (!root || root->style_node_id() == 0)
-        return object;
-    auto host = document.style_computer().style_engine().host();
-    auto nanoseconds = CSS::StyleEngineFFI::style_engine_cold_pass(host, read, root->style_node_id(), verify, threads);
-    object->define_direct_property("milliseconds"_utf16_fly_string, JS::Value(static_cast<double>(nanoseconds) / 1'000'000.0), JS::default_attributes);
-    // NB: In the order of the report fields of the Rust style engine.
-    static constexpr Array field_names {
-        "elements"sv,
-        "indexedEntries"sv,
-        "indexNanoseconds"sv,
-        "styleNanoseconds"sv,
-        "threads"sv,
-        "candidates"sv,
-        "bloomRejections"sv,
-        "evaluations"sv,
-        "matches"sv,
-        "winners"sv,
-        "computedElements"sv,
-        "directlyComputedElements"sv,
-        "sharedElements"sv,
-        "reusedElements"sv,
-        "pseudoElements"sv,
-        "differences"sv,
-    };
-    for (u32 index = 0; index < field_names.size(); ++index) {
-        auto value = CSS::StyleEngineFFI::style_engine_cold_pass_report(host, read, index);
-        object->define_direct_property(Utf16FlyString::from_utf8(field_names[index]), JS::Value(static_cast<double>(value)), JS::default_attributes);
-    }
-    return object;
+    Vector<String> lines;
+    CSS::StyleEngineFFI::style_engine_self_check_report(document.style_computer().style_engine().host(), read, root ? root->style_node_id().value() : 0, &lines,
+        [](void* context, u8 const* bytes, size_t length) {
+            static_cast<Vector<String>*>(context)->append(MUST(String::from_utf8(StringView { bytes, length })));
+        });
+    return lines;
 }
 
-GC::Ref<JS::Object> Internals::style_live_report(bool verify)
+void Internals::begin_rendering_trace()
+{
+    HTML::main_thread_event_loop().begin_rendering_trace();
+}
+
+String Internals::take_rendering_trace()
+{
+    return HTML::main_thread_event_loop().take_rendering_trace();
+}
+
+void Internals::begin_style_trace()
 {
     // A script reads the render state, which waits for a frame in flight.
     Layout::ForcedReadScope read { window().associated_document() };
-    auto& realm = window().principal_realm();
-    auto object = JS::Object::create(realm, nullptr);
-    auto& document = window().associated_document();
-    auto* root = document.document_element();
-    if (!root || root->style_node_id() == 0)
-        return object;
-    auto host = document.style_computer().style_engine().host();
-    // NB: In the order of the live report fields of the Rust style engine.
-    static constexpr Array field_names {
-        "passes"sv,
-        "fullPasses"sv,
-        "styledElements"sv,
-        "invalidationNanoseconds"sv,
-        "styleNanoseconds"sv,
-        "verifiedElements"sv,
-        "missingRecords"sv,
-        "differences"sv,
-        "hintedElements"sv,
-        "hintedSubtrees"sv,
-        "changedElements"sv,
-        "invalidationVisits"sv,
-        "invalidationTests"sv,
-        "coldPasses"sv,
-    };
-    for (u32 index = 0; index < field_names.size(); ++index) {
-        auto value = CSS::StyleEngineFFI::style_engine_live_report(host, read, root->style_node_id(), verify && index == 0, index);
-        object->define_direct_property(Utf16FlyString::from_utf8(field_names[index]), JS::Value(static_cast<double>(value)), JS::default_attributes);
-    }
-    return object;
+    (void)CSS::StyleEngineFFI::style_engine_begin_style_trace(window().associated_document().style_computer().style_engine().host(), read);
 }
 
-GC::Ref<JS::Object> Internals::style_counters()
+Utf16String Internals::take_style_trace()
 {
     // A script reads the render state, which waits for a frame in flight.
     Layout::ForcedReadScope read { window().associated_document() };
-    auto& realm = window().principal_realm();
-    auto object = JS::Object::create(realm, nullptr);
-    auto host = window().associated_document().style_computer().style_engine().host();
-    // NB: In the order of StyleCounter in the Rust style engine.
-    static constexpr Array field_names {
-        "passes"sv,
-        "fullPasses"sv,
-        "styledElements"sv,
-        "changedElements"sv,
-        "hintedElements"sv,
-        "hintedSubtrees"sv,
-        "invalidationVisits"sv,
-        "invalidationTests"sv,
-        "coldPasses"sv,
-        "sharedElements"sv,
-        "reusedElements"sv,
-        "indexBuilds"sv,
-        "indexedEntries"sv,
-        "compiledSelectors"sv,
-        "userAgentIndexBuilds"sv,
-        "matchedElements"sv,
-        "relativeWalks"sv,
-    };
-    for (u32 index = 0; index < field_names.size(); ++index) {
-        auto value = CSS::StyleEngineFFI::style_engine_style_counter(host, read, index);
-        object->define_direct_property(Utf16FlyString::from_utf8(field_names[index]), JS::Value(static_cast<double>(value)), JS::default_attributes);
-    }
-    return object;
-}
-
-void Internals::reset_style_counters()
-{
-    // A script reads the render state, which waits for a frame in flight.
-    Layout::ForcedReadScope read { window().associated_document() };
-    (void)CSS::StyleEngineFFI::style_engine_reset_style_counters(window().associated_document().style_computer().style_engine().host(), read);
-}
-
-GC::Ref<JS::Object> Internals::style_last_pass()
-{
-    // A script reads the render state, which waits for a frame in flight.
-    Layout::ForcedReadScope read { window().associated_document() };
-    auto& realm = window().principal_realm();
     auto& document = window().associated_document();
     auto& style_computer = document.style_computer();
     auto host = style_computer.style_engine().host();
-    auto object = JS::Object::create(realm, nullptr);
     auto* root = document.document_element();
     auto root_id = root ? root->style_node_id() : CSS::StyleNodeID {};
-    object->define_direct_property("fullPass"_utf16_fly_string, JS::Value(CSS::StyleEngineFFI::style_engine_last_pass_is_full(host, read)), JS::default_attributes);
-    auto elements = [&](bool changed) {
-        auto array = MUST(JS::Array::create(realm, 0));
-        if (root_id == 0)
-            return array;
-        u32 index = 0;
-        auto size = CSS::StyleEngineFFI::style_engine_last_pass_size(host, read, root_id, changed);
-        for (u32 position = 0; position < size; ++position) {
-            auto element = style_computer.element_for_style_node(CSS::StyleNodeID { CSS::StyleEngineFFI::style_engine_last_pass_element(host, read, root_id, changed, position) });
-            if (!element)
-                continue;
-            auto identity = element->id().has_value() ? *element->id() : element->local_name();
-            MUST(array->create_data_property_or_throw(index++, JS::PrimitiveString::create(vm(), identity)));
+    Utf16StringBuilder builder;
+    HashMap<Utf16String, u32> occurrences_in_pass;
+    auto size = CSS::StyleEngineFFI::style_engine_style_trace_size(host, read, root_id);
+    for (u32 index = 0; index < size; ++index) {
+        auto entry = CSS::StyleEngineFFI::style_engine_style_trace_entry(host, read, root_id, index);
+        auto kind = (entry >> 32) & 0xff;
+        if (kind == 7) {
+            static constexpr Array event_names {
+                "rule index built"sv,
+                "rule index updated"sv,
+                "user agent rule index built"sv,
+                "selectors compiled"sv,
+                "style rules compiled"sv,
+                "sheet declarations interned"sv,
+                "sheet declarations shared"sv,
+            };
+            auto event = (entry >> 40) & 0xff;
+            auto times = entry & 0xffffffff;
+            builder.appendff("  {}", event_names[event - 1]);
+            if (times > 1)
+                builder.appendff(" x{}", times);
+            builder.append_ascii('\n');
+            continue;
         }
-        return array;
-    };
-    object->define_direct_property("styled"_utf16_fly_string, elements(false), JS::default_attributes);
-    object->define_direct_property("changed"_utf16_fly_string, elements(true), JS::default_attributes);
-    return object;
+        if (kind != 4) {
+            occurrences_in_pass.clear();
+            static constexpr Array pass_names { "FULL"sv, "PARTIAL"sv, "COLD"sv, ""sv, "ANIMATION"sv, "PROGRAM"sv };
+            builder.appendff("style {}\n", pass_names[kind - 1]);
+            continue;
+        }
+        auto element = style_computer.element_for_style_node(CSS::StyleNodeID { static_cast<u32>(entry) });
+        if (!element)
+            continue;
+        auto description = element->debug_description();
+        auto occurrence = ++occurrences_in_pass.ensure(description, [] { return 0u; });
+        builder.appendff("  {}", description);
+        if (occurrence > 1)
+            builder.appendff("@{}", occurrence);
+        Vector<StringView, 2> notes;
+        switch ((entry >> 40) & 0xff) {
+        case 1:
+            notes.append("computed"sv);
+            break;
+        case 2:
+            notes.append("shared"sv);
+            break;
+        case 3:
+            notes.append("reused"sv);
+            break;
+        case 4:
+            notes.append("declined"sv);
+            break;
+        case 5:
+            notes.append("kept"sv);
+            break;
+        case 6:
+            notes.append("sampled"sv);
+            break;
+        case 7:
+            notes.append("sampled every group"sv);
+            break;
+        default:
+            break;
+        }
+        if (entry & (1ull << 48))
+            notes.append("changed"sv);
+        if (!notes.is_empty())
+            builder.appendff(" ({})", MUST(String::join(", "sv, notes)));
+        builder.append_ascii('\n');
+    }
+    (void)CSS::StyleEngineFFI::style_engine_end_style_trace(host, read);
+    return builder.to_string();
 }
 
 // Names every rule identity StyleEngine was given, so a disagreement can be reported as the selector
@@ -3483,41 +3443,67 @@ Utf16String Internals::style_engine_matched_rules()
     return builder.to_string();
 }
 
-void Internals::reset_style_ffi_counters()
+Utf16String Internals::dump_style_records(GC::Ptr<DOM::Node> root, Bindings::StyleRecordsDumpOptions const& options)
 {
-    CSS::g_style_ffi_counters_enabled = true;
-    CSS::StyleValueFFI::rust_style_ffi_counters_reset();
-}
-
-GC::Ref<JS::Object> Internals::style_group_sharing_info(DOM::Element& element)
-{
-    auto& realm = HTML::relevant_realm(window());
-    auto object = JS::Object::create(realm, nullptr);
-    auto computed_values = element.computed_style();
-    if (!computed_values)
-        return object;
-    auto parent = element.parent_element();
-    auto parent_values = parent ? parent->computed_style() : CSS::ComputedStyleRecordView {};
-    size_t group_index = 0;
-    computed_values->for_each_style_group_sharing_state(parent_values ? &*parent_values : nullptr, [&](StringView name, bool shared_with_parent, bool is_default) {
-        auto group = JS::Object::create(realm, nullptr);
-        group->define_direct_property("sharedWithParent"_utf16_fly_string, JS::Value(shared_with_parent), JS::default_attributes);
-        group->define_direct_property("isDefault"_utf16_fly_string, JS::Value(is_default), JS::default_attributes);
-        auto* payload = computed_values->style_group_payload(static_cast<CSS::StyleGroupIndex>(group_index++));
-        group->define_direct_property("payloadIdentity"_utf16_fly_string, JS::PrimitiveString::create(vm(), Utf16String::from_utf8(MUST(String::formatted("{:p}", payload)))), JS::default_attributes);
-        object->define_direct_property(Utf16FlyString::from_utf8(name), group, JS::default_attributes);
-    });
-    return object;
-}
-
-GC::Ref<JS::Object> Internals::computed_values_stats()
-{
-    auto& realm = HTML::relevant_realm(window());
-    auto const& statistics = CSS::ComputedValues::statistics();
-    auto object = JS::Object::create(realm, nullptr);
-    object->define_direct_property("liveComputedValues"_utf16_fly_string, JS::Value(statistics.live_instance_count), JS::default_attributes);
-    object->define_direct_property("totalComputedValuesCreated"_utf16_fly_string, JS::Value(statistics.total_instances_created), JS::default_attributes);
-    return object;
+    auto& document = window().associated_document();
+    Layout::ForcedReadScope read { document };
+    if (options.layout)
+        document.update_layout(DOM::UpdateLayoutReason::Debugging);
+    else
+        document.update_style();
+    HashMap<u64, size_t> record_numbers;
+    HashMap<u64, size_t> environment_numbers;
+    HashMap<void const*, size_t> payload_numbers;
+    auto number = [](auto& numbers, auto key) { return numbers.ensure(key, [&] { return numbers.size() + 1; }); };
+    StringBuilder builder;
+    Function<void(DOM::Node const&, size_t)> dump = [&](DOM::Node const& node, size_t depth) {
+        auto const* element = as_if<DOM::Element>(node);
+        if (element) {
+            builder.append_repeated("  "sv, depth);
+            builder.appendff("{}", element->debug_description());
+            auto record = element->style_record_identity().value();
+            if (record == 0)
+                builder.append(" no record"sv);
+            else
+                builder.appendff(" record {}", number(record_numbers, record));
+            if (options.custom_property_environments && record != 0) {
+                auto environment = element->installed_style().custom_property_environment();
+                builder.appendff(" environment {}", environment ? number(environment_numbers, environment) : 0);
+            }
+            if (options.layout) {
+                auto const* layout_node = element->layout_node(read);
+                if (!layout_node)
+                    builder.append(", no box"sv);
+                else if (auto layout_record = layout_node->style_record_identity().value())
+                    builder.appendff(", box record {}", number(record_numbers, layout_record));
+                else
+                    builder.append(", box holds no record"sv);
+            }
+            if (options.groups) {
+                if (auto computed_values = element->computed_style()) {
+                    auto parent = element->parent_element();
+                    auto parent_values = parent ? parent->computed_style() : CSS::ComputedStyleRecordView {};
+                    size_t group_index = 0;
+                    computed_values->for_each_style_group_sharing_state(parent_values ? &*parent_values : nullptr, [&](StringView name, bool shared_with_parent, bool is_default) {
+                        auto const* payload = computed_values->style_group_payload(static_cast<CSS::StyleGroupIndex>(group_index++));
+                        if (shared_with_parent)
+                            builder.appendff(" {}=parent", name);
+                        else if (is_default)
+                            builder.appendff(" {}=default", name);
+                        else
+                            builder.appendff(" {}={}", name, number(payload_numbers, payload));
+                    });
+                }
+            }
+            builder.append('\n');
+            if (auto shadow_root = element->shadow_root())
+                dump(*shadow_root, depth + 1);
+        }
+        for (auto const* child = node.first_child(); child; child = child->next_sibling())
+            dump(*child, element ? depth + 1 : depth);
+    };
+    dump(root ? *root : static_cast<DOM::Node const&>(document), 0);
+    return Utf16String::from_utf8_without_validation(builder.string_view());
 }
 
 void Internals::update_style()
@@ -3576,6 +3562,18 @@ WebIDL::UnsignedLongLong Internals::active_timer_count(JS::Object& object)
     return 0;
 }
 
+Vector<WebIDL::Long> Internals::active_timer_ids(JS::Object& object)
+{
+    if (auto* window_proxy = HTML::WindowProxy::from_object(object)) {
+        if (auto window = window_proxy->window())
+            return window->active_timer_ids({});
+        return {};
+    }
+    if (auto* window = HTML::window_from_global_object(object))
+        return window->active_timer_ids({});
+    return {};
+}
+
 WebIDL::UnsignedLongLong Internals::task_queue_length()
 {
     return HTML::main_thread_event_loop().task_queue().size_slow();
@@ -3589,9 +3587,13 @@ Utf16String Internals::canvas_color_scheme()
     return CSS::preferred_color_scheme_to_utf16_fly_string(document.canvas_color_scheme(read)).to_utf16_string();
 }
 
-u64 Internals::image_request_count(DOM::Document const& document) const
+Vector<String> Internals::image_request_urls(DOM::Document const& document) const
 {
-    return document.shared_resource_requests().size();
+    Vector<String> urls;
+    for (auto const& request : document.shared_resource_requests())
+        urls.append(request.key.url.serialize());
+    quick_sort(urls);
+    return urls;
 }
 
 WebIDL::ExceptionOr<GC::Ref<JS::Object>> Internals::image_animation_state_for_url(Utf16String const& url)
@@ -3657,6 +3659,8 @@ namespace {
 
 // The bytes of a stream from create_stream_pulling_from_bytes() that it has not pulled yet.
 struct UnpulledBytes final : public RefCounted<UnpulledBytes> {
+    GC_HOLDS_NO_CELL_EDGES;
+
     explicit UnpulledBytes(ByteBuffer bytes)
         : bytes(move(bytes))
     {
@@ -3673,7 +3677,7 @@ GC::Ref<Streams::ReadableStream> Internals::create_stream_pulling_from_bytes(Str
     auto stream = Streams::ReadableStream::create(realm);
     auto unpulled = make_ref_counted<UnpulledBytes>(MUST(ByteBuffer::copy(bytes.bytes())));
 
-    auto pull_algorithm = GC::create_function(realm.heap(), [realm = GC::Ref { realm }, stream, unpulled, pull_size] {
+    auto pull_algorithm = GC::create_function(realm.heap(), GC::captures(GC::Ref { realm }, stream, unpulled, pull_size), [](auto& realm, auto& stream, auto& unpulled, auto& pull_size) {
         auto& remaining = unpulled->bytes;
         auto size = min(remaining.size(), static_cast<size_t>(pull_size));
         if (auto view_byte_length = stream->current_byob_request_view_byte_length(); view_byte_length.has_value())
@@ -3781,7 +3785,7 @@ GC::Ref<WebIDL::Promise> Internals::check_spelling_for_testing(Utf16String const
         WebIDL::reject_promise(realm, promise, JS::PrimitiveString::create(vm(), "Spellchecking is unavailable"_utf16));
         return promise;
     }
-    page.request_spell_check(text, GC::create_function(heap(), [&realm, promise](Vector<SpellingError> errors) {
+    page.request_spell_check(text, GC::create_function(heap(), GC::captures(realm, promise), [](auto& realm, auto& promise, Vector<SpellingError> errors) {
         HTML::TemporaryExecutionContext execution_context { realm };
         StringBuilder builder;
         for (auto const& error : errors) {
@@ -3798,7 +3802,7 @@ GC::Ref<WebIDL::Promise> Internals::spell_check_settled()
 {
     auto& realm = window().principal_realm();
     auto promise = WebIDL::create_promise_for(window());
-    page().when_spell_checking_settled(GC::create_function(heap(), [&realm, promise] {
+    page().when_spell_checking_settled(GC::create_function(heap(), GC::captures(realm, promise), [](auto& realm, auto& promise) {
         HTML::TemporaryExecutionContext execution_context { realm };
         WebIDL::resolve_promise(promise);
     }));
@@ -3814,7 +3818,7 @@ GC::Ref<WebIDL::Promise> Internals::translation_settled()
 {
     auto& realm = window().principal_realm();
     auto promise = WebIDL::create_promise_for(window());
-    page().when_translation_settled(GC::create_function(heap(), [&realm, promise] {
+    page().when_translation_settled(GC::create_function(heap(), GC::captures(realm, promise), [](auto& realm, auto& promise) {
         HTML::TemporaryExecutionContext execution_context { realm };
         WebIDL::resolve_promise(promise);
     }));
@@ -3830,7 +3834,7 @@ GC::Ref<WebIDL::Promise> Internals::request_writing_suggestion_for_testing(Utf16
         WebIDL::reject_promise(realm, promise, JS::PrimitiveString::create(vm(), "Writing suggestions are unavailable"_utf16));
         return promise;
     }
-    page.request_writing_suggestion(text, caret_offset, GC::create_function(heap(), [&realm, promise](Optional<WritingSuggestion> suggestion) {
+    page.request_writing_suggestion(text, caret_offset, GC::create_function(heap(), GC::captures(realm, promise), [](auto& realm, auto& promise, Optional<WritingSuggestion> suggestion) {
         HTML::TemporaryExecutionContext execution_context { realm };
         auto result = suggestion.has_value()
             ? Utf16String::formatted("{}-{}:{}", suggestion->replacement_start, suggestion->replacement_length, suggestion->text)
@@ -3858,7 +3862,7 @@ GC::Ref<WebIDL::Promise> Internals::writing_suggestion_settled()
 {
     auto& realm = window().principal_realm();
     auto promise = WebIDL::create_promise_for(window());
-    page().when_writing_suggestions_settled(GC::create_function(heap(), [&realm, promise] {
+    page().when_writing_suggestions_settled(GC::create_function(heap(), GC::captures(realm, promise), [](auto& realm, auto& promise) {
         HTML::TemporaryExecutionContext execution_context { realm };
         WebIDL::resolve_promise(promise);
     }));
@@ -3869,7 +3873,7 @@ GC::Ref<WebIDL::Promise> Internals::writing_suggestion_request_sent()
 {
     auto& realm = window().principal_realm();
     auto promise = WebIDL::create_promise_for(window());
-    page().when_writing_suggestion_requested(GC::create_function(heap(), [&realm, promise] {
+    page().when_writing_suggestion_requested(GC::create_function(heap(), GC::captures(realm, promise), [](auto& realm, auto& promise) {
         HTML::TemporaryExecutionContext execution_context { realm };
         WebIDL::resolve_promise(promise);
     }));
@@ -3893,7 +3897,7 @@ GC::Ref<WebIDL::Promise> Internals::activate_spelling_menu_item(Bindings::Spelli
         }
         VERIFY_NOT_REACHED();
     }();
-    page().request_spelling_menu_action_for_testing(action, guess_index, GC::create_function(heap(), [&realm, promise](String menu) {
+    page().request_spelling_menu_action_for_testing(action, guess_index, GC::create_function(heap(), GC::captures(realm, promise), [](auto& realm, auto& promise, String menu) {
         HTML::TemporaryExecutionContext execution_context { realm };
         WebIDL::resolve_promise(realm, promise, JS::PrimitiveString::create(realm.vm(), Utf16String::from_utf8(menu)));
     }));
@@ -3914,90 +3918,15 @@ GC::Ptr<JS::Object> Internals::hit_test_result(double x, double y)
     return nullptr;
 }
 
-GC::Ref<JS::Object> Internals::style_invalidation_counters_object() const
-{
-    Layout::ForcedReadScope read { window().associated_document() };
-    auto& realm = HTML::relevant_realm(window());
-    auto const& counters = style_invalidation_counters();
-    auto& document = window().associated_document();
-    auto object = JS::Object::create(realm, nullptr);
-    object->define_direct_property("styleEnvironmentVersion"_utf16_fly_string, JS::Value(window().associated_document().style_environment_version()), JS::default_attributes);
-    object->define_direct_property("styleEngineReactionBatchRuns"_utf16_fly_string, JS::Value(counters.style_engine_reaction_batch_runs), JS::default_attributes);
-    object->define_direct_property("styleEngineReactionElements"_utf16_fly_string, JS::Value(counters.style_engine_reaction_elements), JS::default_attributes);
-    object->define_direct_property("styleEnginePublishedReactions"_utf16_fly_string, JS::Value(counters.style_engine_published_reactions), JS::default_attributes);
-    object->define_direct_property("layoutStyleRecordPublications"_utf16_fly_string, JS::Value(counters.layout_style_record_publications), JS::default_attributes);
-    auto animated_style_samples = [&](bool rebuilt_every_group) {
-        return static_cast<double>(CSS::StyleEngineFFI::style_engine_animated_style_samples(document.style_computer().style_engine().host(), read, rebuilt_every_group, false));
-    };
-    object->define_direct_property("animatedStyleOverlayBuilds"_utf16_fly_string, JS::Value(animated_style_samples(false)), JS::default_attributes);
-    object->define_direct_property("animatedStyleFullBuilds"_utf16_fly_string, JS::Value(animated_style_samples(true)), JS::default_attributes);
-    object->define_direct_property("animationFramePumpRequests"_utf16_fly_string, JS::Value(counters.animation_frame_pump_requests), JS::default_attributes);
-    object->define_direct_property("animationStyleSkipCacheHits"_utf16_fly_string, JS::Value(counters.animation_style_skip_cache_hits), JS::default_attributes);
-    object->define_direct_property("animationStyleSkipCacheMisses"_utf16_fly_string, JS::Value(counters.animation_style_skip_cache_misses), JS::default_attributes);
-    object->define_direct_property("animationTimelineSynchronizations"_utf16_fly_string, JS::Value(counters.animation_timeline_synchronizations), JS::default_attributes);
-    object->define_direct_property("animationTimelineAssociatedAnimationUpdates"_utf16_fly_string, JS::Value(counters.animation_timeline_associated_animation_updates), JS::default_attributes);
-    object->define_direct_property("associatedAnimations"_utf16_fly_string, JS::Value(document.associated_animation_count()), JS::default_attributes);
-    object->define_direct_property("compositorVisualAnimationUpdates"_utf16_fly_string, JS::Value(counters.compositor_visual_animation_updates), JS::default_attributes);
-    object->define_direct_property("compositorVisualAnimationTimingAnchorUpdates"_utf16_fly_string, JS::Value(counters.compositor_visual_animation_timing_anchor_updates), JS::default_attributes);
-    object->define_direct_property("compositorKeyframeValueResolutions"_utf16_fly_string, JS::Value(counters.compositor_keyframe_value_resolutions), JS::default_attributes);
-    size_t compositor_visual_animation_count = 0;
-    Optional<double> compositor_visual_animation_local_time_at_anchor;
-    bool compositor_visual_animations_share_timing_anchor = true;
-    bool compositor_visual_animation_targets_are_valid = true;
-    if (document.has_committed_viewport_box() && document.paint_state().has_visual_context_tree(read)) {
-        auto visual_context_tree = document.paint_state().visual_context_tree(document);
-        auto summary = visual_context_tree.visual_animation_summary();
-        compositor_visual_animation_count = summary.count;
-        if (summary.count > 0)
-            compositor_visual_animation_local_time_at_anchor = summary.local_time_at_anchor_ms_of_first;
-        compositor_visual_animations_share_timing_anchor = summary.share_timing_anchor;
-        compositor_visual_animation_targets_are_valid = summary.targets_are_valid;
-    }
-    object->define_direct_property("compositorVisualAnimations"_utf16_fly_string, JS::Value(compositor_visual_animation_count), JS::default_attributes);
-    object->define_direct_property("compositorVisualAnimationLocalTimeAtAnchor"_utf16_fly_string, compositor_visual_animation_local_time_at_anchor.has_value() ? JS::Value(*compositor_visual_animation_local_time_at_anchor) : JS::js_null(), JS::default_attributes);
-    object->define_direct_property("compositorVisualAnimationsShareTimingAnchor"_utf16_fly_string, JS::Value(compositor_visual_animations_share_timing_anchor), JS::default_attributes);
-    object->define_direct_property("compositorVisualAnimationTargetsAreValid"_utf16_fly_string, JS::Value(compositor_visual_animation_targets_are_valid), JS::default_attributes);
-    auto document_timeline_current_time = document.timeline()->current_time();
-    object->define_direct_property("documentTimelineCurrentTime"_utf16_fly_string, document_timeline_current_time.has_value() ? JS::Value(document_timeline_current_time->value) : JS::js_null(), JS::default_attributes);
-    object->define_direct_property("compositorAnimationWakeupTimerActive"_utf16_fly_string, JS::Value(document.compositor_animation_wakeup_timer_is_active()), JS::default_attributes);
-    object->define_direct_property("compositorAnimationObservationTimerActive"_utf16_fly_string, JS::Value(document.compositor_animation_observation_timer_is_active()), JS::default_attributes);
-    object->define_direct_property("longhandWrappersMinted"_utf16_fly_string, JS::Value(CSS::longhand_wrappers_minted()), JS::default_attributes);
-    object->define_direct_property("styleStabilizationEpochs"_utf16_fly_string, JS::Value(counters.style_stabilization_epochs), JS::default_attributes);
-    object->define_direct_property("styleStabilizationFeedbackEpochs"_utf16_fly_string, JS::Value(counters.style_stabilization_feedback_epochs), JS::default_attributes);
-    object->define_direct_property("provisionalStylePasses"_utf16_fly_string, JS::Value(counters.provisional_style_passes), JS::default_attributes);
-    object->define_direct_property("styleStabilizationRoundGuardHits"_utf16_fly_string, JS::Value(counters.style_stabilization_round_guard_hits), JS::default_attributes);
-    object->define_direct_property("compositeOrderDocumentPositionCompares"_utf16_fly_string, JS::Value(counters.composite_order_document_position_compares), JS::default_attributes);
-    object->define_direct_property("styleUpdatePassGuardHits"_utf16_fly_string, JS::Value(counters.style_update_pass_guard_hits), JS::default_attributes);
-    object->define_direct_property("exactStabilizationPasses"_utf16_fly_string, JS::Value(counters.exact_stabilization_passes), JS::default_attributes);
-    object->define_direct_property("styleStabilizationBoundFailures"_utf16_fly_string, JS::Value(counters.style_stabilization_bound_failures), JS::default_attributes);
-    object->define_direct_property("provisionalAnimationEvents"_utf16_fly_string, JS::Value(counters.provisional_animation_events), JS::default_attributes);
-    object->define_direct_property("committedAnimationEvents"_utf16_fly_string, JS::Value(counters.committed_animation_events), JS::default_attributes);
-    object->define_direct_property("provisionalTransitionDecisions"_utf16_fly_string, JS::Value(counters.provisional_transition_decisions), JS::default_attributes);
-    object->define_direct_property("supersededProvisionalTransitionDecisions"_utf16_fly_string, JS::Value(counters.superseded_provisional_transition_decisions), JS::default_attributes);
-    object->define_direct_property("committedTransitionActions"_utf16_fly_string, JS::Value(counters.committed_transition_actions), JS::default_attributes);
-    object->define_direct_property("committedTransitionsStarted"_utf16_fly_string, JS::Value(counters.committed_transitions_started), JS::default_attributes);
-    object->define_direct_property("mediaRuleEvaluations"_utf16_fly_string, JS::Value(counters.media_rule_evaluations), JS::default_attributes);
-    object->define_direct_property("registeredPropertiesCacheRebuilds"_utf16_fly_string, JS::Value(counters.registered_properties_cache_rebuilds), JS::default_attributes);
-    object->define_direct_property("styleQueryContainerScans"_utf16_fly_string, JS::Value(counters.style_query_container_scans), JS::default_attributes);
-    object->define_direct_property("sizeQueryContainerScanVisits"_utf16_fly_string, JS::Value(CSS::StyleEngineFFI::style_engine_size_query_container_scan_visits(document.style_computer().style_engine().host(), read, false)), JS::default_attributes);
-    object->define_direct_property("styleEngineTransactionSetups"_utf16_fly_string, JS::Value(counters.style_engine_transaction_setups), JS::default_attributes);
-    object->define_direct_property("styleEngineTransactionSetupMicroseconds"_utf16_fly_string, JS::Value(counters.style_engine_transaction_setup_microseconds), JS::default_attributes);
-    object->define_direct_property("styleEnginePlanningMicroseconds"_utf16_fly_string, JS::Value(counters.style_update_bridge_microseconds), JS::default_attributes);
-    object->define_direct_property("relayoutsPerformed"_utf16_fly_string, JS::Value(counters.relayouts_performed), JS::default_attributes);
-    object->define_direct_property("styleUpdateMicroseconds"_utf16_fly_string, JS::Value(counters.style_update_microseconds), JS::default_attributes);
-    object->define_direct_property("styleUpdateSubmissionMicroseconds"_utf16_fly_string, JS::Value(counters.style_update_submission_microseconds), JS::default_attributes);
-    object->define_direct_property("styleUpdateBridgeMicroseconds"_utf16_fly_string, JS::Value(counters.style_update_bridge_microseconds), JS::default_attributes);
-    object->define_direct_property("styleUpdateApplyMicroseconds"_utf16_fly_string, JS::Value(counters.style_update_apply_microseconds), JS::default_attributes);
-    object->define_direct_property("styleUpdateRemainderMicroseconds"_utf16_fly_string, JS::Value(counters.style_update_remainder_microseconds), JS::default_attributes);
-    object->define_direct_property("scrollableOverflowRecalculations"_utf16_fly_string, JS::Value(Layout::RustFFI::render_state_scrollable_overflow_recalculation_count(document.layout_node_arena().host(), false)), JS::default_attributes);
-    return object;
-}
-
 GC::Ref<JS::Object> Internals::recorded_async_scrolling_state_object()
 {
-    auto* display_list = window().associated_document().paint_state().display_list_used_as_paint_command_cache_source();
-    auto state = display_list ? Compositing::async_scrolling_state_from_display_list(*display_list) : Compositing::AsyncScrollingState {};
-    return scrolling_state_report_to_object(window(), Compositing::async_scrolling_state_to_json(state));
+    auto& document = window().associated_document();
+    String json;
+    Layout::RustFFI::render_state_recorded_async_scrolling_state_json(document.layout_node_arena().host(), &json, [](void* receiver, u8 const* bytes, size_t byte_count) {
+        *static_cast<String*>(receiver) = MUST(String::from_utf8(StringView { bytes, byte_count }));
+    });
+    auto report = MUST(JsonValue::from_string(json));
+    return scrolling_state_report_to_object(window(), report.as_object());
 }
 
 }

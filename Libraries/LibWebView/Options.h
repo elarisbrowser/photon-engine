@@ -24,6 +24,7 @@ enum class HeadlessMode {
     LayoutTree,
     Text,
     Manual,
+    Terminal,
     Test,
 };
 
@@ -97,6 +98,7 @@ struct BrowserOptions {
     u32 screenshot_delay { 1 };
     int window_width { 800 };
     int window_height { 600 };
+    double device_pixel_ratio { 1.0 };
     NewWindow new_window { NewWindow::No };
     AllowPopups allow_popups { AllowPopups::No };
     DisableScripting disable_scripting { DisableScripting::No };
@@ -148,6 +150,11 @@ enum class EnableMemoryHTTPCache {
     Yes,
 };
 
+enum class ShareProcessBetweenSameOriginTabs {
+    No,
+    Yes,
+};
+
 enum class ExposeExperimentalInterfaces {
     No,
     Yes,
@@ -189,6 +196,7 @@ struct WebContentOptions {
     IsTestMode is_test_mode { IsTestMode::No };
     LogAllJSExceptions log_all_js_exceptions { LogAllJSExceptions::No };
     SiteIsolationMode site_isolation_mode { SiteIsolationMode::IFrame };
+    ShareProcessBetweenSameOriginTabs share_process_between_same_origin_tabs { ShareProcessBetweenSameOriginTabs::Yes };
     EnableMemoryHTTPCache enable_http_memory_cache { EnableMemoryHTTPCache::No };
     ExposeExperimentalInterfaces expose_experimental_interfaces { ExposeExperimentalInterfaces::No };
     ExposeInternalsObject expose_internals_object { ExposeInternalsObject::No };

@@ -17,12 +17,14 @@ ProcessType process_type_from_name(StringView name)
 {
     if (name == "Browser"sv)
         return ProcessType::Browser;
+    if (name == "UI"sv)
+        return ProcessType::UI;
+    if (name == "Hub"sv)
+        return ProcessType::Hub;
     if (name == "Compositor"sv)
         return ProcessType::Compositor;
     if (name == "WebContent"sv)
         return ProcessType::WebContent;
-    if (name == "WebWorker"sv)
-        return ProcessType::WebWorker;
     if (name == "RequestServer"sv)
         return ProcessType::RequestServer;
     if (name == "ImageDecoder"sv)
@@ -45,12 +47,14 @@ StringView process_name_from_type(ProcessType type)
     switch (type) {
     case ProcessType::Browser:
         return "Browser"sv;
+    case ProcessType::UI:
+        return "UI"sv;
+    case ProcessType::Hub:
+        return "Hub"sv;
     case ProcessType::Compositor:
         return "Compositor"sv;
     case ProcessType::WebContent:
         return "WebContent"sv;
-    case ProcessType::WebWorker:
-        return "WebWorker"sv;
     case ProcessType::RequestServer:
         return "RequestServer"sv;
     case ProcessType::ImageDecoder:

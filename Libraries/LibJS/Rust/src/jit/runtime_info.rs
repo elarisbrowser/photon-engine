@@ -18,6 +18,7 @@ use libjs_jit::snapshot::{
     CellId, DynamicCallLayout, Float64FunctionAddresses, HelperCallAddresses, IntrinsicHelpers, RuntimeInfo,
     RuntimeLayout, RuntimeOffsets, TypeofStrings,
 };
+use libjs_runtime_macros::jit_function_address;
 
 use super::allocation::{AllocationInfos, FUNCTION_ENVIRONMENT_FREE_LIST_COUNT};
 use super::entry_table::{JIT_ENTRY_SLOT_MASK, JIT_ENTRY_TABLE_OWNERS_OFFSET};
@@ -31,7 +32,8 @@ use crate::gc::class::{BLOCK_CLASS_OFFSET, BLOCK_CLASS_TAIL_TAG, BLOCK_SIZE, Cla
 use crate::gc::defer_gc::DeferGc;
 use crate::interpreter::runtime_functions::runtime_function_addresses;
 use crate::interpreter::vm::{
-    FLY_STRING_CACHE_SIZE, LARGE_NUMERIC_STRING_CACHE_SIZE, NUMERIC_STRING_CACHE_SIZE, NumericStringCacheEntry, Vm,
+    FLY_STRING_CACHE_SIZE, KEY_CONCATENATION_CACHE_SIZE, KeyConcatenationCacheEntry, LARGE_NUMERIC_STRING_CACHE_SIZE,
+    NUMERIC_STRING_CACHE_SIZE, NumericStringCacheEntry, Vm,
 };
 use crate::layout::accessor::Accessor;
 use crate::layout::cell::Gc;
@@ -122,6 +124,7 @@ fn runtime_offsets() -> RuntimeOffsets {
         execution_context_private_environment: offset(offset_of!(ExecutionContext, private_environment)),
         execution_context_frame_initialized: offset(offset_of!(ExecutionContext, frame_initialized)),
         execution_context_executable: offset(offset_of!(ExecutionContext, executable)),
+        executable_idle_collection_count: offset(offset_of!(ExecutableHead, idle_collection_count)),
         execution_context_slots: offset(size_of::<ExecutionContext>()),
         vm_running_execution_context: offset(offset_of!(VmHead, running_execution_context)),
         vm_jit_native_stack_limit: offset(offset_of!(Vm, jit_native_stack_limit)),
@@ -163,6 +166,11 @@ fn runtime_offsets() -> RuntimeOffsets {
         execution_context_argument_count: offset(offset_of!(ExecutionContext, argument_count)),
         execution_context_returns_to_native_caller: offset(offset_of!(ExecutionContext, returns_to_native_caller)),
         execution_context_runs_jit_code: offset(offset_of!(ExecutionContext, runs_jit_code)),
+        execution_context_caller_is_derived_construct: offset(offset_of!(
+            ExecutionContext,
+            caller_is_derived_construct
+        )),
+        execution_context_new_target: offset(offset_of!(ExecutionContext, new_target)),
         ecmascript_function_environment: offset(ECMASCRIPT_FUNCTION_OBJECT_ENVIRONMENT_OFFSET),
         ecmascript_function_private_environment: offset(offset_of!(
             EcmascriptFunctionObjectWithRareData,
@@ -250,6 +258,12 @@ fn runtime_layout() -> RuntimeLayout {
         typeof_strings: TypeofStrings::default(),
         fly_string_cache: 0,
         fly_string_cache_mask: (FLY_STRING_CACHE_SIZE - 1) as u32,
+        key_concatenation_cache: 0,
+        key_concatenation_cache_mask: (KEY_CONCATENATION_CACHE_SIZE - 1) as u32,
+        key_concatenation_cache_entry_size: size_of::<KeyConcatenationCacheEntry>() as u32,
+        key_concatenation_cache_lhs: offset(offset_of!(KeyConcatenationCacheEntry, lhs)),
+        key_concatenation_cache_rhs: offset(offset_of!(KeyConcatenationCacheEntry, rhs)),
+        key_concatenation_cache_string: offset(offset_of!(KeyConcatenationCacheEntry, string)),
         numeric_string_cache: 0,
         numeric_string_cache_size: NUMERIC_STRING_CACHE_SIZE as u32,
         large_numeric_string_cache: 0,
@@ -481,6 +495,7 @@ pub fn runtime_info(
     layout.keyed_lookup_cache_new_shape = keyed_lookup_cache.new_shape;
     layout.single_ascii_character_strings = vm.single_ascii_character_strings_address();
     layout.fly_string_cache = vm.fly_string_cache().as_ptr().expose_provenance() as u64;
+    layout.key_concatenation_cache = vm.key_concatenation_cache().as_ptr().expose_provenance() as u64;
     layout.numeric_string_cache = vm.numeric_string_cache().as_ptr().expose_provenance() as u64;
     layout.large_numeric_string_cache = vm.large_numeric_string_cache().as_ptr().expose_provenance() as u64;
     let strings = vm.cached_strings();
@@ -498,44 +513,50 @@ pub fn runtime_info(
     let mut info = RuntimeInfo {
         no_htmldda_objects: !vm.jit.htmldda_objects_exist(),
         slow_paths: Arc::clone(&addresses.slow_paths),
-        jit_call: super::calls::libjs_jit_call as *const () as u64,
-        call_forwarding_arguments: super::calls::libjs_jit_call_forwarding_arguments as *const () as u64,
-        finish_direct_call: super::calls::libjs_jit_finish_direct_call as *const () as u64,
+        jit_call: jit_function_address!(super::calls::libjs_jit_call),
+        call_forwarding_arguments: jit_function_address!(super::calls::libjs_jit_call_forwarding_arguments),
+        finish_direct_call: jit_function_address!(super::calls::libjs_jit_finish_direct_call),
+        prepare_construct: jit_function_address!(super::calls::libjs_jit_prepare_construct),
+        construct_result_error: jit_function_address!(super::calls::libjs_jit_construct_result_error),
+        finish_direct_construct: jit_function_address!(super::calls::libjs_jit_finish_direct_construct),
+        construct_stub: 0,
+        construct_this: jit_function_address!(super::calls::libjs_jit_construct_this),
+        throw_call_stack_size_exceeded: jit_function_address!(super::calls::libjs_jit_throw_call_stack_size_exceeded),
         raw_native_exception: addresses.raw_native_exception,
-        push_inlined_call_frames: super::entry_exit::libjs_jit_push_inlined_call_frames as *const () as u64,
-        finish_inlined_direct_call: super::entry_exit::libjs_jit_finish_inlined_direct_call as *const () as u64,
+        push_inlined_call_frames: jit_function_address!(super::entry_exit::libjs_jit_push_inlined_call_frames),
+        finish_inlined_direct_call: jit_function_address!(super::entry_exit::libjs_jit_finish_inlined_direct_call),
         inlined_raw_native_exception: if RAW_NATIVE_FUNCTIONS_RETURN_IN_REGISTERS {
-            super::entry_exit::libjs_jit_inlined_raw_native_exception as *const () as u64
+            jit_function_address!(super::entry_exit::libjs_jit_inlined_raw_native_exception)
         } else {
             0
         },
-        array_push: super::calls::libjs_jit_array_push as *const () as u64,
-        array_splice: super::intrinsics::libjs_jit_array_splice as *const () as u64,
-        store_holey_element: super::calls::libjs_jit_store_holey_element as *const () as u64,
-        slice_arguments: super::calls::libjs_jit_slice_arguments as *const () as u64,
-        open_array_iteration: super::intrinsics::libjs_jit_open_array_iteration as *const () as u64,
+        array_push: jit_function_address!(super::calls::libjs_jit_array_push),
+        array_splice: jit_function_address!(super::intrinsics::libjs_jit_array_splice),
+        store_holey_element: jit_function_address!(super::calls::libjs_jit_store_holey_element),
+        slice_arguments: jit_function_address!(super::calls::libjs_jit_slice_arguments),
+        open_array_iteration: jit_function_address!(super::intrinsics::libjs_jit_open_array_iteration),
         // NB: Filled in by capture_snapshot(), which lists the cells as embedded cells.
         array_iterator_next: None,
         array_iterator_return_watchpoint_set: None,
         array_iterator_next_watchpoint_set_address: None,
         array_iterator_method_watchpoint_set_address: None,
-        jit_exit: super::entry_exit::libjs_jit_exit as *const () as u64,
+        jit_exit: jit_function_address!(super::entry_exit::libjs_jit_exit),
         to_boolean: addresses.to_boolean,
-        primitive_to_string: super::calls::libjs_jit_primitive_to_string as *const () as u64,
+        primitive_to_string: jit_function_address!(super::calls::libjs_jit_primitive_to_string),
         helper_calls: HelperCallAddresses(super::helper_calls::address),
         float64_functions: Float64FunctionAddresses(super::calls::float64_function_address),
-        to_object: super::calls::libjs_jit_to_object as *const () as u64,
-        array_create: super::calls::libjs_jit_array_create as *const () as u64,
+        to_object: jit_function_address!(super::calls::libjs_jit_to_object),
+        array_create: jit_function_address!(super::calls::libjs_jit_array_create),
         intrinsic_helpers: IntrinsicHelpers {
-            has_own_property: super::intrinsics::libjs_jit_has_own_property as *const () as u64,
-            has_property: super::intrinsics::libjs_jit_has_property as *const () as u64,
+            has_own_property: jit_function_address!(super::intrinsics::libjs_jit_has_own_property),
+            has_property: jit_function_address!(super::intrinsics::libjs_jit_has_property),
         },
-        create_arguments: super::entry_exit::libjs_jit_create_arguments as *const () as u64,
+        create_arguments: jit_function_address!(super::entry_exit::libjs_jit_create_arguments),
         object_allocation: allocation.object,
         array_allocation: allocation.array,
         rope_allocation: allocation.rope,
         function_allocation: allocation.function,
-        create_lexical_environment: super::allocation::libjs_jit_create_lexical_environment as *const () as u64,
+        create_lexical_environment: jit_function_address!(super::allocation::libjs_jit_create_lexical_environment),
         realm: CellId(realm.as_ptr() as u64),
         array_prototype: CellId(realm.array_prototype().as_ptr() as u64),
         object_prototype: CellId(realm.object_prototype().as_ptr() as u64),
@@ -551,6 +572,7 @@ pub fn runtime_info(
         dynamic_calls: dynamic_call_layout(vm),
     };
     info.dynamic_calls.call_stub = vm.jit.call_stub(&info);
+    info.construct_stub = vm.jit.construct_stub(&info);
     info
 }
 
@@ -596,7 +618,7 @@ fn dynamic_call_layout(vm: &Vm) -> DynamicCallLayout {
         native_function_table_index_mask: NATIVE_FUNCTION_TABLE_INDEX_MASK,
         native_function_table_entry_size: offset(size_of::<NativeFunctionTableEntry>()),
         native_function_table_entry_function: offset(offset_of!(NativeFunctionTableEntry, function)),
-        prepare_call_environment: super::calls::libjs_jit_prepare_call_environment as *const () as u64,
+        prepare_call_environment: jit_function_address!(super::calls::libjs_jit_prepare_call_environment),
         shared_data_call_environment_template: offset(offset_of!(
             SharedFunctionInstanceData,
             call_environment_template

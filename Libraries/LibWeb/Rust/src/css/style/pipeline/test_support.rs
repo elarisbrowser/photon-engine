@@ -11,7 +11,7 @@
 
 use super::super::bridge::{
     BoundScopeChain, FfiDocumentStyleComputationInputs, FfiFontResolutionRequest, FfiHostHandle, FfiResolvedFont,
-    element_adjustment_fact, publish_rule_declarations, publish_style_rule,
+    element_adjustment_fact, publish_style_rule,
 };
 use super::super::font_resolution::{FontResolverHost, PublishedFontFaces};
 use super::super::*;
@@ -126,7 +126,6 @@ pub(super) fn relations(
 pub(super) fn add_feature(engine: &mut StyleEngine, node: StyleNodeID, feature: LocalFeatureKey) {
     engine.record_input(
         InputKey::LocalFeature(node, feature),
-        InputValue::Feature(FeatureValue::Absent),
         InputValue::Feature(FeatureValue::Present),
     );
 }
@@ -134,7 +133,6 @@ pub(super) fn add_feature(engine: &mut StyleEngine, node: StyleNodeID, feature: 
 pub(super) fn remove_feature(engine: &mut StyleEngine, node: StyleNodeID, feature: LocalFeatureKey) {
     engine.record_input(
         InputKey::LocalFeature(node, feature),
-        InputValue::Feature(FeatureValue::Present),
         InputValue::Feature(FeatureValue::Absent),
     );
 }
@@ -147,7 +145,6 @@ pub(super) fn set_atom_feature(
 ) {
     engine.record_input(
         InputKey::LocalFeature(node, feature),
-        InputValue::Feature(FeatureValue::Absent),
         InputValue::Feature(FeatureValue::Atom(atom)),
     );
 }
@@ -274,7 +271,7 @@ pub(super) fn add_sheet_with_origin(engine: &mut StyleEngine, scope: TreeScopeID
 
 /// A style rule parsed as the host parses a sheet's: its selectors and its declarations.
 pub(super) struct ParsedRule {
-    selectors: Arc<crate::css::selector_parser::RustParsedSelectorList>,
+    selectors: crate::css::selector_parser::RustParsedSelectorList,
     pub(super) declarations: crate::css::declaration_block::SharedDeclarationBlock,
 }
 
@@ -329,7 +326,7 @@ pub(super) fn add_rules(engine: &mut StyleEngine, sheet: SheetID, source: &str) 
         .iter()
         .map(|parsed| {
             let rule = publish_parsed_rule(engine, sheet, parsed);
-            publish_rule_declarations(engine, rule.0 + 1, &parsed.declarations);
+            engine.publish_block_declarations(rule, &parsed.declarations);
             rule
         })
         .collect()
@@ -354,8 +351,9 @@ pub(super) fn add_user_agent_sheet(engine: &mut StyleEngine, source: &str) -> (S
 
 /// Take a style update and every later wave of its pass, as the host does when it installs
 /// each wave; nothing is installed here. The engine, where it owns the document, restyles what
-/// the transaction changed as it does.
+/// the transaction changed as it does. The style trace holds the passes of this update only.
 pub(super) fn run_style_update(engine: &mut StyleEngine, root: StyleNodeID) {
+    engine.retained.live_counters.begin_trace();
     engine.run_style_update(root, |_| {});
 }
 

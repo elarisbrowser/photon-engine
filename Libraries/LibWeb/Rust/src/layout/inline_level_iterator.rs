@@ -83,8 +83,36 @@ fn shaped_glyphs_from(
     shape.with_baseline_start(baseline_start_x).into_glyphs()
 }
 
+/// `glyphs`, the glyphs of a text item past its leading tabs, after a glyph that paints nothing standing for the
+/// `tab_count` tabs and advancing to the tab stop at `tab_advance`, so that the code units of the item's glyphs line up
+/// with those of its text.
+fn glyphs_after_tab_spacer(
+    glyphs: &libgfx_rust::text_layout::GlyphBuffer,
+    tab_count: usize,
+    tab_advance: f32,
+) -> libgfx_rust::text_layout::GlyphBuffer {
+    use libgfx_rust::text_layout::{DrawGlyph, GlyphBuffer, PlacedGlyph};
+    let tab_count_u32 = u32::try_from(tab_count).expect("tab counts fit in 32 bits");
+    let mut with_spacer = GlyphBuffer::default();
+    with_spacer.push_placed(PlacedGlyph {
+        glyph: DrawGlyph::new(tab_advance, 0, tab_count, false),
+        x: 0.0,
+        y: glyphs.placed().next().map_or(0.0, |placed| placed.y),
+        cluster_start: 0,
+        is_rtl: false,
+    });
+    for placed in glyphs.placed() {
+        with_spacer.push_placed(PlacedGlyph {
+            cluster_start: placed.cluster_start + tab_count_u32,
+            ..placed
+        });
+    }
+    with_spacer
+}
+
 fn reshaped_glyph_run(
     text: &[u16],
+    range: std::ops::Range<usize>,
     font: &libgfx_rust::font::FontHandle,
     text_type: u8,
     letter_spacing: f32,
@@ -92,10 +120,11 @@ fn reshaped_glyph_run(
 ) -> OwnedGlyphRun {
     let shape = libgfx_rust::text_layout::shape_text_shared(
         font,
-        text,
+        &text[range.clone()],
         libgfx_rust::text_layout::TextType::try_from(text_type).expect("invalid Gfx::GlyphRun::TextType"),
         letter_spacing,
         word_spacing,
+        text_chunker::joining_context(text, range),
     );
     OwnedGlyphRun {
         glyphs: shape.glyphs().clone(),
@@ -369,7 +398,8 @@ impl Item {
             .unwrap_or_else(|| {
                 let prepared_item = self.prepared_item(prepared);
                 reshaped_glyph_run(
-                    &text[split_offset_in_node..end],
+                    text,
+                    split_offset_in_node..end,
                     prepared.font_of(prepared_item),
                     prepared_item.text_type(),
                     letter_spacing,
@@ -525,7 +555,9 @@ impl Item {
             return None;
         }
 
-        let shape = |text_range: &[u16]| reshaped_glyph_run(text_range, font, text_type, letter_spacing, word_spacing);
+        let shape = |range: std::ops::Range<usize>| {
+            reshaped_glyph_run(text, range, font, text_type, letter_spacing, word_spacing)
+        };
 
         let leading_edge_inline_size = self.margin_start + self.border_start + self.padding_start;
         let prefix_fits = |boundary: usize| {
@@ -535,6 +567,7 @@ impl Item {
                 libgfx_rust::text_layout::TextType::try_from(text_type).expect("invalid Gfx::GlyphRun::TextType"),
                 letter_spacing,
                 word_spacing,
+                text_chunker::joining_context(text, start..boundary),
             );
             leading_edge_inline_size + CssPixels::nearest_value_for_f32(width) <= max_border_box_inline_size
         };
@@ -547,7 +580,7 @@ impl Item {
         }
         let split = boundaries[fitting_count - 1];
 
-        Some(self.take_prefix_before(split, shape(&text[start..split]), shape(&text[split..end])))
+        Some(self.take_prefix_before(split, shape(start..split), shape(split..end)))
     }
 
     pub(crate) fn first_grapheme_cluster_inline_size(
@@ -589,6 +622,7 @@ impl Item {
             libgfx_rust::text_layout::TextType::try_from(run.text_type).expect("invalid Gfx::GlyphRun::TextType"),
             letter_spacing,
             word_spacing,
+            text_chunker::joining_context(text, start..boundary),
         );
         Some(CssPixels::nearest_value_for_f32(width))
     }
@@ -686,6 +720,8 @@ struct InlineContentPreparer<'pass> {
     /// The text of the text node before the current one, when nothing but inline box boundaries and out-of-flow
     /// boxes lies between them.
     previous_text: Option<&'pass [u16]>,
+    /// The text node that `previous_text` comes from, or the atomic inline that it stands for.
+    previous_node: Option<Node>,
     /// Whether the previous text wraps with `word-break: break-all`.
     previous_text_breaks_all: bool,
     /// The number of regional indicators that end the previous text, including any in the text nodes before it.
@@ -699,6 +735,51 @@ struct InlineContentPreparer<'pass> {
 }
 
 impl PreparedInlineContent {
+    fn orders_atomic_items_right_to_left(
+        &self,
+        context: &inline_formatting_context::InlineFormattingContext<'_>,
+    ) -> bool {
+        let style = context.style(context.containing_block);
+        if style.direction() != direction::RTL || style.unicode_bidi() == unicode_bidi::PLAINTEXT {
+            return false;
+        }
+        if self
+            .box_events
+            .iter()
+            .filter_map(InlineBoxEvent::entered_box)
+            .any(|node| {
+                let style = context.style(node);
+                style.unicode_bidi() != unicode_bidi::NORMAL || style.direction() != direction::RTL
+            })
+        {
+            return false;
+        }
+
+        // https://drafts.csswg.org/css-writing-modes-4/#bidi-atomic-inlines
+        // All other atomic inline-level boxes are treated as neutral characters always.
+        // FIXME: Resolve paragraph-wide bidi levels for mixed text and atomic boxes, and for explicit embeddings.
+        let mut has_atomic_box = false;
+        self.items.iter().all(|item| match item.type_() {
+            ItemType::Element => {
+                let facts = context.facts(item.node());
+                if !facts.is_atomic_inline()
+                    || (facts.is_replaced_box()
+                        && matches!(
+                            context.style(item.node()).unicode_bidi(),
+                            unicode_bidi::EMBED | unicode_bidi::BIDI_OVERRIDE | unicode_bidi::ISOLATE_OVERRIDE
+                        ))
+                {
+                    return false;
+                }
+                has_atomic_box = true;
+                true
+            }
+            ItemType::Text => item.has(PreparedItem::TRAILING_WHITESPACE_IS_WHOLE_ITEM),
+            ItemType::ForcedBreak | ItemType::AbsolutelyPositionedElement | ItemType::FloatingElement => true,
+            ItemType::BlockLevelBox | ItemType::InlineEdge => false,
+        }) && has_atomic_box
+    }
+
     pub(super) fn prepare(pass: LayoutPass<'_>, block_container: Node) -> Self {
         InlineContentPreparer::prepare(pass, block_container)
     }
@@ -708,6 +789,7 @@ impl PreparedInlineContent {
         context: &mut inline_formatting_context::InlineFormattingContext<'_>,
         atomic_sizing: AtomicInlineSizing,
     ) -> InlineLevelIterator {
+        context.atomic_items_are_right_to_left = self.orders_atomic_items_right_to_left(context);
         let (entered_box_model_nodes, items) = RunItemResolver {
             context,
             prepared: &self,
@@ -743,6 +825,7 @@ impl<'pass> InlineContentPreparer<'pass> {
             walks_within_item: false,
             previous_chunk_can_break_after: false,
             previous_text: None,
+            previous_node: None,
             previous_text_breaks_all: false,
             previous_text_regional_indicators: 0,
             regional_indicators_before_text: 0,
@@ -763,6 +846,22 @@ impl<'pass> InlineContentPreparer<'pass> {
 
     fn style(&self, node: Node) -> StyleValues<'pass> {
         StyleValues::for_node(&self.pass, node)
+    }
+
+    /// The nearest node that's an ancestor of both `a` and `b`.
+    fn nearest_common_ancestor(&self, a: Node, b: Node) -> Node {
+        let mut ancestor = self.pass.parent(b);
+        while !ancestor.is_invalid() {
+            let mut node = a;
+            while !node.is_invalid() && node != ancestor {
+                node = self.pass.parent(node);
+            }
+            if node == ancestor {
+                return ancestor;
+            }
+            ancestor = self.pass.parent(ancestor);
+        }
+        self.pass.parent(b)
     }
 
     fn facts(&self, node: Node) -> NodeFacts<'pass> {
@@ -820,9 +919,16 @@ impl<'pass> InlineContentPreparer<'pass> {
 
     fn exit_node_with_box_model_metrics(&mut self) {
         self.buffers.box_stack.pop().unwrap();
-        // NB: The walk looks one node ahead, so a box usually ends while its last item is the current node. An inline
-        //     box as the current node has no item of its own, so nothing in the box comes with the next item.
-        let before_item = !self.current_node.is_invalid() && self.facts(self.current_node).is_fragmented_inline();
+        // The walk looks one node ahead, so a box usually ends while its last item is the current node. An inline box
+        // or an empty text node without a caret fragment has no item of its own. Its end edges precede the next item
+        // rather than follow that item's content.
+        let before_item = !self.current_node.is_invalid() && {
+            let facts = self.facts(self.current_node);
+            facts.is_fragmented_inline()
+                || (facts.is_text_node()
+                    && !facts.produces_line_box_fragment_when_empty()
+                    && self.pass.text_content(self.current_node).text.is_empty())
+        };
         let event = InlineBoxEvent::leaving_innermost_box(self.inline_box_event_position(), before_item);
         self.buffers.box_events.push(event);
     }
@@ -1020,6 +1126,7 @@ impl<'pass> InlineContentPreparer<'pass> {
                 };
                 self.code_unit_before_previous_text = self.code_unit_before_text;
                 self.previous_text = Some(text_context.text);
+                self.previous_node = Some(text_node);
                 self.previous_text_breaks_all =
                     text_context.should_wrap_lines && text_context.style.word_break() == word_break::BREAK_ALL;
             }
@@ -1047,7 +1154,7 @@ impl<'pass> InlineContentPreparer<'pass> {
         }
         if text_context.should_respect_linebreaks && chunk.has_breaking_newline {
             self.text_node_context = Some(text_context);
-            return Some(PreparedItem::new(ItemType::ForcedBreak, text_node, 0));
+            return Some(PreparedItem::newline(text_node, chunk.start));
         }
 
         let full_text = text_context.text;
@@ -1056,8 +1163,19 @@ impl<'pass> InlineContentPreparer<'pass> {
         let mut tab_stop = None;
         if chunk.has_breaking_tab {
             let style = text_context.style;
+            // https://drafts.csswg.org/css-text-3/#tab-size-property
+            // "Represents the measure as a multiple of the advance width of the space character (U+0020) of the
+            // nearest block container ancestor of the preserved tab, including its associated letter-spacing and
+            // word-spacing."
+            // NB: That's the space of the block container's first available font, whatever font the tab itself would
+            //     be drawn with. The zeros that set the least distance to a tab stop are of that font too.
+            let text_font = self
+                .style(self.block_container)
+                .font()
+                .first_available_font()
+                .expect("layout read a font group that never received a frozen font list");
             let tab_inline_size = if style.tab_size_is_number() {
-                let space = font.glyph_width(b' ' as u32);
+                let space = text_font.glyph_width(b' ' as u32);
                 CssPixels::nearest_value_for(
                     style.tab_size_number() * (space + text_context.word_spacing + text_context.letter_spacing) as f64,
                 )
@@ -1073,17 +1191,19 @@ impl<'pass> InlineContentPreparer<'pass> {
             tab_stop = Some(PreparedTabStop {
                 tab_count: u32::try_from(tab_count).expect("tab counts fit in 32 bits"),
                 tab_inline_size,
-                zero_advance: font.glyph_width(b'0' as u32),
+                zero_advance: text_font.glyph_width(b'0' as u32),
                 upright_advance: None,
             });
         }
-        let shaped_text = &full_text[shaped_start..shaped_start + shaped_length];
+        let shaped_range = shaped_start..shaped_start + shaped_length;
+        let shaped_text = &full_text[shaped_range.clone()];
         let mut shape = libgfx_rust::text_layout::shape_text_shared(
             font,
             shaped_text,
             libgfx_rust::text_layout::TextType::try_from(text_type).expect("invalid Gfx::GlyphRun::TextType"),
             text_context.letter_spacing,
             text_context.word_spacing,
+            text_chunker::joining_context(full_text, shaped_range),
         );
         let mut flags = 0;
         if !shaped_text.is_empty()
@@ -1122,33 +1242,59 @@ impl<'pass> InlineContentPreparer<'pass> {
             };
             self.code_unit_before_text = self.previous_text.and_then(|text| text.last().copied());
         }
+        // https://drafts.csswg.org/css-text-3/#valdef-white-space-nowrap
+        // "For soft wrap opportunities defined by the boundary between two characters or atomic inlines, the
+        // white-space property on the nearest common ancestor of the two characters controls breaking"
+        // NB: The caret chunk of an empty text node has no characters to break before, so the boundary stays for the
+        //     text after it.
+        let keeps_boundary = text_context.text.is_empty();
+        let previous_node = if keeps_boundary {
+            None
+        } else {
+            self.previous_node.take()
+        };
+        let wraps_at_boundary = match previous_node {
+            Some(previous_node) if is_first_chunk => {
+                self.style(self.nearest_common_ancestor(previous_node, text_node))
+                    .text_wrap_mode()
+                    == text_wrap_mode::WRAP
+            }
+            _ => text_context.should_wrap_lines,
+        };
         if is_first_chunk
             && !can_break_before
+            && !keeps_boundary
             && let Some(previous_text) = self.previous_text.take()
-            && (text_context.should_wrap_lines || self.previous_text_breaks_all)
+            && wraps_at_boundary
         {
-            let style = text_context.style;
-            let line_break_language = if style.line_break() == line_break::LOOSE {
-                self.pass.arena().text_line_break_language(text_node)
+            if previous_node.is_some_and(|node| !self.facts(node).is_text_node()) {
+                can_break_before = text_chunker::soft_wrap_opportunity_after_atomic_inline(&full_text[chunk.start..]);
             } else {
-                text_chunker::LineBreakLanguage::Other
-            };
-            let opportunity_with = |word_break| {
-                text_chunker::soft_wrap_opportunity_between(
-                    previous_text,
-                    &full_text[chunk.start..],
-                    self.code_unit_before_previous_text,
-                    self.regional_indicators_before_text,
-                    word_break,
-                    style.line_break(),
-                    line_break_language,
-                )
-            };
-            can_break_before = (text_context.should_wrap_lines && opportunity_with(style.word_break()))
-                || (self.previous_text_breaks_all && opportunity_with(word_break::BREAK_ALL));
+                let style = text_context.style;
+                let line_break_language = if style.line_break() == line_break::LOOSE {
+                    self.pass.arena().text_line_break_language(text_node)
+                } else {
+                    text_chunker::LineBreakLanguage::Other
+                };
+                let opportunity_with = |word_break| {
+                    text_chunker::soft_wrap_opportunity_between(
+                        previous_text,
+                        &full_text[chunk.start..],
+                        self.code_unit_before_previous_text,
+                        self.regional_indicators_before_text,
+                        word_break,
+                        style.line_break(),
+                        line_break_language,
+                    )
+                };
+                can_break_before = opportunity_with(style.word_break())
+                    || (self.previous_text_breaks_all && opportunity_with(word_break::BREAK_ALL));
+            }
         }
-        self.previous_text = None;
-        self.previous_chunk_can_break_after = chunk.can_break_after;
+        if !keeps_boundary {
+            self.previous_text = None;
+            self.previous_chunk_can_break_after = chunk.can_break_after;
+        }
         if can_break_before {
             flags |= PreparedItem::CAN_BREAK_BEFORE;
         }
@@ -1200,6 +1346,7 @@ impl<'pass> InlineContentPreparer<'pass> {
             }
             if facts.is_break_node() {
                 self.previous_text = None;
+                self.previous_node = None;
                 self.skip_to_next_within_item();
                 return Some(PreparedItem::new(ItemType::ForcedBreak, node, 0));
             }
@@ -1223,10 +1370,23 @@ impl<'pass> InlineContentPreparer<'pass> {
             }
             if facts.is_inline_flow_interrupting_block() {
                 self.previous_text = None;
+                self.previous_node = None;
                 self.skip_to_next_within_item();
                 return Some(PreparedItem::new(ItemType::BlockLevelBox, node, 0));
             }
-            self.previous_text = None;
+            // https://drafts.csswg.org/css-text-3/#line-break-details
+            // "For Web-compatibility there is a soft wrap opportunity before and after each replaced element or other
+            // atomic inline, even when adjacent to a character that would normally suppress them, including U+00A0
+            // NO-BREAK SPACE. However, with the exception of U+00A0 NO-BREAK SPACE, there must be no soft wrap
+            // opportunity between atomic inlines and adjacent characters belonging to the Unicode GL, WJ, or ZWJ line
+            // breaking classes."
+            // NB: The line breaker allows the break before the box, and the text after it looks for the one after it.
+            //     The box stands in the text before that text as U+FFFC OBJECT REPLACEMENT CHARACTER.
+            self.previous_text = Some(&OBJECT_REPLACEMENT_CHARACTER);
+            self.previous_node = Some(node);
+            self.previous_text_breaks_all = false;
+            self.previous_text_regional_indicators = 0;
+            self.code_unit_before_previous_text = None;
             self.skip_to_next_within_item();
             return Some(PreparedItem::new(
                 ItemType::Element,
@@ -1361,7 +1521,7 @@ impl<'context> RunItemResolver<'_, 'context> {
                 return false;
             }
             let mut item = Item::new(ItemType::InlineEdge, edge.node, Item::NOT_RESOLVED_FROM_A_PREPARED_ITEM);
-            if edge.is_low {
+            if edge.is_low != context.atomic_items_are_right_to_left {
                 item.margin_start = edge.margin;
                 item.border_start = edge.border;
                 item.padding_start = edge.padding;
@@ -1398,7 +1558,7 @@ impl<'context> RunItemResolver<'_, 'context> {
         } else {
             (sides.margin_right, sides.border_right, sides.padding_right)
         };
-        let physical = if is_start {
+        let physical = if is_start != self.context().atomic_items_are_right_to_left {
             ExtraBoxMetrics {
                 margin: sides.margin_left,
                 border: sides.border_left,
@@ -1569,6 +1729,7 @@ impl<'context> RunItemResolver<'_, 'context> {
         let prepared = self.prepared;
         let mut inline_offset = 0.0f32;
         let mut upright_advance_after_tabs = None;
+        let mut tab_count = 0;
         if prepared_item.has(PreparedItem::TAB_STOP) {
             let tab_stop = prepared.tab_stops[self.next_tab_stop];
             self.next_tab_stop += 1;
@@ -1585,6 +1746,7 @@ impl<'context> RunItemResolver<'_, 'context> {
             tab_stop_distance = tab_stop_distance * tab_stop.tab_count as usize;
             inline_offset = tab_stop_distance.to_double() as f32;
             upright_advance_after_tabs = tab_stop.upright_advance;
+            tab_count = tab_stop.tab_count as usize;
         }
         let shape = prepared_item.shape();
         let mut width = shape.width();
@@ -1593,6 +1755,8 @@ impl<'context> RunItemResolver<'_, 'context> {
             let mut glyphs = shaped_glyphs_from(shape, inline_offset);
             if let Some(advance) = upright_advance_after_tabs {
                 width = set_glyphs_upright(&mut glyphs, inline_offset, advance);
+            } else if tab_count > 0 {
+                glyphs = glyphs_after_tab_spacer(&glyphs, tab_count, inline_offset);
             }
             owned_glyph_run = Some(Box::new(OwnedGlyphRun {
                 glyphs,
@@ -1670,6 +1834,11 @@ impl<'context> RunItemResolver<'_, 'context> {
                 content_baselines,
                 box_cells: Some(box_cells),
             }));
+        }
+        if self.context().atomic_items_are_right_to_left {
+            std::mem::swap(&mut item.margin_start, &mut item.margin_end);
+            std::mem::swap(&mut item.border_start, &mut item.border_end);
+            std::mem::swap(&mut item.padding_start, &mut item.padding_end);
         }
         self.add_extra_box_model_metrics_to_item(
             &mut item,
@@ -1791,6 +1960,7 @@ impl InlineLevelIterator {
                 )
             });
         if let Some((items, entered_box_model_nodes, prepared)) = shared {
+            context.atomic_items_are_right_to_left = prepared.orders_atomic_items_right_to_left(context);
             for node in entered_box_model_nodes.iter() {
                 lay_out_entered_inline_box(context, *node);
             }
@@ -1859,6 +2029,17 @@ impl InlineLevelIterator {
     /// The content the items were resolved from, which their glyph runs are read against.
     pub(crate) fn prepared_content(&self) -> &PreparedInlineContent {
         &self.prepared
+    }
+
+    /// The <br> or the preserved newline that the forced break `item` stands for.
+    pub(crate) fn forced_break_position(&self, item: &Item) -> inline_content::ForcedBreakPosition {
+        // NB: The item of a preserved newline has no node, so its prepared item cannot be checked against it.
+        let prepared = &self.prepared.items[item.prepared_item_index as usize];
+        debug_assert_eq!(prepared.type_(), ItemType::ForcedBreak);
+        inline_content::ForcedBreakPosition {
+            node: prepared.node(),
+            rendered_offset: prepared.offset_in_node() as u32,
+        }
     }
 
     pub(crate) fn shares_items(&self) -> bool {
@@ -2103,3 +2284,6 @@ fn inline_extent_without_removed_whitespace<'item>(
     }
     extent.unwrap_or_default()
 }
+
+/// What an atomic inline stands for in the text around it when looking for soft wrap opportunities.
+static OBJECT_REPLACEMENT_CHARACTER: [u16; 1] = [0xFFFC];

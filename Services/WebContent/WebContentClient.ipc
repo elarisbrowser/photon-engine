@@ -84,7 +84,7 @@ endpoint WebContentClient routed by Web::PageId page_id
 {
 
     [NotRouted] did_add_blob_url_entry(Web::PageId page_id, Web::HTML::EnvironmentId environment_id, Utf16String url, Web::FileAPI::SerializedBlobURLEntry entry) => (URL::BlobURLEntry::Token token)
-    did_remove_blob_url_entries(Web::PageId page_id, Web::HTML::EnvironmentId environment_id, Vector<Utf16String> urls) => ()
+    [NotRouted] did_remove_blob_url_entries(Web::PageId page_id, Web::HTML::EnvironmentId environment_id, Vector<Utf16String> urls) => ()
     did_request_blob_url_entry(Utf16String url, Optional<URL::BlobURLEntry::Token> token) => (Optional<Web::FileAPI::SerializedBlobURLEntry> entry)
     did_retain_blob_url_token(Web::HTML::CrossProcessId navigable_id, URL::BlobURLEntry::Token token) =|
 
@@ -96,6 +96,7 @@ endpoint WebContentClient routed by Web::PageId page_id
     did_request_navigation_of_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId source_navigable_id, Web::HTML::CrossProcessId source_document_id, Web::HTML::PreparedNavigationDescriptor navigation) =|
     did_post_message_to_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::PostedMessageDescriptor message) =|
     did_report_navigation_violation(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id, u64 policy_index, Web::ContentSecurityPolicy::RemoteViolationDirective directive, bool url_is_https) =|
+    did_report_container_document_navigation_violation(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Utf16String navigation_id, u64 policy_index, Web::ContentSecurityPolicy::RemoteViolationDirective directive, bool url_is_https) =|
     did_request_close_of_traversable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId source_navigable_id, Web::HTML::NavigationSourceSnapshot source_snapshot) =|
     did_request_focusing_steps_for_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::FocusTrigger focus_trigger) =|
     did_request_window_focus_of_navigable(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id) =|
@@ -116,17 +117,14 @@ endpoint WebContentClient routed by Web::PageId page_id
     did_destroy_child_frame(Web::PageId page_id, Web::HTML::CrossProcessId frame_id) =|
     did_finish_loading(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Web::HTML::CrossProcessId document_id) =|
     [NotRouted] did_start_download_without_request(Web::PageId page_id, URL::URL url, ByteString suggested_filename, Optional<u64> total_size) => (Optional<u64> download_id)
-    [NotRouted] did_start_download(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> navigation_id, URL::URL url, ByteString suggested_filename, Optional<u64> total_size, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data, JsonValue network_response) => (Optional<u64> download_id)
+    [NotRouted] did_start_download(Web::PageId page_id, Web::HTML::CrossProcessId navigable_id, Optional<Utf16String> navigation_id, URL::URL url, ByteString suggested_filename, Optional<u64> total_size, HTTP::Cookie::SameSiteContext same_site_context, int request_server_client_id, u64 request_server_request_id, ByteBuffer initial_data, JsonValue network_response) => (Optional<u64> download_id)
     did_receive_download_data(Web::PageId page_id, u64 download_id, ByteBuffer data) =|
     did_finish_download(Web::PageId page_id, u64 download_id) =|
     did_fail_download(Web::PageId page_id, u64 download_id, String error) =|
-    did_request_refresh(Web::PageId page_id) =|
     did_request_cursor_change(Web::PageId page_id, Gfx::Cursor cursor) =|
     did_change_title(Web::PageId page_id, Utf16String title) =|
     did_update_editing_history_state(Web::PageId page_id, bool can_undo, bool can_redo) =|
     did_set_text_fragment_indication_visibility(Web::PageId page_id, bool visible) =|
-    did_request_tooltip_override(Web::PageId page_id, Gfx::IntPoint position, ByteString title) =|
-    did_stop_tooltip_override(Web::PageId page_id) =|
     did_enter_tooltip_area(Web::PageId page_id, ByteString title) =|
     did_leave_tooltip_area(Web::PageId page_id) =|
     did_hover_link(Web::PageId page_id, URL::URL url) =|
@@ -197,7 +195,6 @@ endpoint WebContentClient routed by Web::PageId page_id
     [NotRouted] did_request_cookie(Web::PageId page_id, Optional<Web::HTML::EnvironmentId> environment_id, URL::URL url, HTTP::Cookie::Source source) => (HTTP::Cookie::VersionedCookie cookie)
     did_set_cookie(Web::PageId page_id, Optional<Web::HTML::EnvironmentId> environment_id, URL::URL url, HTTP::Cookie::ParsedCookie cookie, HTTP::Cookie::Source source) => ()
     did_update_cookie(HTTP::Cookie::Cookie cookie) =|
-    [NotRouted] did_update_managed_heap_bytes(u64 bytes) =|
     did_request_delete_all_cookies(Web::PageId page_id, u64 request_id, URL::URL url) =|
 
     did_is_known_hsts_host(String domain) => (bool result)
@@ -206,6 +203,8 @@ endpoint WebContentClient routed by Web::PageId page_id
     request_media_server_connection() => (Optional<IPC::TransportHandle> handle)
     request_audio_server_connection() => (Optional<IPC::TransportHandle> handle)
     request_webrtc_client_connection() => (Optional<IPC::TransportHandle> handle)
+    request_image_decoder_connection() => (Optional<IPC::TransportHandle> handle)
+    did_release_image_decoder() =|
     request_video_presentation_channel() =|
 
     [NotRouted] did_request_storage_usage(Web::PageId page_id, Web::HTML::EnvironmentId environment_id) => (u64 usage)
@@ -223,6 +222,7 @@ endpoint WebContentClient routed by Web::PageId page_id
     did_complete_close_preflight(Web::PageId page_id, u64 request_id, bool approved) =|
     did_change_needs_beforeunload_check(Web::PageId page_id, bool needs_beforeunload_check) =|
     did_consume_user_activation(Web::PageId page_id, Web::HTML::UserActivationConsumption consumption) =|
+    did_notify_about_user_activation(Web::PageId page_id, Web::HTML::CrossProcessId document_id) =|
     webdriver_user_prompt_handling_complete(Web::PageId page_id, u64 request_id, Web::WebDriver::Response response) =|
     webdriver_did_set_current_browsing_context(Web::PageId page_id, u64 command_id, Web::HTML::CrossProcessId navigable_id) =|
     webdriver_command_complete(Web::PageId page_id, u64 command_id, Web::WebDriver::Response response) =|
@@ -264,8 +264,10 @@ endpoint WebContentClient routed by Web::PageId page_id
     did_change_theme_color(Web::PageId page_id, Gfx::Color color) =|
     did_change_background_color(Web::PageId page_id, Gfx::Color color) =|
 
-    did_insert_clipboard_item(Web::PageId page_id, Web::Clipboard::SystemClipboardItem item, String presentation_style) =|
-    did_request_clipboard_entries(Web::PageId page_id, u64 request_id) =|
+    did_insert_clipboard_item(Web::PageId page_id, Web::Clipboard::SystemClipboardItem item, String presentation_style, Optional<Web::HTML::CrossProcessId> writing_document_id) =|
+    did_request_clipboard_entries_for_paste(Web::PageId page_id, u64 request_id) =|
+    did_request_clipboard_entries(Web::PageId page_id, u64 request_id, Web::HTML::CrossProcessId reading_document_id) =|
+    did_request_paste_from_clipboard_for_testing(Web::PageId page_id) =|
     did_request_spell_check(Web::PageId page_id, u64 request_id, Utf16String text) =|
     did_request_writing_suggestion(Web::PageId page_id, u64 request_id, Utf16String text, u32 caret_offset) =|
     did_get_translation_language_sample(Web::PageId page_id, u64 request_id, Web::TranslationLanguageSample sample) =|
@@ -325,9 +327,7 @@ endpoint WebContentClient routed by Web::PageId page_id
 
     did_find_in_page(Web::PageId page_id, size_t current_match_index, Optional<size_t> total_match_count) =|
 
-    [NotRouted] start_worker_agent(Web::PageId page_id, Web::HTML::WorkerAgentStartRequest request) => (Web::HTML::WorkerAgentId agent_id)
-    close_worker_agent(Web::PageId page_id, Web::HTML::WorkerAgentId agent_id, Web::HTML::WorkerAgentOwnerToken owner_token) =|
-    rtc_transform_init(Web::PageId page_id, Web::HTML::WorkerAgentId agent_id, u64 transform_id, Web::HTML::SerializedTransferRecord options_record) =|
-    rtc_transform_teardown(Web::PageId page_id, Web::HTML::WorkerAgentId agent_id, u64 transform_id) =|
-    rtc_transform_encoded_audio_frame(Web::PageId page_id, Web::HTML::WorkerAgentId agent_id, u64 transform_id, ByteBuffer payload, u32 ssrc, u8 payload_type, u32 rtp_timestamp, u16 sequence_number) =|
+    [NotRouted] start_worker_agent(Web::PageId page_id, Web::HTML::WorkerAgentStartRequest request) => (Web::HTML::WorkerAgentId agent_id, Optional<IPC::TransportHandle> thread_transport, bool is_hosted_in_caller_process)
+    [NotRouted] close_worker_agent(Web::PageId page_id, Web::HTML::WorkerAgentId agent_id, Web::HTML::WorkerAgentOwnerToken owner_token) =|
+    [NotRouted] register_dedicated_worker(Web::PageId page_id, Web::HTML::WorkerAgentStartRequest request, IPC::TransportHandle worker_transport) =|
 }

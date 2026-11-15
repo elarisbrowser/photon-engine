@@ -181,7 +181,6 @@ TEST_CASE(members_hash_like_pointers)
 class TestVisitor : public GC::Cell::Visitor {
     virtual void visit_impl(GC::Cell& cell) override { visited_cells.append(&cell); }
     virtual void visit_impl(ReadonlySpan<GC::NanBoxedValue>) override { }
-    virtual void visit_possible_values(ReadonlyBytes) override { }
 
 public:
     Vector<GC::Cell*> visited_cells;
@@ -243,11 +242,12 @@ private:
 GC_DEFINE_ALLOCATOR(FinalizationTrackingCell);
 
 // Keeps nothing on the stack that points at the cell the function captures, other than the root of the function.
-template<typename MakeCallable>
-static NEVER_INLINE GC::Root<GC::Function<size_t()>> make_function_capturing_a_member(bool& finalized, MakeCallable make_callable)
+static NEVER_INLINE GC::Root<GC::Function<size_t()>> make_function_capturing_a_member(bool& finalized)
 {
     GC::Member<FinalizationTrackingCell> member = test_heap().allocate<FinalizationTrackingCell>(finalized);
-    return GC::make_root(GC::create_function(test_heap(), make_callable(member)));
+    return GC::make_root(GC::create_function(test_heap(), GC::captures(member), [](GC::Ptr<FinalizationTrackingCell>& cell) {
+        return reinterpret_cast<size_t>(cell.ptr());
+    }));
 }
 
 static NEVER_INLINE void clobber_the_stack()
@@ -257,118 +257,18 @@ static NEVER_INLINE void clobber_the_stack()
         byte = 0;
 }
 
-TEST_CASE(function_whose_only_capture_is_a_member_keeps_its_cell_alive)
+TEST_CASE(function_capturing_a_member_keeps_its_cell_alive)
 {
     // NB: Static, since the cell outlives the test once nothing holds it anymore.
     static bool finalized;
     finalized = false;
-    auto function = make_function_capturing_a_member(finalized, [](GC::Member<FinalizationTrackingCell> member) {
-        auto callable = [member] { return reinterpret_cast<size_t>(member.ptr()); };
-        static_assert(sizeof(callable) == sizeof(u32));
-        return callable;
-    });
+    auto function = make_function_capturing_a_member(finalized);
     clobber_the_stack();
 
     test_heap().collect_garbage(GC::Heap::CollectionType::CollectGarbage);
 
     EXPECT(!finalized);
     EXPECT_NE(function->function()(), 0u);
-}
-
-TEST_CASE(function_whose_captures_end_in_a_member_keeps_its_cell_alive)
-{
-    // NB: Static, since the cell outlives the test once nothing holds it anymore.
-    static bool finalized;
-    finalized = false;
-    auto function = make_function_capturing_a_member(finalized, [](GC::Member<FinalizationTrackingCell> member) {
-        auto callable = [first = static_cast<u32>(1), second = static_cast<u32>(2), member] {
-            return reinterpret_cast<size_t>(member.ptr()) + first + second;
-        };
-        // NB: The member is past the last whole word of the captures.
-        static_assert(sizeof(callable) == 3 * sizeof(u32));
-        return callable;
-    });
-    clobber_the_stack();
-
-    test_heap().collect_garbage(GC::Heap::CollectionType::CollectGarbage);
-
-    EXPECT(!finalized);
-    EXPECT_NE(function->function()(), 0u);
-}
-
-// Walks a list of cells through compressed pointers, decoding them against the base copy or against the base exported
-// from LibGC. The opaque call per cell keeps the compiler from hoisting the base out of the loop, as an ordinary DOM
-// walk with calls in its body would.
-static NEVER_INLINE void touch(TestCell& cell)
-{
-    cell.value += 1;
-    asm volatile("" ::: "memory");
-}
-
-static GC::Root<TestCell> const& benchmark_list()
-{
-    static GC::Root<TestCell> head = [] {
-        auto head = GC::make_root(test_heap().allocate<TestCell>());
-        GC::Ptr<TestCell> tail = head.ptr();
-        for (size_t i = 0; i < 100'000; ++i) {
-            auto cell = test_heap().allocate<TestCell>();
-            tail->next = cell;
-            tail = cell;
-        }
-        return head;
-    }();
-    return head;
-}
-
-template<typename LoadBase>
-static NEVER_INLINE void walk_benchmark_list(LoadBase load_base)
-{
-    auto* head = benchmark_list().ptr();
-    for (size_t round = 0; round < 1000; ++round) {
-        for (auto* cell = head; cell;) {
-            touch(*cell);
-            auto compressed = cell->next.compressed();
-            cell = compressed ? reinterpret_cast<TestCell*>(GC::decompress_nonnull(compressed, load_base())) : nullptr;
-        }
-    }
-}
-
-// The same walk, with the decode in a function of its own, so it loads the base (and its address) on every call.
-template<typename LoadBase>
-static NEVER_INLINE TestCell* next_cell(TestCell& cell, LoadBase load_base)
-{
-    auto compressed = cell.next.compressed();
-    return compressed ? reinterpret_cast<TestCell*>(GC::decompress_nonnull(compressed, load_base())) : nullptr;
-}
-
-template<typename LoadBase>
-static NEVER_INLINE void walk_benchmark_list_out_of_line(LoadBase load_base)
-{
-    auto* head = benchmark_list().ptr();
-    for (size_t round = 0; round < 1000; ++round) {
-        for (auto* cell = head; cell; cell = next_cell(*cell, load_base))
-            touch(*cell);
-    }
-}
-
-BENCHMARK_CASE(walk_members_out_of_line_with_exported_base)
-{
-    walk_benchmark_list_out_of_line([] { return js_heap_region_base; });
-}
-
-BENCHMARK_CASE(walk_members_out_of_line_with_base_copy)
-{
-    walk_benchmark_list_out_of_line([] { return GC::heap_region_base(); });
-}
-
-BENCHMARK_CASE(walk_members_with_base_copy)
-{
-    walk_benchmark_list([] { return GC::heap_region_base(); });
-}
-
-BENCHMARK_CASE(walk_members_with_exported_base)
-{
-    walk_benchmark_list([] { return js_heap_region_base; });
 }
 
 }

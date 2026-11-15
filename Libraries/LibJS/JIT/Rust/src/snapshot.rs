@@ -140,6 +140,36 @@ pub struct ExecutableSnapshot {
     /// The global variables of the executable's realm that its `GetGlobal`
     /// and `SetGlobal` instructions access, if code may access them directly.
     pub globals: Option<GlobalsSnapshot>,
+    /// For a derived constructor among the inlining candidates whose
+    /// constructs JIT code can inline (see `ConstructTarget`): what its
+    /// super() constructs with.
+    pub super_constructor: Option<SuperConstructTarget>,
+    /// Whether the function is a class constructor with instance fields or
+    /// private methods, which InitializeInstanceElements adds to `this`.
+    pub has_instance_elements: bool,
+    /// For a base constructor with instance elements among the inlining
+    /// candidates whose constructs JIT code can inline: the values its
+    /// fields give `this`, by property offset, in the order
+    /// InitializeInstanceElements defines them. `this` is created with the
+    /// shape it has after that (see `ConstructTarget::this_shape`).
+    pub literal_instance_fields: Option<Vec<(u32, u64)>>,
+    /// For a derived constructor with instance elements among the inlining
+    /// candidates whose constructs JIT code can inline: its fields, if they
+    /// can be added to `this` like literal fields of a base constructor,
+    /// starting from the shape `this` always had there so far.
+    pub derived_instance_fields: Option<DerivedInstanceFields>,
+}
+
+/// The fields InitializeInstanceElements defines on `this` of a derived
+/// constructor, which only has fields with string or symbol names and
+/// literal initial values: from `shape`, which must not have their names
+/// and allows extensions, in order, the property offset of each field, its
+/// value, and the shape `this` gets if the field adds the property (the
+/// same one as an earlier field otherwise).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DerivedInstanceFields {
+    pub shape: CellId,
+    pub fields: Vec<(u32, u64, Option<CellId>)>,
 }
 
 /// The global object and the global declarative environment of a realm, and
@@ -203,6 +233,9 @@ pub struct GlobalValueSnapshot {
     pub cell: Option<CellId>,
     /// Which intrinsic the value is, if it is one the compiler knows.
     pub intrinsic: Option<Intrinsic>,
+    /// The snapshot executable of the value, if it is a function whose
+    /// calls JIT code may inline.
+    pub inline_executable: Option<u32>,
     /// How `instanceof` with the value on its right-hand side runs, if the
     /// value is a function that inherits `%Function.prototype%`'s
     /// `@@hasInstance` (which can never change): OrdinaryHasInstance with its
@@ -292,6 +325,23 @@ pub struct InlinedFunctionSnapshot {
     /// The function's `SharedFunctionInstanceData`, which all closures of
     /// the same function share.
     pub shared_data: CellId,
+    /// What `super` property access in the function resolves its base to,
+    /// if JIT code can tell (see `SuperBaseSnapshot`).
+    pub super_base: Option<SuperBaseSnapshot>,
+    /// Whether the function has a new.target of its own, which an arrow
+    /// function does not have.
+    pub has_own_new_target: bool,
+}
+
+/// The [[HomeObject]] of a method, an ordinary object with a shape that is
+/// not a dictionary, so that its prototype, the base of `super` property
+/// access in the method, stays `prototype` while it has `home_shape`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SuperBaseSnapshot {
+    pub home: CellId,
+    pub home_shape: CellId,
+    /// The prototype, or None for null.
+    pub prototype: Option<CellId>,
 }
 
 // NB: The bits of the interpreter's feedback below are those of
@@ -403,6 +453,8 @@ pub struct FeedbackSnapshot {
     pub arith: Vec<u8>,
     /// `ValueFeedback` bits.
     pub value: Vec<u16>,
+    /// The `ValueFeedback` bits of the sites of the property lookup caches, indexed like the caches.
+    pub cache_value: Vec<u16>,
     pub call: Vec<CallFeedbackSnapshot>,
     pub keyed: Vec<KeyedFeedbackSnapshot>,
     /// The bound arguments of the bound functions that call sites forwarded
@@ -416,12 +468,15 @@ pub struct CallFeedbackSnapshot {
     pub target: Option<CellId>,
     /// `CallFeedback::Flags` bits.
     pub flags: u8,
+    /// `value_feedback` bits: the types of the values the calls returned.
+    pub value: u16,
     /// The index in `Snapshot::executables` of `target`'s executable, if it is
     /// an inlining candidate.
     pub inline_executable: Option<u32>,
     /// `target`, if JIT code can call it directly.
     pub direct_call: Option<DirectCallTarget>,
-    /// `target`, if it is a raw native function JIT code can call directly.
+    /// `target`, if it is a raw native function. JIT code can call it directly if it has an `entry`, and can replace
+    /// a call of it with an intrinsic either way.
     pub native_call: Option<NativeCallTarget>,
     /// How `target` forwarded the calls of this site, if it always forwarded
     /// them the same way to the same function.
@@ -436,11 +491,18 @@ pub struct CallFeedbackSnapshot {
 }
 
 /// A constructor whose construct JIT code can inline: a base constructor
-/// without fields, whose function object (of `function_shape`) holds
-/// `prototype` as the data property at `prototype_offset`. Its construct
-/// creates `this` as an empty plain object of `this_shape`, whose prototype
-/// that is, and runs the body of the snapshot executable `executable`
-/// (with no function environment).
+/// without private methods whose fields have string or symbol names and
+/// literal initial values (see `ExecutableSnapshot::literal_instance_fields`)
+/// if any, whose function object (of `function_shape`) holds `prototype` as
+/// the data property at `prototype_offset`. Its construct creates `this` as
+/// a plain object of `this_shape`, an empty object shape with that prototype
+/// plus the fields, and runs the body of the snapshot executable
+/// `executable` (with no function environment).
+///
+/// Or a derived constructor whose super() constructs with
+/// `super_constructor`. Its construct runs its body, and super() constructs
+/// with its parent and the same new target, down to a base constructor,
+/// which creates `this` as above.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConstructTarget {
     pub executable: u32,
@@ -449,8 +511,23 @@ pub struct ConstructTarget {
     pub prototype: CellId,
     pub this_shape: CellId,
     /// How many properties the new object gets room for (see
-    /// `SharedFunctionInstanceData::construct_reserve()`).
+    /// `SharedFunctionInstanceData::construct_reserve()`): those of the
+    /// super constructor for a derived constructor.
     pub reserve: u32,
+    pub super_constructor: Option<SuperConstructTarget>,
+}
+
+/// The constructor without fields that super() in a derived constructor
+/// JIT code can inline constructs with: `function`, the [[Prototype]] of the
+/// derived constructor while that has `function_shape`, whose body is the
+/// snapshot executable `executable`. If `function` is `derived` itself, the
+/// snapshot of its executable says what its super() constructs with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SuperConstructTarget {
+    pub executable: u32,
+    pub function: CellId,
+    pub function_shape: CellId,
+    pub derived: bool,
 }
 
 /// How a callee forwards calls to another function.
@@ -590,8 +667,9 @@ impl FunctionFrameFields {
     }
 }
 
-/// A raw native function that JIT code calls directly, in the lightweight
+/// A native function that JIT code calls directly, in the lightweight
 /// frame the interpreter's call fast path builds for raw native functions.
+/// Capturing native functions use an entry that reads the function from that frame.
 /// The compiled code must list `function` and `realm` in
 /// `CompiledCode::embedded_cells`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -599,8 +677,10 @@ pub struct NativeCallTarget {
     pub function: CellId,
     /// The function's realm, the frame's realm.
     pub realm: CellId,
-    /// `ThrowCompletionOr<Value> (*)(VM&)`: the native function.
-    pub entry: u64,
+    /// `ThrowCompletionOr<Value> (*)(VM&)`: the native function, or None
+    /// where native functions do not return their completion in two
+    /// registers, and JIT code leaves calls of them to the runtime.
+    pub entry: Option<core::num::NonZeroU64>,
     /// Where the function, a getter of a platform object attribute backed by
     /// a field, finds the wrapper it would return, if it is one and the
     /// interpreter validated the cache entry for it (see
@@ -1056,6 +1136,41 @@ pub struct RuntimeInfo {
     /// interpreter as needed, and returns a slow path control word for the
     /// call, whose result is in its destination slot.
     pub finish_direct_call: u64,
+    /// `PreparedConstruct libjs_jit_prepare_construct(VM*, ExecutionContext*
+    /// frame, u32 pc)`: starts the `CallConstruct`, `SuperCall` or
+    /// `SuperCallWithForwardedArguments` instruction at `pc` of `frame`. In
+    /// two registers: the frame of an ECMAScript constructor the runtime
+    /// pushed for the construct stub to enter, and the value of the construct
+    /// if that frame returns something other than an object (an object, or
+    /// the empty value for a derived constructor); or 0 and a slow path
+    /// control word if the runtime ran the instruction to completion.
+    pub prepare_construct: u64,
+    /// `ConstructThis libjs_jit_construct_this(VM*, ECMAScriptFunctionObject*,
+    /// u64 new_target, u32 pc)`: for a construct with the function (with
+    /// `new_target`, or the empty value for the frame's new.target) whose
+    /// frame the construct stub may build like a call's: in two registers
+    /// its this value (an object, or the empty value for a derived
+    /// constructor) and its new target. Or 0 if the stub must not build the
+    /// frame, before anything observable happened, or 1 and a slow path
+    /// control word if making the this value threw.
+    pub construct_this: u64,
+    /// `i64 libjs_jit_throw_call_stack_size_exceeded(VM*, ExecutionContext*
+    /// frame, u32 pc)`: throws the error of a call with too little stack
+    /// left at `pc` of `frame`.
+    pub throw_call_stack_size_exceeded: u64,
+    /// `i64 libjs_jit_construct_result_error(VM*, ExecutionContext* frame,
+    /// u32 pc, u64 result)`: throws the error of a construct whose derived
+    /// constructor's frame returned `result`, which is not an object.
+    pub construct_result_error: u64,
+    /// `i64 libjs_jit_finish_direct_construct(VM*, ExecutionContext* frame,
+    /// u32 pc, u64 status, u64 value)`: like `finish_direct_call` for a
+    /// construct whose frame did not return to the construct stub, with the
+    /// value from `prepare_construct`.
+    pub finish_direct_construct: u64,
+    /// The address of the construct stub (see
+    /// `codegen::generate_construct_stub()`), or 0 if JIT code makes
+    /// constructs through `jit_call`.
+    pub construct_stub: u64,
     /// `i64 asm_helper_handle_raw_native_exception(VM*, u64 exception)`: unwinds
     /// the frame of a raw native function that threw, and returns a slow
     /// path control word for the exception.
@@ -1388,10 +1503,9 @@ pub struct RopeAllocationInfo {
 /// `cell_size`) and, unless `count` is 0, a storage cell of the first
 /// storage size class with a `capacity` of at least `count`. JIT code only
 /// allocates both itself if both local free lists have a cell: it checks
-/// the heap's threshold for the array cell (storage cells never start a
-/// collection, nor count towards one), pops both cells, adds both cell
-/// sizes to the heap's total allocated bytes and the array's to its
-/// allocated bytes since the last collection. Then:
+/// the heap's threshold for both cells, pops both cells, and adds both cell
+/// sizes to the heap's total allocated bytes and to its allocated bytes
+/// since the last collection. Then:
 /// 1. Copy `template` to the array cell and store
 ///    `array + inline_storage_offset` at `array + named_properties_offset`
 ///    (see `ObjectAllocationInfo`).
@@ -1475,6 +1589,9 @@ pub struct RuntimeOffsets {
     pub execution_context_frame_initialized: u32,
     /// `ExecutionContext::executable` (cell pointer).
     pub execution_context_executable: u32,
+    /// `Executable::idle_collection_count` (u8), which JIT code clears at its entry like the interpreter's Enter, or 0
+    /// for code that does not.
+    pub executable_idle_collection_count: u32,
     /// `sizeof(ExecutionContext)`: where the slots start.
     pub execution_context_slots: u32,
     /// `VmHead::running_execution_context`.
@@ -1544,6 +1661,10 @@ pub struct RuntimeOffsets {
     pub execution_context_returns_to_native_caller: u32,
     /// `ExecutionContext::runs_jit_code` (bool).
     pub execution_context_runs_jit_code: u32,
+    /// `ExecutionContext::caller_is_derived_construct` (bool).
+    pub execution_context_caller_is_derived_construct: u32,
+    /// `ExecutionContext::new_target` (a value).
+    pub execution_context_new_target: u32,
     /// `EcmascriptFunctionObject::environment` (cell pointer).
     pub ecmascript_function_environment: u32,
     /// `EcmascriptFunctionObjectWithRareData::private_environment` (cell
@@ -1785,6 +1906,21 @@ pub struct RuntimeLayout {
     /// if it is there, where `u64_hash` is the MurmurHash3 64-bit finalizer.
     pub fly_string_cache: u64,
     pub fly_string_cache_mask: u32,
+    /// The address of the VM's cache of the concatenations that became
+    /// property keys, or 0 for code without one. Its entries are
+    /// `key_concatenation_cache_entry_size` bytes, and have the two strings
+    /// of a concatenation at `key_concatenation_cache_lhs` and
+    /// `key_concatenation_cache_rhs` and the string that it made at
+    /// `key_concatenation_cache_string`, as values (0 in an empty entry).
+    /// The concatenation of the string values `l` and `r` is at index
+    /// `((l >> 4) ^ ((r >> 4) * 33)) & key_concatenation_cache_mask` if it is
+    /// there.
+    pub key_concatenation_cache: u64,
+    pub key_concatenation_cache_mask: u32,
+    pub key_concatenation_cache_entry_size: u32,
+    pub key_concatenation_cache_lhs: u32,
+    pub key_concatenation_cache_rhs: u32,
+    pub key_concatenation_cache_string: u32,
     /// The address of the VM's strings of the integers below
     /// `numeric_string_cache_size` (cell pointers, or null where it made
     /// none yet), or 0 for code without them.

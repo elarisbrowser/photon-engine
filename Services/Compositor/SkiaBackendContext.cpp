@@ -4,32 +4,19 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-#include <AK/Array.h>
 #include <AK/AnyOf.h>
 #include <AK/NeverDestroyed.h>
 #include <AK/NonnullOwnPtr.h>
 #include <AK/RefPtr.h>
-#include <AK/String.h>
 #include <AK/Time.h>
-#include <AK/Vector.h>
-#include <cstdlib>
-#include <cstring>
 #include <Compositor/PaintingSurface.h>
 #include <LibGfx/Bitmap.h>
 #ifdef USE_DIRECTX
 #    include <LibGfx/Direct3DContext.h>
 #endif
 #include <Compositor/SkiaBackendContext.h>
-#ifdef AK_OS_MACOS
-#    include <Compositor/PhotonGaneshPersistentCache.h>
-#endif
 
 #include <core/SkSurface.h>
-#ifdef AK_OS_MACOS
-#    ifdef SK_GRAPHITE
-#        include <core/SkExecutor.h>
-#    endif
-#endif
 #include <gpu/ganesh/GrContextOptions.h>
 #include <gpu/ganesh/GrDirectContext.h>
 
@@ -57,37 +44,19 @@ constexpr bool AllocatedWithSystemAllocator<skgpu::VulkanExtensions> = true;
 #    include <gpu/ganesh/mtl/GrMtlBackendContext.h>
 #    include <gpu/ganesh/mtl/GrMtlBackendSurface.h>
 #    include <gpu/ganesh/mtl/GrMtlDirectContext.h>
-#    ifdef SK_GRAPHITE
-#        pragma push_macro("TODO")
-#        undef TODO
-#        include <gpu/graphite/Context.h>
-#        include <gpu/graphite/ContextOptions.h>
-#        include <gpu/graphite/GraphiteTypes.h>
-#        include <gpu/graphite/mtl/MtlBackendContext.h>
-#        include <gpu/graphite/mtl/MtlGraphiteTypes_cpp.h>
-#        pragma pop_macro("TODO")
-#    endif
 #endif
 
 namespace Gfx {
 
 #if defined(AK_OS_MACOS) || defined(USE_DIRECTX) || defined(USE_VULKAN)
-// The compositor has one Skia context shared by every tab. Keep its reusable GPU resources bounded so one heavy page
-// cannot retain hundreds of MiB outside the per-tab memory totals shown by the shell.
-static constexpr size_t skia_resource_cache_limit = 128 * MiB;
+static constexpr size_t skia_resource_cache_limit = 256 * MiB;
 #endif
-// NB: Asked on every flush, so the environment is read once.
-[[maybe_unused]] static bool photon_verbose()
-{
-    static bool enabled = std::getenv("PHOTON_VERBOSE") != nullptr;
-    return enabled;
-}
-
 static constexpr auto skia_deferred_cleanup_interval = AK::Duration::from_seconds(1);
 static constexpr auto skia_aggressive_cleanup_interval = AK::Duration::from_seconds(5);
-static constexpr auto skia_deferred_cleanup_resource_age = std::chrono::seconds(1);
-static constexpr auto skia_resource_cache_high_watermark = 192 * MiB;
-static constexpr auto skia_resource_cache_critical_watermark = 256 * MiB;
+static constexpr auto skia_deferred_cleanup_resource_age = std::chrono::seconds(5);
+static constexpr auto skia_idle_cleanup_delay = AK::Duration::from_seconds(6);
+static constexpr auto skia_resource_cache_high_watermark = 384 * MiB;
+static constexpr auto skia_resource_cache_critical_watermark = 512 * MiB;
 
 static auto& main_thread_context()
 {
@@ -95,15 +64,6 @@ static auto& main_thread_context()
     return *context;
 }
 
-static SkiaBackendContext::SurfaceAccess surface_access_for(PaintingSurface const& surface)
-{
-    // Keep both contracts: Photon can require external access, and upstream marks images shared with another process.
-    if (surface.wraps_shared_image())
-        return SkiaBackendContext::SurfaceAccess::SharedImage;
-    return surface.requires_external_access() ? SkiaBackendContext::SurfaceAccess::External : SkiaBackendContext::SurfaceAccess::Internal;
-}
-
-#if defined(AK_OS_MACOS) || defined(USE_DIRECTX) || defined(USE_VULKAN)
 static void invoke_async_flush_callback(void* context)
 {
     auto* callback = static_cast<Function<void()>*>(context);
@@ -112,83 +72,15 @@ static void invoke_async_flush_callback(void* context)
     callback_to_invoke();
 }
 
-#ifdef AK_OS_MACOS
-#    ifdef SK_GRAPHITE
-static void invoke_graphite_flush_callback(skgpu::graphite::GpuFinishedContext context, skgpu::CallbackResult)
+static SkSurfaces::BackendSurfaceAccess backend_access_for(PaintingSurface const& surface)
 {
-    auto* callback = static_cast<Function<void()>*>(context);
-    auto callback_to_invoke = move(*callback);
-    delete callback;
-    callback_to_invoke();
+    // Only an image shared with another process is handed over for presentation. A render target Skia allocated
+    // itself is read back instead, and it has no memory to present if allocating it failed during the flush.
+    return surface.wraps_shared_image() ? SkSurfaces::BackendSurfaceAccess::kPresent : SkSurfaces::BackendSurfaceAccess::kNoAccess;
 }
-#    endif
-#endif
-
-static SkSurfaces::BackendSurfaceAccess to_backend_surface_access(SkiaBackendContext::SurfaceAccess access)
-{
-    return access != SkiaBackendContext::SurfaceAccess::Internal
-        ? SkSurfaces::BackendSurfaceAccess::kPresent
-        : SkSurfaces::BackendSurfaceAccess::kNoAccess;
-}
-
-#ifdef USE_VULKAN
-// The external queue family only reaches the same device and driver. Anything else takes the foreign one, which not
-// every device has.
-static u32 queue_family_receiving_shared_images(VulkanContext const& vulkan_context)
-{
-    auto has_foreign_queue_family = any_of(vulkan_context.enabled_device_extensions, [](char const* extension) {
-        return std::strcmp(extension, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME) == 0;
-    });
-    return !vulkan_context.is_preferred_device && has_foreign_queue_family ? VK_QUEUE_FAMILY_FOREIGN_EXT : VK_QUEUE_FAMILY_EXTERNAL;
-}
-#endif
-
-static void flush_surface(GrDirectContext& context, SkSurface* surface, SkiaBackendContext::SurfaceAccess access, GrFlushInfo const& flush_info, [[maybe_unused]] VulkanContext const* vulkan_context = nullptr)
-{
-#ifdef USE_VULKAN
-    if (access == SkiaBackendContext::SurfaceAccess::SharedImage && vulkan_context) {
-        // Some Vulkan drivers keep shared images compressed until ownership is released to another queue family.
-        auto const handed_over_state = skgpu::MutableTextureStates::MakeVulkan(VK_IMAGE_LAYOUT_GENERAL, queue_family_receiving_shared_images(*vulkan_context));
-        context.flush(surface, flush_info, &handed_over_state);
-        return;
-    }
-#endif
-    context.flush(surface, to_backend_surface_access(access), flush_info);
-}
-
-static void flush_and_submit_async_to_context(GrDirectContext& context, SkSurface* surface, SkiaBackendContext::SurfaceAccess access, Function<void()>&& callback, GrBackendSemaphore* signal_semaphore = nullptr, VulkanContext const* vulkan_context = nullptr)
-{
-    GrFlushInfo flush_info {};
-    if (signal_semaphore) {
-        flush_info.fNumSemaphores = 1;
-        flush_info.fSignalSemaphores = signal_semaphore;
-    }
-    flush_info.fFinishedProc = invoke_async_flush_callback;
-    flush_info.fFinishedContext = new Function<void()>(move(callback));
-    if (!photon_verbose()) {
-        flush_surface(context, surface, access, flush_info, vulkan_context);
-        VERIFY(context.submit(GrSyncCpu::kNo));
-        return;
-    }
-    auto const flush_started_at = MonotonicTime::now();
-    flush_surface(context, surface, access, flush_info, vulkan_context);
-    auto const flush_duration = MonotonicTime::now() - flush_started_at;
-    auto const submit_started_at = MonotonicTime::now();
-    VERIFY(context.submit(GrSyncCpu::kNo));
-    auto const submit_duration = MonotonicTime::now() - submit_started_at;
-    if ((flush_duration.to_microseconds() >= 5000 || submit_duration.to_microseconds() >= 5000))
-        dbgln("Photon Skia submit detail: flush={:.2f}ms metal_submit={:.2f}ms", flush_duration.to_seconds_f64() * 1000.0, submit_duration.to_seconds_f64() * 1000.0);
-}
-#endif
 
 void SkiaBackendContext::check_async_work_completion()
 {
-#ifdef SK_GRAPHITE
-    if (auto* context = graphite_context()) {
-        context->checkAsyncWorkCompletion();
-        return;
-    }
-#endif
     if (auto* context = sk_context())
         context->checkAsyncWorkCompletion();
 }
@@ -205,105 +97,57 @@ static u32 queue_family_receiving_shared_images(VulkanContext const& vulkan_cont
 }
 #endif
 
+static void flush_surface(SkiaBackendContext& backend_context, PaintingSurface& surface, GrFlushInfo const& flush_info)
+{
+    auto& context = *backend_context.sk_context();
+#ifdef USE_VULKAN
+    // NB: A driver can keep an image compressed in memory that only it knows about, even when the image's layout has
+    //     no compression. It only writes the actual pixels out once the image is released to another owner, so without
+    //     this, whoever else reads the shared image's memory sees the compressed data.
+    if (surface.wraps_shared_image()) {
+        auto const handed_over_state = skgpu::MutableTextureStates::MakeVulkan(VK_IMAGE_LAYOUT_GENERAL, queue_family_receiving_shared_images(backend_context.vulkan_context()));
+        context.flush(&surface.sk_surface(), flush_info, &handed_over_state);
+        return;
+    }
+#endif
+    context.flush(&surface.sk_surface(), backend_access_for(surface), flush_info);
+}
+
 void SkiaBackendContext::flush_and_submit(PaintingSurface& surface)
 {
-    flush_and_submit(&surface.sk_surface(), surface_access_for(surface));
-}
-
-void SkiaBackendContext::flush_and_submit_async(PaintingSurface& surface, Function<void()>&& callback, uint64_t presentation_signal_value)
-{
-    flush_and_submit_async(&surface.sk_surface(), surface_access_for(surface), move(callback), presentation_signal_value);
-}
-
-void SkiaBackendContext::flush_and_submit(SkSurface* surface, SurfaceAccess access)
-{
-    flush_and_submit_impl(surface, access);
+    auto& context = *sk_context();
+    flush_surface(*this, surface, {});
+    context.submit(GrSyncCpu::kYes);
 
     perform_post_flush_cleanup();
 }
 
-void SkiaBackendContext::flush_and_submit_async(SkSurface* surface, SurfaceAccess access, Function<void()>&& callback, uint64_t presentation_signal_value)
+void SkiaBackendContext::flush_and_submit_async(PaintingSurface& surface, Function<void()>&& callback)
 {
-    flush_and_submit_async_impl(surface, access, move(callback), presentation_signal_value);
+    auto& context = *sk_context();
+    GrFlushInfo flush_info {};
+    flush_info.fFinishedProc = invoke_async_flush_callback;
+    flush_info.fFinishedContext = new Function<void()>(move(callback));
+    flush_surface(*this, surface, flush_info);
+    VERIFY(context.submit(GrSyncCpu::kNo));
 
     perform_post_flush_cleanup();
 }
 
-void SkiaBackendContext::purge_resources_unused_for(AK::Duration age)
+void SkiaBackendContext::flush_and_submit_async(Function<void()>&& callback)
 {
-#ifdef SK_GRAPHITE
-    if (auto* context = graphite_context()) {
-        auto const cleanup_age = std::chrono::milliseconds(age.to_milliseconds());
-        context->performDeferredCleanup(cleanup_age);
-        if (auto* recorder = graphite_recorder())
-            recorder->performDeferredCleanup(cleanup_age);
-        return;
-    }
-#endif
-    auto* context = sk_context();
-    if (!context)
-        return;
+    auto& context = *sk_context();
+    GrFlushInfo flush_info {};
+    flush_info.fFinishedProc = invoke_async_flush_callback;
+    flush_info.fFinishedContext = new Function<void()>(move(callback));
+    context.flush(flush_info);
+    VERIFY(context.submit(GrSyncCpu::kNo));
 
-    size_t resource_bytes_before = 0;
-    context->getResourceCacheUsage(nullptr, &resource_bytes_before);
-    context->performDeferredCleanup(std::chrono::milliseconds(age.to_milliseconds()));
-    if (photon_verbose()) {
-        size_t resource_bytes_after = 0;
-        context->getResourceCacheUsage(nullptr, &resource_bytes_after);
-        dbgln("Photon Skia idle purge: cache_bytes={}->{}", resource_bytes_before, resource_bytes_after);
-    }
-}
-
-void SkiaBackendContext::purge_unlocked_scratch_resources()
-{
-#ifdef SK_GRAPHITE
-    if (auto* context = graphite_context()) {
-        auto* recorder = graphite_recorder();
-        auto const bytes_before = context->currentBudgetedBytes() + recorder->currentBudgetedBytes();
-        context->freeGpuResources();
-        recorder->freeGpuResources();
-        auto const bytes_after = context->currentBudgetedBytes() + recorder->currentBudgetedBytes();
-        dbgln("Photon Graphite memory-pressure GPU cache: {} -> {} bytes", bytes_before, bytes_after);
-        return;
-    }
-#endif
-    auto* context = sk_context();
-    if (!context)
-        return;
-
-    size_t resource_bytes_before = 0;
-    context->getResourceCacheUsage(nullptr, &resource_bytes_before);
-    context->purgeUnlockedResources(GrPurgeResourceOptions::kScratchResourcesOnly);
-    size_t resource_bytes_after = 0;
-    context->getResourceCacheUsage(nullptr, &resource_bytes_after);
-    dbgln("Photon memory-pressure GPU cache: {} -> {} bytes", resource_bytes_before, resource_bytes_after);
+    perform_post_flush_cleanup();
 }
 
 void SkiaBackendContext::perform_post_flush_cleanup()
 {
-#ifdef SK_GRAPHITE
-    if (auto* context = graphite_context()) {
-        static thread_local Optional<MonotonicTime> s_last_cleanup;
-        auto const now = MonotonicTime::now();
-        if (s_last_cleanup.has_value() && now - *s_last_cleanup < skia_deferred_cleanup_interval)
-            return;
-        s_last_cleanup = now;
-
-        auto* recorder = graphite_recorder();
-        context->performDeferredCleanup(skia_deferred_cleanup_resource_age);
-        recorder->performDeferredCleanup(skia_deferred_cleanup_resource_age);
-        auto const bytes_before = context->currentBudgetedBytes() + recorder->currentBudgetedBytes();
-        if (bytes_before >= skia_resource_cache_critical_watermark) {
-            context->performDeferredCleanup(std::chrono::milliseconds(0));
-            recorder->performDeferredCleanup(std::chrono::milliseconds(0));
-        }
-        if (photon_verbose()) {
-            auto const bytes_after = context->currentBudgetedBytes() + recorder->currentBudgetedBytes();
-            dbgln("Photon Graphite cleanup: cache_bytes={}->{}", bytes_before, bytes_after);
-        }
-        return;
-    }
-#endif
     auto* context = sk_context();
     if (!context)
         return;
@@ -316,61 +160,34 @@ void SkiaBackendContext::perform_post_flush_cleanup()
         return;
 
     s_last_deferred_cleanup = now;
-    int resource_count_before = 0;
-    size_t resource_bytes_before = 0;
-    context->getResourceCacheUsage(&resource_count_before, &resource_bytes_before);
-
-    auto const deferred_cleanup_started_at = MonotonicTime::now();
     context->performDeferredCleanup(skia_deferred_cleanup_resource_age);
-    auto const deferred_cleanup_duration = MonotonicTime::now() - deferred_cleanup_started_at;
 
-    int resource_count_after_deferred_cleanup = 0;
+    if (!m_idle_cleanup_timer) {
+        m_idle_cleanup_timer = Core::Timer::create_single_shot(skia_idle_cleanup_delay, [this] {
+            auto& context = *sk_context();
+            context.checkAsyncWorkCompletion();
+            context.purgeUnlockedResources(GrPurgeResourceOptions::kAllResources);
+        });
+    }
+    m_idle_cleanup_timer->restart();
+
     size_t resource_bytes = 0;
-    context->getResourceCacheUsage(&resource_count_after_deferred_cleanup, &resource_bytes);
-    auto const resource_bytes_after_deferred_cleanup = resource_bytes;
-    if (resource_bytes < skia_resource_cache_high_watermark) {
-        if (photon_verbose() && deferred_cleanup_duration.to_microseconds() >= 5000)
-            dbgln("Photon Skia cleanup detail: deferred={:.2f}ms aggressive=skipped purge=skipped resources={}->{} cache_bytes={}->{}", deferred_cleanup_duration.to_seconds_f64() * 1000.0, resource_count_before, resource_count_after_deferred_cleanup, resource_bytes_before, resource_bytes);
+    context->getResourceCacheUsage(nullptr, &resource_bytes);
+    if (resource_bytes < skia_resource_cache_high_watermark)
         return;
-    }
-    if (s_last_aggressive_cleanup.has_value() && now - *s_last_aggressive_cleanup < skia_aggressive_cleanup_interval) {
-        if (photon_verbose() && deferred_cleanup_duration.to_microseconds() >= 5000)
-            dbgln("Photon Skia cleanup detail: deferred={:.2f}ms aggressive=throttled purge=skipped resources={}->{} cache_bytes={}->{}", deferred_cleanup_duration.to_seconds_f64() * 1000.0, resource_count_before, resource_count_after_deferred_cleanup, resource_bytes_before, resource_bytes);
+    if (s_last_aggressive_cleanup.has_value() && now - *s_last_aggressive_cleanup < skia_aggressive_cleanup_interval)
         return;
-    }
 
     s_last_aggressive_cleanup = now;
-    auto const aggressive_cleanup_started_at = MonotonicTime::now();
     context->performDeferredCleanup(std::chrono::milliseconds(0));
-    auto const aggressive_cleanup_duration = MonotonicTime::now() - aggressive_cleanup_started_at;
-    int resource_count_after_aggressive_cleanup = 0;
-    context->getResourceCacheUsage(&resource_count_after_aggressive_cleanup, &resource_bytes);
-    AK::Duration purge_duration {};
-    if (resource_bytes >= skia_resource_cache_critical_watermark) {
-        auto const purge_started_at = MonotonicTime::now();
+    context->getResourceCacheUsage(nullptr, &resource_bytes);
+    if (resource_bytes >= skia_resource_cache_critical_watermark)
         context->purgeUnlockedResources(GrPurgeResourceOptions::kScratchResourcesOnly);
-        purge_duration = MonotonicTime::now() - purge_started_at;
-    }
-
-    int resource_count_after_purge = 0;
-    size_t resource_bytes_after_purge = 0;
-    context->getResourceCacheUsage(&resource_count_after_purge, &resource_bytes_after_purge);
-    auto const cleanup_duration = MonotonicTime::now() - deferred_cleanup_started_at;
-    if (photon_verbose() && cleanup_duration.to_microseconds() >= 5000)
-        dbgln("Photon Skia cleanup detail: total={:.2f}ms deferred={:.2f}ms aggressive={:.2f}ms purge={:.2f}ms resources={}/{}/{}/{} cache_bytes={}/{}/{}/{}", cleanup_duration.to_seconds_f64() * 1000.0, deferred_cleanup_duration.to_seconds_f64() * 1000.0, aggressive_cleanup_duration.to_seconds_f64() * 1000.0, purge_duration.to_seconds_f64() * 1000.0, resource_count_before, resource_count_after_deferred_cleanup, resource_count_after_aggressive_cleanup, resource_count_after_purge, resource_bytes_before, resource_bytes_after_deferred_cleanup, resource_bytes, resource_bytes_after_purge);
 }
 
 size_t SkiaBackendContext::resource_cache_bytes() const
 {
     size_t bytes = 0;
-#ifdef SK_GRAPHITE
-    if (auto* context = graphite_context()) {
-        bytes = context->currentBudgetedBytes();
-        if (auto* recorder = graphite_recorder())
-            bytes += recorder->currentBudgetedBytes();
-        return bytes;
-    }
-#endif
     if (auto* context = sk_context())
         context->getResourceCacheUsage(nullptr, &bytes);
     return bytes;
@@ -432,18 +249,6 @@ public:
         m_context.reset();
     }
 
-    void flush_and_submit_impl(SkSurface* surface, SurfaceAccess access) override
-    {
-        GrFlushInfo const flush_info {};
-        m_context->flush(surface, to_backend_surface_access(access), flush_info);
-        m_context->submit(GrSyncCpu::kYes);
-    }
-
-    void flush_and_submit_async_impl(SkSurface* surface, SurfaceAccess access, Function<void()>&& callback, uint64_t) override
-    {
-        flush_and_submit_async_to_context(*m_context, surface, access, move(callback));
-    }
-
     GrDirectContext* sk_context() const override { return m_context.get(); }
 
     VulkanContext const& vulkan_context() override { VERIFY_NOT_REACHED(); }
@@ -500,18 +305,6 @@ public:
             vkDestroyDevice(m_vulkan_context.logical_device, nullptr);
         if (m_vulkan_context.instance != VK_NULL_HANDLE)
             vkDestroyInstance(m_vulkan_context.instance, nullptr);
-    }
-
-    void flush_and_submit_impl(SkSurface* surface, SurfaceAccess access) override
-    {
-        GrFlushInfo const flush_info {};
-        flush_surface(*m_context, surface, access, flush_info, &m_vulkan_context);
-        m_context->submit(GrSyncCpu::kYes);
-    }
-
-    void flush_and_submit_async_impl(SkSurface* surface, SurfaceAccess access, Function<void()>&& callback, uint64_t) override
-    {
-        flush_and_submit_async_to_context(*m_context, surface, access, move(callback), nullptr, &m_vulkan_context);
     }
 
     skgpu::VulkanExtensions const* extensions() const { return m_extensions.ptr(); }
@@ -572,105 +365,13 @@ RefPtr<SkiaBackendContext> SkiaBackendContext::create_vulkan_context(VulkanConte
 #endif
 
 #ifdef AK_OS_MACOS
-
-#    ifdef SK_GRAPHITE
-class SkiaGraphiteMetalBackendContext final : public SkiaBackendContext {
-    AK_MAKE_NONCOPYABLE(SkiaGraphiteMetalBackendContext);
-    AK_MAKE_NONMOVABLE(SkiaGraphiteMetalBackendContext);
-
-public:
-    SkiaGraphiteMetalBackendContext(std::unique_ptr<SkExecutor> executor, std::unique_ptr<skgpu::graphite::Context> context, std::unique_ptr<skgpu::graphite::Recorder> recorder, NonnullRefPtr<MetalContext> metal_context)
-        : m_executor(move(executor))
-        , m_context(move(context))
-        , m_recorder(move(recorder))
-        , m_metal_context(move(metal_context))
-    {
-        VERIFY(m_executor);
-        VERIFY(m_context);
-        VERIFY(m_recorder);
-    }
-
-    ~SkiaGraphiteMetalBackendContext() override
-    {
-        m_recorder.reset();
-        m_context.reset();
-    }
-
-    void flush_and_submit_impl(SkSurface*, SurfaceAccess access) override
-    {
-        auto recording = m_recorder->snap();
-        if (recording) {
-            skgpu::graphite::InsertRecordingInfo insert_info;
-            insert_info.fRecording = recording.get();
-            auto status = m_context->insertRecording(insert_info);
-            if (!status)
-                dbgln("Photon Graphite recording insertion failed: {}", status.message().c_str());
-        }
-        skgpu::graphite::SubmitInfo submit_info;
-        submit_info.fSync = skgpu::graphite::SyncToCpu::kYes;
-        submit_info.fMarkBoundary = access != SurfaceAccess::Internal ? skgpu::graphite::MarkFrameBoundary::kYes : skgpu::graphite::MarkFrameBoundary::kNo;
-        if (!m_context->submit(submit_info))
-            dbgln("Photon Graphite synchronous submit failed");
-    }
-
-    void flush_and_submit_async_impl(SkSurface*, SurfaceAccess access, Function<void()>&& callback, uint64_t presentation_signal_value) override
-    {
-        auto recording = m_recorder->snap();
-        if (!recording) {
-            if (presentation_signal_value != 0)
-                m_metal_context->signal_presentation_value(presentation_signal_value);
-            callback();
-            return;
-        }
-
-        auto* callback_context = new Function<void()>(move(callback));
-        skgpu::graphite::InsertRecordingInfo insert_info;
-        insert_info.fRecording = recording.get();
-        insert_info.fFinishedContext = callback_context;
-        insert_info.fFinishedProc = invoke_graphite_flush_callback;
-
-        auto status = m_context->insertRecording(insert_info);
-        if (!status)
-            dbgln("Photon Graphite recording insertion failed: {}", status.message().c_str());
-        skgpu::graphite::SubmitInfo submit_info;
-        submit_info.fSync = skgpu::graphite::SyncToCpu::kNo;
-        submit_info.fMarkBoundary = access != SurfaceAccess::Internal || presentation_signal_value != 0
-            ? skgpu::graphite::MarkFrameBoundary::kYes
-            : skgpu::graphite::MarkFrameBoundary::kNo;
-        if (!m_context->submit(submit_info))
-            dbgln("Photon Graphite asynchronous submit failed");
-        if (presentation_signal_value != 0) {
-            // Skia 148's Graphite Metal signal-semaphore path passes an invalid event to
-            // encodeSignalEvent. Submit a signal buffer on the same Metal queue instead; queue
-            // ordering places it after Graphite's committed frame commands without a CPU wait.
-            m_metal_context->signal_presentation_value(presentation_signal_value);
-        }
-    }
-
-    GrDirectContext* sk_context() const override { return nullptr; }
-    skgpu::graphite::Context* graphite_context() const override { return m_context.get(); }
-    skgpu::graphite::Recorder* graphite_recorder() const override { return m_recorder.get(); }
-
-    VulkanContext const& vulkan_context() override { VERIFY_NOT_REACHED(); }
-    MetalContext& metal_context() override { return m_metal_context; }
-
-private:
-    // Keep Graphite pipeline compilation off the compositor thread. The executor must outlive the context.
-    std::unique_ptr<SkExecutor> m_executor;
-    std::unique_ptr<skgpu::graphite::Context> m_context;
-    std::unique_ptr<skgpu::graphite::Recorder> m_recorder;
-    NonnullRefPtr<MetalContext> m_metal_context;
-};
-#    endif
-
 class SkiaMetalBackendContext final : public SkiaBackendContext {
     AK_MAKE_NONCOPYABLE(SkiaMetalBackendContext);
     AK_MAKE_NONMOVABLE(SkiaMetalBackendContext);
 
 public:
-    SkiaMetalBackendContext(sk_sp<GrDirectContext> context, OwnPtr<PhotonGaneshPersistentCache> persistent_cache, NonnullRefPtr<MetalContext> metal_context)
+    SkiaMetalBackendContext(sk_sp<GrDirectContext> context, NonnullRefPtr<MetalContext> metal_context)
         : m_context(move(context))
-        , m_persistent_cache(move(persistent_cache))
         , m_metal_context(move(metal_context))
     {
     }
@@ -680,97 +381,26 @@ public:
         m_context.reset();
     }
 
-    void flush_and_submit_impl(SkSurface* surface, SurfaceAccess access) override
-    {
-        GrFlushInfo const flush_info {};
-        m_context->flush(surface, to_backend_surface_access(access), flush_info);
-        m_context->submit(GrSyncCpu::kYes);
-    }
-
-    void flush_and_submit_async_impl(SkSurface* surface, SurfaceAccess access, Function<void()>&& callback, uint64_t presentation_signal_value) override
-    {
-        void* signal_semaphore = nullptr;
-        if (presentation_signal_value != 0)
-            signal_semaphore = m_metal_context->create_presentation_signal_semaphore(presentation_signal_value);
-        flush_and_submit_async_to_context(*m_context, surface, access, move(callback), static_cast<GrBackendSemaphore*>(signal_semaphore));
-        if (signal_semaphore)
-            m_metal_context->destroy_presentation_signal_semaphore(signal_semaphore);
-    }
-
     GrDirectContext* sk_context() const override { return m_context.get(); }
 
     VulkanContext const& vulkan_context() override { VERIFY_NOT_REACHED(); }
 
     MetalContext& metal_context() override { return m_metal_context; }
 
-    bool precompile_next_shader() override
-    {
-        if (!m_warm_entries.has_value())
-            m_warm_entries = m_persistent_cache->load_warm_entries();
-        if (m_next_warm_entry >= m_warm_entries->size())
-            return false;
-        auto const& entry = m_warm_entries->at(m_next_warm_entry++);
-        auto started_at = MonotonicTime::now();
-        m_context->precompileShader(*entry.key, *entry.data);
-        m_warm_duration += MonotonicTime::now() - started_at;
-        auto remaining = m_next_warm_entry < m_warm_entries->size();
-        if (!remaining && photon_verbose())
-            dbgln("Photon Skia precompiled {} programs in {:.2f}ms", m_warm_entries->size(), m_warm_duration.to_seconds_f64() * 1000.0);
-        return remaining;
-    }
-
 private:
     sk_sp<GrDirectContext> m_context;
-    OwnPtr<PhotonGaneshPersistentCache> m_persistent_cache;
     NonnullRefPtr<MetalContext> m_metal_context;
-    Optional<Vector<PhotonGaneshPersistentCache::WarmEntry>> m_warm_entries;
-    size_t m_next_warm_entry { 0 };
-    AK::Duration m_warm_duration;
 };
 
 RefPtr<SkiaBackendContext> SkiaBackendContext::create_metal_context(NonnullRefPtr<MetalContext> metal_context)
 {
-#    ifdef SK_GRAPHITE
-    auto* backend_override = std::getenv("PHOTON_SKIA_BACKEND");
-    auto use_graphite = backend_override && std::strcmp(backend_override, "graphite") == 0;
-    if (backend_override && std::strcmp(backend_override, "ganesh") != 0 && std::strcmp(backend_override, "graphite") != 0)
-        dbgln("Unknown PHOTON_SKIA_BACKEND '{}'; defaulting to Ganesh", backend_override);
-
-    if (use_graphite) {
-        skgpu::graphite::MtlBackendContext graphite_backend_context;
-        graphite_backend_context.fDevice.retain(metal_context->device());
-        graphite_backend_context.fQueue.retain(metal_context->queue());
-
-        auto graphite_executor = SkExecutor::MakeFIFOThreadPool(2, false);
-        VERIFY(graphite_executor);
-        skgpu::graphite::ContextOptions graphite_options;
-        graphite_options.fGpuBudgetInBytes = skia_resource_cache_limit / 2;
-        graphite_options.fRequireOrderedRecordings = true;
-        graphite_options.fExecutor = graphite_executor.get();
-        auto graphite_context = skgpu::graphite::ContextFactory::MakeMetal(graphite_backend_context, graphite_options);
-        if (graphite_context) {
-            skgpu::graphite::RecorderOptions recorder_options;
-            recorder_options.fGpuBudgetInBytes = skia_resource_cache_limit / 2;
-            auto graphite_recorder = graphite_context->makeRecorder(recorder_options);
-            if (graphite_recorder) {
-                dbgln("Photon Skia backend: Graphite on Metal (2 pipeline workers)");
-                return adopt_ref(*new SkiaGraphiteMetalBackendContext(move(graphite_executor), move(graphite_context), move(graphite_recorder), move(metal_context)));
-            }
-        }
-        dbgln("Photon Graphite initialization failed; falling back to Ganesh on Metal");
-    }
-#    endif
-
     GrMtlBackendContext backend_context;
     backend_context.fDevice.retain(metal_context->device());
     backend_context.fQueue.retain(metal_context->queue());
-    auto persistent_cache = make<PhotonGaneshPersistentCache>(metal_context->device_registry_id());
-    GrContextOptions options;
-    options.fPersistentCache = persistent_cache.ptr();
-    sk_sp<GrDirectContext> ctx = GrDirectContexts::MakeMetal(backend_context, options);
+    sk_sp<GrDirectContext> ctx = GrDirectContexts::MakeMetal(backend_context);
     VERIFY(ctx);
     ctx->setResourceCacheLimit(skia_resource_cache_limit);
-    return adopt_ref(*new SkiaMetalBackendContext(move(ctx), move(persistent_cache), move(metal_context)));
+    return adopt_ref(*new SkiaMetalBackendContext(move(ctx), move(metal_context)));
 }
 #endif
 

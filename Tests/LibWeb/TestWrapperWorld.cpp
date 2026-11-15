@@ -5,8 +5,10 @@
  */
 
 #include <AK/NonnullOwnPtr.h>
+#include <AK/RefCounted.h>
 #include <LibCore/EventLoop.h>
 #include <LibGC/CellAllocator.h>
+#include <LibGC/Function.h>
 #include <LibGC/Weak.h>
 #include <LibJS/HostClassBuilder.h>
 #include <LibJS/Runtime/ArrayBuffer.h>
@@ -28,6 +30,7 @@
 #include <LibWeb/HTML/BarProp.h>
 #include <LibWeb/HTML/CrossOrigin/AbstractOperations.h>
 #include <LibWeb/HTML/LocalTraversableNavigable.h>
+#include <LibWeb/HTML/Scripting/Environments.h>
 #include <LibWeb/HTML/Scripting/SimilarOriginWindowAgent.h>
 #include <LibWeb/HTML/Scripting/TemporaryExecutionContext.h>
 #include <LibWeb/HTML/Scripting/WindowEnvironmentSettingsObject.h>
@@ -38,8 +41,6 @@
 #include <LibWeb/WebIDL/ExceptionOr.h>
 
 namespace {
-
-bool s_main_thread_vm_was_initialized_by_an_earlier_wrapper_test = false;
 
 void ensure_font_plugin_installed()
 {
@@ -824,7 +825,7 @@ TEST_CASE(window_cross_origin_descriptor_cache_lives_on_wrapper)
     auto window = Web::HTML::Window::create();
     auto wrapper = Web::Bindings::wrap(wrapper_world, extension_realm.realm(), window);
     auto key = Web::HTML::CrossOriginKey {
-        .current_settings_object = 1,
+        .current_settings_object = Web::HTML::principal_realm_settings_object(extension_realm.realm()),
         .relevant_settings_object = 2,
         .property_key = JS::PropertyKey { "closed"_utf16_fly_string },
     };
@@ -832,10 +833,10 @@ TEST_CASE(window_cross_origin_descriptor_cache_lives_on_wrapper)
     EXPECT(!wrapper->host_data());
     JS::PropertyDescriptor descriptor;
     descriptor.value = JS::Value(false);
-    Web::HTML::cross_origin_property_descriptor_map(*wrapper).set(key, Web::HTML::CrossOriginCachedPropertyDescriptor { descriptor });
+    Web::HTML::cross_origin_property_descriptor_map(*wrapper).set(key, descriptor);
 
     EXPECT(wrapper->host_data());
-    EXPECT(Web::HTML::cross_origin_property_descriptor_map(*wrapper).contains(key));
+    EXPECT(Web::HTML::cross_origin_property_descriptor_map(*wrapper).get(key).has_value());
     EXPECT(wrapper_world.wrapper_for(*window, extension_realm.realm()) == wrapper);
     wrapper_world.detach();
     EXPECT(!wrapper_world.wrapper_for(*window, extension_realm.realm()));
@@ -851,16 +852,16 @@ TEST_CASE(cross_origin_descriptor_cache_does_not_root_realm_after_wrapper_dies)
         auto& wrapper_world = Web::Bindings::host_defined_wrapper_world(realm.realm());
         auto window = Web::HTML::Window::create();
         auto wrapper = Web::Bindings::wrap(wrapper_world, realm.realm(), window);
-        auto accessor = JS::NativeFunction::create(realm.realm(), [](JS::VM&) { return JS::js_undefined(); }, 0);
+        auto accessor = JS::NativeFunction::create(realm.realm(), [](JS::VM&) -> JS::ThrowCompletionOr<JS::Value> { return JS::js_undefined(); }, 0);
         auto key = Web::HTML::CrossOriginKey {
-            .current_settings_object = 1,
+            .current_settings_object = Web::HTML::principal_realm_settings_object(realm.realm()),
             .relevant_settings_object = 2,
             .property_key = JS::PropertyKey { "closed"_utf16_fly_string },
         };
 
         JS::PropertyDescriptor descriptor;
         descriptor.get = accessor;
-        Web::HTML::cross_origin_property_descriptor_map(*wrapper).set(key, Web::HTML::CrossOriginCachedPropertyDescriptor { descriptor });
+        Web::HTML::cross_origin_property_descriptor_map(*wrapper).set(key, descriptor);
         weak_realm = GC::Weak<JS::Realm> { realm.realm() };
     }
 
@@ -872,17 +873,23 @@ TEST_CASE(cross_origin_descriptor_cache_does_not_root_realm_after_wrapper_dies)
     EXPECT(!weak_realm);
 }
 
+struct TimerFired : RefCounted<TimerFired> {
+    GC_HOLDS_NO_CELL_EDGES;
+
+    bool value { false };
+};
+
 // An active timer lives only as long as its owner reaches it. One that nothing reaches is collected, and must be
 // stopped then rather than fire into a callback that was collected with it.
 TEST_CASE(unreachable_active_timer_is_stopped_when_collected)
 {
     IGNORE_USE_IN_ESCAPING_LAMBDA Core::EventLoop event_loop;
     auto vm = JS::VM::create();
-    IGNORE_USE_IN_ESCAPING_LAMBDA bool fired = false;
+    auto fired = make_ref_counted<TimerFired>();
     GC::Weak<Web::Platform::Timer> weak_timer;
     [&] {
-        auto timer = Web::Platform::Timer::create_single_shot(GC::Heap::the(), AK::Duration::from_milliseconds(0), GC::create_function(GC::Heap::the(), [&] {
-            fired = true;
+        auto timer = Web::Platform::Timer::create_single_shot(GC::Heap::the(), AK::Duration::from_milliseconds(0), GC::create_function(GC::Heap::the(), GC::captures(fired), [](auto& fired) {
+            fired->value = true;
         }));
         timer->start();
         weak_timer = *timer;
@@ -897,7 +904,7 @@ TEST_CASE(unreachable_active_timer_is_stopped_when_collected)
     quit_timer->start();
     event_loop.exec();
 
-    EXPECT(!fired);
+    EXPECT(!fired->value);
 }
 
 TEST_CASE(extension_world_hash_cache_scales)
@@ -1051,7 +1058,6 @@ TEST_CASE(relevant_global_main_world_wrapper_ignores_preferred_realm)
 
     vm.pop_execution_context();
     vm.pop_execution_context();
-    s_main_thread_vm_was_initialized_by_an_earlier_wrapper_test = true;
 }
 
 TEST_CASE(wasm_instance_exports_belong_to_the_realm_of_the_instance)
@@ -1092,5 +1098,4 @@ TEST_CASE(wasm_instance_exports_belong_to_the_realm_of_the_instance)
 
     vm.pop_execution_context();
     vm.pop_execution_context();
-    s_main_thread_vm_was_initialized_by_an_earlier_wrapper_test = true;
 }

@@ -7,6 +7,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Diagnostics.h>
 #include <LibGC/Weak.h>
 #include <LibWeb/CSS/Fetch.h>
 #include <LibWeb/CSS/StyleSheetState.h>
@@ -46,13 +47,13 @@ ImageStyleValueResource::ImageStyleValueResource(ImageStyleValueResourceKey key,
     , m_resource_request(move(request))
 {
     m_resource_request->add_callbacks(
-        [weak_document = GC::Weak(document), key = m_key] {
+        GC::create_function(GC::Heap::the(), GC::captures(GC::Weak(document), m_key), [](auto& weak_document, auto& key) {
             // FIXME: Can we directly access the resource (i.e. this) here instead of looking it up in the document?
             if (auto document = weak_document.ptr()) {
                 if (auto* resource = document->css_image_resource(key))
                     resource->on_decoded_image_data_loaded();
             }
-        },
+        }),
         nullptr);
 }
 
@@ -104,7 +105,14 @@ void ImageStyleValueResource::notify_image_style_values_did_update()
 
 static HashMap<StyleValueFFI::StyleValueData const*, ImageStyleValue const*>& facades_by_rust_style_value_data()
 {
-    static auto& facades = *new HashMap<StyleValueFFI::StyleValueData const*, ImageStyleValue const*>;
+    // NB: A facade is not thread safe, so each thread has its own. Two agents that see the same data get a facade each.
+    using Facades = HashMap<StyleValueFFI::StyleValueData const*, ImageStyleValue const*>;
+    // NB: Free what this thread kept when it exits.
+#ifdef AK_COMPILER_CLANG
+    AK_IGNORE_DIAGNOSTIC("-Wexit-time-destructors", static thread_local Facades facades)
+#else
+    static thread_local Facades facades;
+#endif
     return facades;
 }
 
@@ -208,10 +216,8 @@ void ImageStyleValue::set_style_sheet(StyleSheetState* style_sheet)
     m_parent_style_sheet_origin_clean.clear();
     m_should_absolutize_url_for_computed_value = false;
 
-    if (style_sheet) {
+    if (style_sheet)
         update_style_sheet_resource_context(*style_sheet);
-        style_sheet->register_pending_image_value(*this);
-    }
 }
 
 void ImageStyleValue::update_style_sheet_resource_context(StyleSheetState const& style_sheet)

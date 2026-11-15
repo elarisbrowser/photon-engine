@@ -106,6 +106,16 @@ pub(super) struct InstalledRecords {
     released: crate::fork::ForkShared<Vec<InstalledRecordID>>,
     /// How many leases on the records held as they are taken were taken.
     lease_epoch: u32,
+    /// How many of the records may have an effect on generated content elsewhere (see
+    /// [`record_may_affect_generated_content`]).
+    records_affecting_generated_content: u32,
+}
+
+/// Whether a box styled with `record` may change what generated content elsewhere shows: it changes a counter, as a
+/// list item does, or it opens or closes quotes.
+fn record_may_affect_generated_content(record: &Record) -> bool {
+    let view = crate::css::computed_value_views::ComputedValuesView::of(&record.payloads);
+    !view.counter_properties_are_none() || view.display().is_list_item() || view.content_opens_or_closes_quotes()
 }
 
 impl InstalledRecords {
@@ -166,6 +176,9 @@ impl InstalledRecords {
                 copy
             }
         };
+        if record_may_affect_generated_content(&record) {
+            self.records_affecting_generated_content += 1;
+        }
         self.slots[id.slot.index()] = Some(InstalledRecord {
             record,
             holders: 0,
@@ -177,10 +190,13 @@ impl InstalledRecords {
     }
 
     /// The identity the record `record`, derived for what no element is, is installed under: that of a slot holding
-    /// the same, or a new slot as [`Self::install`] takes.
+    /// the same, or a new slot as [`Self::install`] takes. `key_salt` goes into the key the record is found under, as the
+    /// hash of what a sample animates does: the longhands of a sample are those of the record it composes over, so its
+    /// samples would all share one key, of which a task that sees no sweep can gather many.
     pub(super) fn install_derived(
         &mut self,
         record: &Arc<Record>,
+        key_salt: u64,
         dependency_flags: impl FnOnce() -> u8,
     ) -> InstalledRecordID {
         if let Some(id) = self.named_by(record) {
@@ -188,7 +204,7 @@ impl InstalledRecords {
         }
         // NB: The key reads a few longhands, so records that differ in others share it: each takes the next key free. A
         //     sweep can open a gap in such a run, which costs a record past it no more than a slot of its own.
-        let mut content_key = Self::content_key(record);
+        let mut content_key = Self::content_key(record) ^ key_salt;
         while let Some(&slot) = self.derived_by_content.get(&content_key) {
             if self.slots[slot.index()]
                 .as_ref()
@@ -244,13 +260,18 @@ impl InstalledRecords {
     }
 
     pub(super) fn hold(&mut self, id: InstalledRecordID) {
+        self.hold_times(id, 1);
+    }
+
+    /// Holds the record `times` times, as many calls of [`Self::hold`] would.
+    pub(super) fn hold_times(&mut self, id: InstalledRecordID, times: u32) {
         let entry = self.slots[id.slot.index()]
             .as_mut()
             .filter(|_| self.generations[id.slot.index()] == id.generation)
             .expect("installed style record is live");
         entry.holders = entry
             .holders
-            .checked_add(1)
+            .checked_add(times)
             .expect("installed style record holder overflow");
     }
 
@@ -310,6 +331,9 @@ impl InstalledRecords {
                 return true;
             }
             let entry = self.slots[index].take().expect("a released slot holds its record");
+            if record_may_affect_generated_content(entry.record()) {
+                self.records_affecting_generated_content -= 1;
+            }
             entry.record().forget_installed_record();
             // NB: A slot whose generations ran out is never taken again.
             if self.generations[index] < InstalledRecordID::MAX_GENERATION {
@@ -325,6 +349,11 @@ impl InstalledRecords {
             self.derived_by_content.retain(|_, slot| slots[slot.index()].is_some());
         }
         freed
+    }
+
+    /// Whether no installed record may have an effect on generated content elsewhere.
+    pub(super) fn holds_no_records_affecting_generated_content(&self) -> bool {
+        self.records_affecting_generated_content == 0
     }
 
     pub(super) fn iter(&self) -> impl Iterator<Item = &InstalledRecord> {
@@ -351,12 +380,29 @@ mod tests {
     #[test]
     fn derived_records_whose_content_shares_a_key_each_keep_a_slot() {
         let mut records = InstalledRecords::default();
-        let first = records.install_derived(&record(1), || 0);
-        let second = records.install_derived(&record(2), || 0);
+        let first = records.install_derived(&record(1), 0, || 0);
+        let second = records.install_derived(&record(2), 0, || 0);
 
         assert_ne!(first, second);
-        assert_eq!(records.install_derived(&record(1), || 0), first);
-        assert_eq!(records.install_derived(&record(2), || 0), second);
+        assert_eq!(records.install_derived(&record(1), 0, || 0), first);
+        assert_eq!(records.install_derived(&record(2), 0, || 0), second);
+    }
+
+    #[test]
+    fn samples_are_found_under_the_hash_of_what_they_animate() {
+        let mut records = InstalledRecords::default();
+        let first = records.install_derived(&record(1), 1, || 0);
+        let second = records.install_derived(&record(2), 2, || 0);
+
+        assert_ne!(first, second);
+        // NB: The two records hash alike by their longhands, so each takes the key its overlay hash mixes in, and
+        //     neither probes past the other.
+        let content_key = InstalledRecords::content_key(&record(1));
+        assert_eq!(InstalledRecords::content_key(&record(2)), content_key);
+        assert_eq!(records.derived_by_content.get(&(content_key ^ 1)), Some(&first.slot));
+        assert_eq!(records.derived_by_content.get(&(content_key ^ 2)), Some(&second.slot));
+        assert_eq!(records.install_derived(&record(1), 1, || 0), first);
+        assert_eq!(records.install_derived(&record(2), 2, || 0), second);
     }
 
     #[test]

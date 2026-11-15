@@ -28,6 +28,7 @@ use crate::painting::recording_slot::{RecordingAnswer, RecordingSlot};
 use crate::painting::visual_animation::VisualAnimation;
 use crate::render_state::TaskBoundary;
 use crate::stage_thread::InFlight;
+use libcompositing_rust::scrolling::ScrollStateSnapshot;
 use libgfx_rust::FloatPoint;
 use std::cell::{Cell, RefCell, RefMut};
 use std::rc::Rc;
@@ -80,6 +81,13 @@ pub struct DocumentHost {
     /// The compositor animations the document's effects published in the current update pass, which the host hands
     /// the render state as the pass ends.
     compositor_animations: RefCell<Vec<VisualAnimation>>,
+    /// Where the document's boxes are scrolled to, as the host refreshed it last: what its queries map through, and its
+    /// frames take to the compositor. It is handed out by reference count, as the rows are.
+    scroll_state: RefCell<Rc<ScrollStateSnapshot>>,
+    /// The visual context trees the viewport mappings the host hands C++ map through.
+    viewport_mapping_trees: RefCell<crate::painting::viewport_mapping::ViewportMappingTrees>,
+    /// The display lists the document was rendered as where it is an SVG image's.
+    vector_images: RefCell<crate::painting::vector_image_cache::VectorImageCache>,
     /// What the host's scopes of a read lend the entries they call.
     begun_read: BegunRead,
     /// The writes the host queued that the render state has not applied yet, in the order the host made them.
@@ -90,6 +98,9 @@ pub struct DocumentHost {
     /// is: nothing was written to it since, queued, in place or by a job. Preparing them again would find nothing
     /// to do.
     paint_preparation_is_current: Cell<bool>,
+    /// What the next preparation of the paint and hit testing properties owes, and what the ones before left for the
+    /// document's frames.
+    paint_preparation: crate::painting::paint_passes::PaintPreparationNotes,
     /// The layout round that flew with the frame, from its landing until the host's next layout update pays it.
     flown_round: RefCell<Option<FlownRound>>,
     /// Whether a job of the host runs, whose host callbacks see rows it freed and the host has not heard of yet.
@@ -200,10 +211,14 @@ impl DocumentHost {
             fresh_transition_sample: Cell::default(),
             absolute_rects: RefCell::default(),
             compositor_animations: RefCell::default(),
+            scroll_state: RefCell::default(),
+            viewport_mapping_trees: RefCell::default(),
+            vector_images: RefCell::default(),
             begun_read: BegunRead::of_host(),
             changes: ChangeQueue::default(),
             flown_style: RefCell::default(),
             paint_preparation_is_current: Cell::new(false),
+            paint_preparation: Default::default(),
             flown_round: RefCell::default(),
             in_job: Cell::new(false),
             streamed: Cell::new(false),
@@ -1054,13 +1069,16 @@ impl DocumentHost {
         self.changes.set_aside();
     }
 
-    /// Queues the writes the host set aside behind those it queued meanwhile.
-    pub(crate) fn queue_writes_set_aside(&self) {
+    /// Queues the writes the host set aside behind those it queued meanwhile. Returns whether any of them stales the
+    /// paint and hit testing properties.
+    pub(crate) fn queue_writes_set_aside(&self) -> bool {
         // The paint and hit testing properties prepared while they were set aside read the render state as it was
         // before them.
-        if self.changes.queue_set_aside() {
+        let stales_paint_preparation = self.changes.queue_set_aside();
+        if stales_paint_preparation {
             self.note_render_state_write();
         }
+        stales_paint_preparation
     }
 
     /// Ends the drain of the style update that flew: the writes the host queued beside it are queued again, behind
@@ -1107,6 +1125,13 @@ impl DocumentHost {
 
     pub(crate) fn first_letter_styles_may_be_derived(&self) -> bool {
         self.shared.first_letter_styles_derived.load(Ordering::Relaxed)
+    }
+
+    /// Whether some text row may wait for paint timing to look at it, where no frame flies whose layout may give a row
+    /// new rendered text.
+    pub(crate) fn text_rows_may_await_first_paint(&self) -> bool {
+        self.layout_waits_for_no_frame().is_none()
+            || self.shared.text_rows_noted_for_first_paint.load(Ordering::Relaxed)
     }
 
     /// Whether some element may have random base values to keep, which only then is worth asking the render state.
@@ -1512,6 +1537,51 @@ impl DocumentHost {
     pub(crate) fn recording(&self) -> RefMut<'_, RecordingSlot> {
         self.recording.borrow_mut()
     }
+
+    /// Where the document's boxes are scrolled to, as the host refreshed it last.
+    pub(crate) fn scroll_state(&self) -> Rc<ScrollStateSnapshot> {
+        self.scroll_state.borrow().clone()
+    }
+
+    /// The visual context trees the viewport mappings the host hands C++ map through.
+    pub(crate) fn viewport_mapping_trees(&self) -> RefMut<'_, crate::painting::viewport_mapping::ViewportMappingTrees> {
+        self.viewport_mapping_trees.borrow_mut()
+    }
+
+    /// The display lists the document was rendered as where it is an SVG image's.
+    pub(crate) fn vector_images(&self) -> RefMut<'_, crate::painting::vector_image_cache::VectorImageCache> {
+        self.vector_images.borrow_mut()
+    }
+
+    /// Takes `device_offsets`, the offsets the render state refreshed, as the document's scroll state.
+    pub(crate) fn refresh_scroll_state(&self, device_offsets: Vec<FloatPoint>) {
+        self.scroll_state
+            .replace(Rc::new(ScrollStateSnapshot::from_device_offsets(device_offsets)));
+    }
+
+    /// Forgets where the document's boxes were scrolled to: nothing is scrolled until the next refresh.
+    pub(crate) fn forget_scroll_state(&self) {
+        self.scroll_state.take();
+    }
+
+    /// Whether the paint and hit testing properties of the document were prepared from its render state as it is, so
+    /// that preparing them again would find nothing to do: they were noted current as their preparation began, and
+    /// nothing was written to the render state since, queued, in place or by a job.
+    pub(crate) fn paint_preparation_is_current(&self) -> bool {
+        self.paint_preparation_is_current.get()
+    }
+
+    /// Notes that the paint and hit testing properties of the document are current, as their preparation begins: they
+    /// stay current until something writes to the render state.
+    pub(crate) fn note_paint_preparation_is_current(&self) {
+        self.paint_preparation_is_current.set(true);
+    }
+
+    /// What the next preparation of the paint and hit testing properties owes, and what the ones before left for the
+    /// document's frames.
+    pub(crate) fn paint_preparation(&self) -> &crate::painting::paint_passes::PaintPreparationNotes {
+        &self.paint_preparation
+    }
 }
 
 /// Creates the host of a new document.
@@ -1569,21 +1639,6 @@ impl Drop for TestHost {
     }
 }
 
-/// Whether the paint and hit testing properties of `host`'s document were prepared from its render state as it is, so
-/// that preparing them again would find nothing to do: the host noted them current as it began to prepare them, and
-/// wrote nothing to the render state since, queued, in place or by a job.
-#[unsafe(no_mangle)]
-pub extern "C" fn document_host_paint_preparation_is_current(host: &DocumentHost) -> bool {
-    host.paint_preparation_is_current.get()
-}
-
-/// Notes that the paint and hit testing properties of `host`'s document are current, as the host begins to prepare them:
-/// they stay current until the host writes to the render state.
-#[unsafe(no_mangle)]
-pub extern "C" fn document_host_note_paint_preparation_is_current(host: &DocumentHost) {
-    host.paint_preparation_is_current.set(true);
-}
-
 /// What a scope of a read of a document's render state reads of the document's host: whether the host waits for the
 /// frame, which it keeps up to date, and the read the scope lends.
 #[repr(C)]
@@ -1615,10 +1670,11 @@ pub extern "C" fn document_host_set_writes_aside(host: &DocumentHost) {
     host.set_writes_aside();
 }
 
-/// Queues the writes `host` set aside behind the writes it queued meanwhile.
+/// Queues the writes `host` set aside behind the writes it queued meanwhile. Returns whether any of them stales the
+/// paint and hit testing properties, which a recording made while they were set aside did not see.
 #[unsafe(no_mangle)]
-pub extern "C" fn document_host_queue_writes_set_aside(host: &DocumentHost) {
-    host.queue_writes_set_aside();
+pub extern "C" fn document_host_queue_writes_set_aside(host: &DocumentHost) -> bool {
+    host.queue_writes_set_aside()
 }
 
 /// Destroys `host`, and has the render owner drop the render state of its document, where a job made one, without
@@ -1769,7 +1825,6 @@ mod tests {
 
         host.queue_change(ArenaChange::Layout(LayoutChange::SetNeedsLayoutUpdate {
             node: viewport,
-            propagate_through_ancestors: false,
         }));
         assert_eq!(host.known_layout_up_to_date_unless_built(), None);
     }

@@ -30,6 +30,28 @@
 
 namespace Web::HTML {
 
+// https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-rfc6265bis-22#dedicated-and-shared-requests
+URL::Origin WorkerGlobalScope::site_for_cookies() const
+{
+    // 1. Let site be worker's origin.
+    auto site = relevant_settings_object(*this).origin();
+
+    // 2. For each document in worker's Documents:
+    // NB: A worker owner represents the sites for cookies of its own Documents.
+    for (auto const& owner : owner_set()) {
+        // 1. Let document-site be document's "site for cookies" (as defined in Section 5.2.1).
+        auto const* document = owner.get_pointer<SerializedDocument>();
+        auto const& document_site = document ? document->site_for_cookies : owner.get<SerializedWorkerGlobalScope>().site_for_cookies;
+
+        // 2. If document-site is not same-site with site, return an origin set to an opaque origin.
+        if (!document_site.is_same_site(site))
+            return URL::Origin::create_opaque();
+    }
+
+    // 3. Return site.
+    return site;
+}
+
 GC_DEFINE_ALLOCATOR(WorkerGlobalScope);
 
 WorkerGlobalScope::WorkerGlobalScope(GC::Ref<Web::Page> page)
@@ -47,8 +69,6 @@ JS::Realm& WorkerGlobalScope::realm() const
 
 void WorkerGlobalScope::initialize_web_interfaces_impl()
 {
-    WindowOrWorkerGlobalScopeMixin::initialize();
-
     m_navigator = WorkerNavigator::create(*this);
 }
 
@@ -87,6 +107,26 @@ void WorkerGlobalScope::close_a_worker()
     // 2. Set workerGlobal's closing flag to true. (This prevents any further tasks from being queued.)
     m_closing = true;
     relevant_settings_object(*this).responsible_event_loop().task_queue().discard_further_tasks();
+
+    // NB: The event loop is destroyed once it has no more to do after the closing flag is set.
+    relevant_settings_object(*this).responsible_event_loop().destroy_once_script_has_finished();
+}
+
+// https://html.spec.whatwg.org/multipage/workers.html#terminate-a-worker
+void WorkerGlobalScope::terminate_a_worker()
+{
+    // 1. Set the worker's WorkerGlobalScope object's closing flag to true.
+    // 2. If there are any tasks queued in the WorkerGlobalScope object's relevant agent's event loop's task queues,
+    //    discard them without processing them.
+    close_a_worker();
+
+    // 3. Abort the script currently running in the worker.
+    relevant_realm(*this).vm().request_interrupt();
+
+    // 4. If the worker's WorkerGlobalScope object is actually a DedicatedWorkerGlobalScope object (i.e. the worker is
+    //    a dedicated worker), then empty the port message queue of the port that the worker's implicit port is
+    //    entangled with.
+    // NB: That port is in the owner, whose Worker::terminate() empties its queue.
 }
 
 // https://html.spec.whatwg.org/multipage/workers.html#importing-scripts-and-libraries

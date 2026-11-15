@@ -5,7 +5,8 @@
  */
 
 use super::effect_clip_plan::EffectClipPlan;
-use super::effect_geometry::{Extent, SpaceMatrices, changed_extent_through_filters, nearest_spreading_effects};
+use super::effect_geometry::{Extent, changed_extent_through_filters, nearest_spreading_effects};
+use super::layers::{LayerKind, LayerPlan};
 use super::replay::{OwnSpaceClipExtent, own_space_clip_extent};
 use super::summary::{DisplayListSummary, LiveContent};
 use crate::display_list::builder::{
@@ -23,8 +24,7 @@ use crate::fast_hash::FastMap;
 use crate::host::FfiAnimatedContentViewportEffect;
 use crate::visual_context::queries::TreeCullingScratch;
 use crate::visual_context::{
-    ClipNodeData, EffectNodeData, IncludeVisualViewportTransform, SpatialData, VisualContextTree,
-    device_offset_for_index,
+    ClipNodeData, EffectNodeData, SpatialData, VisualContextTree, WorldTransforms, device_offset_for_index,
 };
 use libgfx_rust::{AffineTransform, FloatMatrix4x4, FloatPoint, FloatRect, IntRect, enclosing_int_rect};
 use std::cell::{Cell, OnceCell, RefCell};
@@ -34,6 +34,8 @@ struct CommandReference<'a> {
     header: DisplayListCommandHeader,
     payload: &'a [u8],
     context: ContextRef,
+    // The offset on its tape of the record that holds the command: its own, or that of the command it is nested in.
+    record_offset: u32,
 }
 
 // A tape and its run table. The runs are the only place a command's visual context is read from.
@@ -50,11 +52,12 @@ impl<'a> Tape<'a> {
 
     fn collect_commands_of_runs(&self, runs: &[DisplayListCommandRun], commands: &mut Vec<CommandReference<'a>>) {
         for run in runs {
-            for_each_command(self.run_bytes(run), |header, _, payload| {
+            for_each_command(self.run_bytes(run), |header, offset, payload| {
                 commands.push(CommandReference {
                     header: *header,
                     payload,
                     context: run.context,
+                    record_offset: run.offset + offset as u32,
                 });
             });
         }
@@ -62,13 +65,18 @@ impl<'a> Tape<'a> {
 }
 
 // Records nested in a group inherit the visual context of the enclosing run.
-fn collect_nested_command_references(bytes: &[u8], context: ContextRef) -> Vec<CommandReference<'_>> {
+fn collect_nested_command_references(
+    bytes: &[u8],
+    context: ContextRef,
+    record_offset: u32,
+) -> Vec<CommandReference<'_>> {
     let mut commands = Vec::new();
     for_each_command(bytes, |header, _, payload| {
         commands.push(CommandReference {
             header: *header,
             payload,
             context,
+            record_offset,
         });
     });
     commands
@@ -83,7 +91,7 @@ fn static_mask_contents(tape: Tape<'_>, effect_count: usize) -> Vec<Option<Stati
     let mut masks: Vec<_> = (0..effect_count).map(|_| None).collect();
     let mut seen = vec![false; effect_count];
     for run in tape.runs {
-        for_each_command(tape.run_bytes(run), |header, _, payload| {
+        for_each_command(tape.run_bytes(run), |header, offset, payload| {
             if header.command_type != DisplayListCommandType::DeclareMaskContent {
                 return;
             }
@@ -96,9 +104,12 @@ fn static_mask_contents(tape: Tape<'_>, effect_count: usize) -> Vec<Option<Stati
             }
             seen[index] = true;
             let content = super::nested_records::span_bytes(payload, declaration.content);
-            let nested = collect_nested_command_references(content, run.context);
+            let nested = collect_nested_command_references(content, run.context, run.offset + offset as u32);
             // Mask groups use their declaration's visual context. Only compare drawing commands whose
-            // complete appearance is encoded in the payload, without canvas, video, or nested scenes.
+            // complete appearance is encoded in the payload, without canvas or video. The id of a nested
+            // display list, such as that of an SVG mask image, names one recording whose commands never
+            // change. The video and animated image frames drawn only inside it can, and for those
+            // ContextPresenter damages the whole viewport.
             if nested.iter().all(|nested| match nested.header.command_type {
                 DisplayListCommandType::FillRect => read_command::<FillRect>(nested.payload)
                     .background_color_animation_effect
@@ -116,6 +127,7 @@ fn static_mask_contents(tape: Tape<'_>, effect_count: usize) -> Vec<Option<Stati
                 DisplayListCommandType::PaintLinearGradient
                 | DisplayListCommandType::PaintRadialGradient
                 | DisplayListCommandType::PaintConicGradient
+                | DisplayListCommandType::PaintNestedDisplayList
                 | DisplayListCommandType::DrawEllipse
                 | DisplayListCommandType::DrawLine
                 | DisplayListCommandType::DrawRect => true,
@@ -288,7 +300,8 @@ fn display_list_commands_are_equal(a: &CommandReference<'_>, b: &CommandReferenc
     }
 
     if a.header.command_type == DisplayListCommandType::DrawGlyphRun {
-        return same_field(offset_of!(DrawGlyphRun, font_smoothing), 1)
+        return same_field(offset_of!(DrawGlyphRun, stroke_width), 4)
+            && same_field(offset_of!(DrawGlyphRun, font_smoothing), 1)
             && first.u64_at(offset_of!(DrawGlyphRun, font_id)) == second.u64_at(offset_of!(DrawGlyphRun, font_id))
             && first.span_bytes_at(offset_of!(DrawGlyphRun, glyphs))
                 == second.span_bytes_at(offset_of!(DrawGlyphRun, glyphs))
@@ -467,29 +480,11 @@ struct ContextPairVerdict {
     equal: bool,
 }
 
-// How one tree's filters spread the commands drawn under them, worked out on first use.
+// Where one tree draws its commands and how its filters spread them, worked out on first use.
 #[derive(Default)]
-struct FilterSpreading {
+struct LazySideGeometry {
     nearest_spreading_effects: OnceCell<Vec<EffectNodeIndex>>,
-    to_root_matrices: RefCell<Vec<Option<FloatMatrix4x4>>>,
-}
-
-struct TreeSpaces<'a> {
-    tree: &'a VisualContextTree,
-    scroll_offsets: &'a [FloatPoint],
-    to_root_matrices: &'a mut Vec<Option<FloatMatrix4x4>>,
-}
-
-impl SpaceMatrices for TreeSpaces<'_> {
-    fn to_root_matrix(&mut self, space: SpatialNodeIndex) -> FloatMatrix4x4 {
-        if self.to_root_matrices.is_empty() {
-            self.to_root_matrices.resize(self.tree.spatial_nodes.len(), None);
-        }
-        *self.to_root_matrices[space.0 as usize].get_or_insert_with(|| {
-            self.tree
-                .accumulated_matrix(space, self.scroll_offsets, IncludeVisualViewportTransform::Yes)
-        })
-    }
+    world_transforms: OnceCell<WorldTransforms>,
 }
 
 // Where a command's inline clips in spaces of their own let it draw on one side of the comparison.
@@ -500,22 +495,13 @@ fn own_space_clip_extent_on(command: &CommandReference<'_>, side: TreeSide<'_>) 
     {
         return None;
     }
-    let mut to_root_matrices = side.filter_spreading.to_root_matrices.borrow_mut();
-    let mut spaces = TreeSpaces {
-        tree: side.tree,
-        scroll_offsets: side.scroll_offsets,
-        to_root_matrices: &mut to_root_matrices,
-    };
-    let mut to_root = |space: SpatialNodeIndex| {
-        ((space.0 as usize) < side.tree.spatial_nodes.len()).then(|| spaces.to_root_matrix(space))
-    };
-    let command_to_root = to_root(command.context.spatial)?;
+    let world = side.world();
     own_space_clip_extent(
         &command.header,
         command.payload,
         command.header.bounding_rect.to_float(),
-        command_to_root,
-        to_root,
+        world.draw_matrix_if_known(command.context.spatial)?,
+        |space| world.draw_matrix_if_known(space),
     )
 }
 
@@ -526,7 +512,16 @@ struct TreeSide<'b> {
     scroll_offsets: &'b [FloatPoint],
     culling: &'b TreeCullingScratch,
     effect_clips: &'b EffectClipPlan,
-    filter_spreading: &'b FilterSpreading,
+    lazy_geometry: &'b LazySideGeometry,
+}
+
+impl<'b> TreeSide<'b> {
+    // Damage maps commands with the matrices replay draws them with.
+    fn world(&self) -> &'b WorldTransforms {
+        self.lazy_geometry
+            .world_transforms
+            .get_or_init(|| WorldTransforms::new(self.tree, self.scroll_offsets, Some(FloatMatrix4x4::identity())))
+    }
 }
 
 struct TreeChainComparison<'a> {
@@ -551,8 +546,8 @@ struct TreeChainComparison<'a> {
     effect_chain_memo: RefCell<Vec<ChainMemoEntry>>,
     chain_walk_path: RefCell<Vec<(u32, u32)>>,
     mask_comparisons: RefCell<FastMap<(u32, u32), bool>>,
-    old_filter_spreading: FilterSpreading,
-    new_filter_spreading: FilterSpreading,
+    old_lazy_geometry: LazySideGeometry,
+    new_lazy_geometry: LazySideGeometry,
 }
 
 impl<'a> TreeChainComparison<'a> {
@@ -562,7 +557,7 @@ impl<'a> TreeChainComparison<'a> {
             scroll_offsets: self.old_scroll_offsets,
             culling: &self.old_culling,
             effect_clips: &self.old_effect_clips,
-            filter_spreading: &self.old_filter_spreading,
+            lazy_geometry: &self.old_lazy_geometry,
         }
     }
 
@@ -572,7 +567,7 @@ impl<'a> TreeChainComparison<'a> {
             scroll_offsets: self.new_scroll_offsets,
             culling: &self.new_culling,
             effect_clips: &self.new_effect_clips,
-            filter_spreading: &self.new_filter_spreading,
+            lazy_geometry: &self.new_lazy_geometry,
         }
     }
 
@@ -789,12 +784,8 @@ impl<'a> TreeChainComparison<'a> {
 // The viewport bounds that the clips outside every filter on a context's effect chain put on the
 // filtered output, or None when no rect clip bounds it. Replay can widen an effect's output clip
 // for escaping descendants, so the complete display list's layer plan says which clips are outside.
-fn filter_output_clip_bounds(
-    context: ContextRef,
-    tree: &VisualContextTree,
-    effect_clips: &EffectClipPlan,
-    scroll_offsets: &[FloatPoint],
-) -> Option<FloatRect> {
+fn filter_output_clip_bounds(context: ContextRef, side: TreeSide<'_>) -> Option<FloatRect> {
+    let (tree, effect_clips) = (side.tree, side.effect_clips);
     let mut clip = context.clip;
     let mut effect = context.effect;
     while !effect.is_none() {
@@ -812,13 +803,9 @@ fn filter_output_clip_bounds(
         if let ClipNodeData::Rect(data) = &node.data
             && data.mode == ClipMode::Intersect
         {
-            let bounds = tree
-                .transform_rect_to_viewport(
-                    node.spatial,
-                    data.rect,
-                    scroll_offsets,
-                    IncludeVisualViewportTransform::Yes,
-                )
+            let bounds = side
+                .world()
+                .map_rect_to_root(node.spatial, data.rect)
                 .inflated(1.0, 1.0);
             if bounds.x.is_finite() && bounds.y.is_finite() && bounds.width.is_finite() && bounds.height.is_finite() {
                 output_bounds = Some(output_bounds.map_or(bounds, |output_bounds| output_bounds.intersected(bounds)));
@@ -840,22 +827,87 @@ fn intersect_like_gfx_int_rect(rect: IntRect, other: IntRect) -> IntRect {
     IntRect::new(left, top, right - left, bottom - top)
 }
 
-struct DamageAccumulator {
+/// The layer plans of the old and the new frame, which have the same layers. A layer keeps its raster between the
+/// frames, so damage is attributed to the layers that draw the content it comes from.
+#[derive(Clone, Copy)]
+pub struct LayerPlans<'a> {
+    pub old: &'a LayerPlan,
+    pub new: &'a LayerPlan,
+}
+
+#[derive(Clone, Copy)]
+enum FrameSide {
+    Old,
+    New,
+}
+
+#[derive(Clone, Copy)]
+enum DamagedLayers {
+    OfRecord(FrameSide, u32),
+    All,
+}
+
+#[derive(Clone, Copy, Default)]
+struct LayerDamage {
+    rect: Option<IntRect>,
+    is_unbounded: bool,
+}
+
+struct DamageAccumulator<'a> {
     damage_rect: Option<IntRect>,
     changed_unbounded_command: bool,
     viewport_rect: IntRect,
+    layer_plans: Option<LayerPlans<'a>>,
+    damage_of_layers: Vec<LayerDamage>,
 }
 
-impl DamageAccumulator {
-    // Once the damage covers the viewport, no further command can change the outcome.
+impl DamageAccumulator<'_> {
+    // Once the damage covers the viewport in every raster it reaches, no further command can change the outcome.
     fn covers_viewport(&self) -> bool {
-        self.changed_unbounded_command
-            || self
-                .damage_rect
-                .is_some_and(|damage_rect| damage_rect.contains_rect(self.viewport_rect))
+        let covers = |is_unbounded: bool, rect: Option<IntRect>| {
+            is_unbounded || rect.is_some_and(|rect| rect.contains_rect(self.viewport_rect))
+        };
+        covers(self.changed_unbounded_command, self.damage_rect)
+            && self.layer_plans.is_none_or(|plans| {
+                plans
+                    .new
+                    .layers
+                    .iter()
+                    .zip(&self.damage_of_layers)
+                    .all(|(layer, damage)| {
+                        matches!(layer.kind, LayerKind::Media { .. }) || covers(damage.is_unbounded, damage.rect)
+                    })
+            })
     }
 
-    fn add_command_damage(&mut self, command: &CommandReference<'_>, side: TreeSide<'_>) {
+    fn for_each_damaged_layer(&mut self, layers: DamagedLayers, mut f: impl FnMut(&mut LayerDamage)) {
+        let Some(plans) = self.layer_plans else {
+            return;
+        };
+        let layer = match layers {
+            DamagedLayers::OfRecord(FrameSide::Old, record_offset) => plans.old.layer_of_record(record_offset),
+            DamagedLayers::OfRecord(FrameSide::New, record_offset) => plans.new.layer_of_record(record_offset),
+            DamagedLayers::All => {
+                self.damage_of_layers.iter_mut().for_each(f);
+                return;
+            }
+        };
+        f(&mut self.damage_of_layers[layer]);
+    }
+
+    fn add_unbounded_damage(&mut self, layers: DamagedLayers) {
+        self.changed_unbounded_command = true;
+        self.for_each_damaged_layer(layers, |damage| damage.is_unbounded = true);
+    }
+
+    fn add_damage_rect(&mut self, rect: IntRect, layers: DamagedLayers) {
+        let united =
+            |damage_rect: Option<IntRect>| Some(damage_rect.map_or(rect, |damage_rect| damage_rect.united(rect)));
+        self.damage_rect = united(self.damage_rect);
+        self.for_each_damaged_layer(layers, |damage| damage.rect = united(damage.rect));
+    }
+
+    fn add_command_damage(&mut self, command: &CommandReference<'_>, side: TreeSide<'_>, frame: FrameSide) {
         let context = command.context;
         if side.culling.context_culls_everything(context) {
             return;
@@ -872,14 +924,25 @@ impl DamageAccumulator {
         if rect.is_empty() {
             return;
         }
-        self.add_changed_content_damage(rect, context, side);
+        self.add_changed_content_damage(
+            rect,
+            context,
+            side,
+            DamagedLayers::OfRecord(frame, command.record_offset),
+        );
     }
 
     // Damage for content drawn within `rect` in `context` that changed, wherever the filters above
     // it spread the change.
-    fn add_changed_content_damage(&mut self, rect: FloatRect, context: ContextRef, side: TreeSide<'_>) {
+    fn add_changed_content_damage(
+        &mut self,
+        rect: FloatRect,
+        context: ContextRef,
+        side: TreeSide<'_>,
+        layers: DamagedLayers,
+    ) {
         let nearest_spreading_effects = side
-            .filter_spreading
+            .lazy_geometry
             .nearest_spreading_effects
             .get_or_init(|| nearest_spreading_effects(side.tree));
         let spread_by_filters =
@@ -890,29 +953,20 @@ impl DamageAccumulator {
             context.spatial,
             rect,
             context.effect,
-            &mut TreeSpaces {
-                tree: side.tree,
-                scroll_offsets: side.scroll_offsets,
-                to_root_matrices: &mut side.filter_spreading.to_root_matrices.borrow_mut(),
-            },
+            side.world(),
         );
         // Spread content can reach far past the clips it was drawn in, but not past those outside
         // the filters.
         let output_clip_bounds = if spread_by_filters {
-            filter_output_clip_bounds(context, side.tree, side.effect_clips, side.scroll_offsets)
+            filter_output_clip_bounds(context, side)
         } else {
             None
         };
         let mut transformed_rect = match (extent, output_clip_bounds) {
-            (Extent::Within(rect), _) => side.tree.transform_rect_to_viewport(
-                space,
-                rect,
-                side.scroll_offsets,
-                IncludeVisualViewportTransform::Yes,
-            ),
+            (Extent::Within(rect), _) => side.world().map_rect_to_root(space, rect),
             (_, Some(output_clip_bounds)) => output_clip_bounds,
             _ => {
-                self.changed_unbounded_command = true;
+                self.add_unbounded_damage(layers);
                 return;
             }
         };
@@ -924,7 +978,7 @@ impl DamageAccumulator {
             || !transformed_rect.width.is_finite()
             || !transformed_rect.height.is_finite()
         {
-            self.changed_unbounded_command = true;
+            self.add_unbounded_damage(layers);
             return;
         }
         if let Some(output_clip_bounds) = output_clip_bounds {
@@ -942,19 +996,34 @@ impl DamageAccumulator {
         if transformed_rect.is_empty() {
             return;
         }
-        let command_damage = enclosing_int_rect(transformed_rect);
-        self.damage_rect = Some(match self.damage_rect {
-            Some(damage_rect) => damage_rect.united(command_damage),
-            None => command_damage,
-        });
+        self.add_damage_rect(enclosing_int_rect(transformed_rect), layers);
     }
 
     fn add_old_command_damage(&mut self, chains: &TreeChainComparison<'_>, command: &CommandReference<'_>) {
-        self.add_command_damage(command, chains.old_side());
+        self.add_command_damage(command, chains.old_side(), FrameSide::Old);
     }
 
     fn add_new_command_damage(&mut self, chains: &TreeChainComparison<'_>, command: &CommandReference<'_>) {
-        self.add_command_damage(command, chains.new_side());
+        self.add_command_damage(command, chains.new_side(), FrameSide::New);
+    }
+
+    // A command that the new plan draws into another layer than the old plan leaves the raster of one layer and
+    // enters that of the other, even where it draws the same pixels.
+    fn add_layer_change_damage(
+        &mut self,
+        chains: &TreeChainComparison<'_>,
+        old_command: &CommandReference<'_>,
+        new_command: &CommandReference<'_>,
+    ) {
+        let Some(plans) = self.layer_plans else {
+            return;
+        };
+        if plans.old.layer_of_record(old_command.record_offset) == plans.new.layer_of_record(new_command.record_offset)
+        {
+            return;
+        }
+        self.add_old_command_damage(chains, old_command);
+        self.add_new_command_damage(chains, new_command);
     }
 
     // A backdrop filter can read the pixels around its region, so damage beneath the region changes it
@@ -973,13 +1042,14 @@ impl DamageAccumulator {
             return;
         }
         let mut seen_effects = vec![false; tree.effect_nodes.len()];
+        // Each effect with a backdrop filter, with the offset of its first record.
         let mut backdrop_effects = Vec::new();
         for run in command_runs {
             let mut effect = run.context.effect;
             while !effect.is_none() && !seen_effects[effect.0 as usize] {
                 seen_effects[effect.0 as usize] = true;
                 if backdrop_of(effect).is_some() {
-                    backdrop_effects.push(effect);
+                    backdrop_effects.push((effect, run.offset));
                 }
                 effect = tree.effect_nodes[effect.0 as usize].parent;
             }
@@ -995,19 +1065,14 @@ impl DamageAccumulator {
             };
             let damage = damage_rect.to_float();
             let mut damage_grew = false;
-            for (index, &effect) in backdrop_effects.iter().enumerate() {
+            for (index, &(effect, first_record_offset)) in backdrop_effects.iter().enumerate() {
                 if region_is_damaged[index] {
                     continue;
                 }
                 let node = &tree.effect_nodes[effect.0 as usize];
                 let backdrop = backdrop_of(effect).expect("only effects with a backdrop filter are collected");
                 let region = backdrop.region.to_float();
-                let to_root_matrix = TreeSpaces {
-                    tree,
-                    scroll_offsets: side.scroll_offsets,
-                    to_root_matrices: &mut side.filter_spreading.to_root_matrices.borrow_mut(),
-                }
-                .to_root_matrix(node.spatial);
+                let to_root_matrix = side.world().draw_matrix(node.spatial);
                 let reads_damage = (|| {
                     if !to_root_matrix.is_2d_affine() {
                         return None;
@@ -1027,7 +1092,12 @@ impl DamageAccumulator {
                     clip: side.effect_clips.output_clip(effect),
                     effect,
                 };
-                self.add_changed_content_damage(region, backdrop_context, side);
+                self.add_changed_content_damage(
+                    region,
+                    backdrop_context,
+                    side,
+                    DamagedLayers::OfRecord(FrameSide::New, first_record_offset),
+                );
             }
             if !damage_grew {
                 return;
@@ -1137,10 +1207,17 @@ impl DamageAccumulator {
         inline_clip_spaces_may_have_moved: bool,
     ) {
         let commands_moved = !verdict.equal;
-        if !commands_moved && !scroll_offsets_differ && !inline_clip_spaces_may_have_moved {
+        let commands_may_change_layers = self
+            .layer_plans
+            .is_some_and(|plans| !plans.old.places_run_like(old_run, plans.new, new_run));
+        if !commands_moved
+            && !scroll_offsets_differ
+            && !inline_clip_spaces_may_have_moved
+            && !commands_may_change_layers
+        {
             return;
         }
-        for_each_command(chains.old_tape.run_bytes(old_run), |header, _, payload| {
+        for_each_command(chains.old_tape.run_bytes(old_run), |header, offset, payload| {
             if self.covers_viewport() {
                 return;
             }
@@ -1148,12 +1225,17 @@ impl DamageAccumulator {
                 header: *header,
                 payload,
                 context: old_run.context,
+                record_offset: old_run.offset + offset as u32,
             };
             let new_command = CommandReference {
                 header: *header,
                 payload,
                 context: new_run.context,
+                record_offset: new_run.offset + offset as u32,
             };
+            if commands_may_change_layers {
+                self.add_layer_change_damage(chains, &old_command, &new_command);
+            }
             if commands_moved {
                 self.add_moved_command_damage(chains, &old_command, &new_command);
             }
@@ -1195,6 +1277,7 @@ impl DamageAccumulator {
 
         let add_matched_pair_damage =
             |damage: &mut Self, old_command: &CommandReference<'_>, new_command: &CommandReference<'_>| {
+                damage.add_layer_change_damage(chains, old_command, new_command);
                 damage.add_visual_context_damage(chains, old_command, new_command);
                 if scroll_offsets_differ {
                     damage.add_scrollbar_scroll_damage(chains, old_command, new_command);
@@ -1361,6 +1444,7 @@ pub fn animated_content_may_affect_viewport(
         };
         *flag = true;
     }
+    let world = OnceCell::new();
     let mut may_affect_viewport = false;
     let tape = Tape {
         bytes: command_bytes,
@@ -1422,13 +1506,13 @@ pub fn animated_content_may_affect_viewport(
             }
             let mut rect = header.bounding_rect.to_float();
             if has_inline_clip_in_its_own_space && header.has_bounding_rect {
-                let to_root = |space: SpatialNodeIndex| {
-                    ((space.0 as usize) < tree.spatial_nodes.len())
-                        .then(|| tree.accumulated_matrix(space, scroll_offsets, IncludeVisualViewportTransform::Yes))
-                };
-                if let Some(command_to_root) = to_root(run.context.spatial)
+                let world =
+                    world.get_or_init(|| WorldTransforms::new(tree, scroll_offsets, Some(FloatMatrix4x4::identity())));
+                if let Some(command_to_root) = world.draw_matrix_if_known(run.context.spatial)
                     && let Some(OwnSpaceClipExtent::Within(clipped_rect)) =
-                        own_space_clip_extent(header, payload, rect, command_to_root, to_root)
+                        own_space_clip_extent(header, payload, rect, command_to_root, |space| {
+                            world.draw_matrix_if_known(space)
+                        })
                 {
                     if clipped_rect.is_empty() {
                         return;
@@ -1471,6 +1555,23 @@ pub struct LiveContentChanges<'a> {
     pub image_frames: &'a [ImageFrameResourceId],
     /// What the compositor repaints whatever the lists hold, such as a blinking caret.
     pub forced_damage_rect: IntRect,
+    pub offsets_of_records_composited_as_media_layers: &'a [u32],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisplayListDamage {
+    pub rect: Option<IntRect>,
+    /// With the frames' layer plans, the damage of each layer, none where that has no bounds.
+    pub layer_rects: Vec<Option<IntRect>>,
+}
+
+impl DisplayListDamage {
+    pub fn unbounded(layer_count: usize) -> Self {
+        Self {
+            rect: None,
+            layer_rects: vec![None; layer_count],
+        }
+    }
 }
 
 impl LiveContentChanges<'_> {
@@ -1489,15 +1590,19 @@ impl LiveContentChanges<'_> {
 
 // The viewport-space damage between two frames, or None when a change without bounds needs a
 // full repaint. The diff pairs the run tables first: runs that are byte-identical under chains of
-// the same shape are never decoded unless their chains or scroll offsets changed. Only the runs
-// in between are diffed command by command, and the diff stops as soon as the damage covers the
-// viewport, so a later unbounded change may then be reported as the viewport rect instead of None.
+// the same shape are never decoded unless their chains, scroll offsets or layers changed. Only the
+// runs in between are diffed command by command, and the diff stops as soon as the damage covers
+// the viewport, so a later unbounded change may then be reported as the viewport rect instead of
+// None. Given the frames' layer plans, the damage of each layer is reported too.
 pub fn compute_display_list_damage(
     old_frame: DisplayListFrame<'_>,
     new_frame: DisplayListFrame<'_>,
     viewport_rect: IntRect,
     live_content_changes: LiveContentChanges<'_>,
-) -> Option<IntRect> {
+    layer_plans: Option<LayerPlans<'_>>,
+) -> DisplayListDamage {
+    let layer_count = layer_plans.map_or(0, |plans| plans.new.layers.len());
+    let unbounded_damage = DisplayListDamage::unbounded(layer_count);
     let old_tape = Tape {
         bytes: old_frame.command_bytes,
         runs: old_frame.command_runs,
@@ -1517,14 +1622,20 @@ pub fn compute_display_list_damage(
     let chains = TreeChainComparison {
         old_tape,
         new_tape,
-        old_effect_clips: EffectClipPlan::from_contexts(
+        old_effect_clips: match EffectClipPlan::from_contexts(
             old_visual_context_tree,
             old_command_runs.iter().map(|run| run.context),
-        )?,
-        new_effect_clips: EffectClipPlan::from_contexts(
+        ) {
+            Some(plan) => plan,
+            None => return unbounded_damage,
+        },
+        new_effect_clips: match EffectClipPlan::from_contexts(
             new_visual_context_tree,
             new_command_runs.iter().map(|run| run.context),
-        )?,
+        ) {
+            Some(plan) => plan,
+            None => return unbounded_damage,
+        },
         old_mask_contents: OnceCell::new(),
         new_mask_contents: OnceCell::new(),
         old_tree: old_visual_context_tree,
@@ -1547,8 +1658,8 @@ pub fn compute_display_list_damage(
         ]),
         chain_walk_path: RefCell::new(Vec::new()),
         mask_comparisons: RefCell::new(FastMap::default()),
-        old_filter_spreading: FilterSpreading::default(),
-        new_filter_spreading: FilterSpreading::default(),
+        old_lazy_geometry: LazySideGeometry::default(),
+        new_lazy_geometry: LazySideGeometry::default(),
     };
     let scroll_offsets_differ = old_scroll_offsets != new_scroll_offsets;
     // NB: An inline clip in a space of its own names its space by index, which a new tree can give to another node,
@@ -1583,6 +1694,8 @@ pub fn compute_display_list_damage(
         damage_rect: None,
         changed_unbounded_command: false,
         viewport_rect,
+        layer_plans,
+        damage_of_layers: vec![LayerDamage::default(); layer_count],
     };
     let identical_run_pairs = old_command_runs[..identical_prefix_run_count]
         .iter()
@@ -1634,7 +1747,11 @@ pub fn compute_display_list_damage(
             if damage.covers_viewport() {
                 break;
             }
-            if !live_content_changes.includes(live_content_record.content) {
+            if !live_content_changes.includes(live_content_record.content)
+                || live_content_changes
+                    .offsets_of_records_composited_as_media_layers
+                    .contains(&live_content_record.record.record_offset)
+            {
                 continue;
             }
             let offset = live_content_record.record.record_offset as usize;
@@ -1646,6 +1763,7 @@ pub fn compute_display_list_damage(
                     header,
                     payload: &new_frame.command_bytes[payload_start..payload_start + header.payload_size as usize],
                     context: new_command_runs[live_content_record.record.run_index as usize].context,
+                    record_offset: live_content_record.record.record_offset,
                 },
             );
         }
@@ -1654,23 +1772,26 @@ pub fn compute_display_list_damage(
     // NB: A backdrop filter reads more than the part of its region that is repainted, so forced damage goes through it too.
     let forced_damage_rect = live_content_changes.forced_damage_rect;
     if !forced_damage_rect.is_empty() {
-        damage.damage_rect = Some(match damage.damage_rect {
-            Some(damage_rect) => damage_rect.united(forced_damage_rect),
-            None => forced_damage_rect,
-        });
+        damage.add_damage_rect(forced_damage_rect, DamagedLayers::All);
     }
     damage.add_backdrop_filter_damage(chains.new_side(), new_command_runs);
 
-    if damage.changed_unbounded_command {
-        return None;
-    }
-    let Some(damage_rect) = damage.damage_rect else {
-        return Some(IntRect::default());
+    let bounded_damage_rect = |is_unbounded: bool, damage_rect: Option<IntRect>| {
+        if is_unbounded {
+            return None;
+        }
+        Some(damage_rect.map_or(IntRect::default(), |damage_rect| {
+            intersect_like_gfx_int_rect(damage_rect.inflated_edges(1, 1, 1, 1), viewport_rect)
+        }))
     };
-    Some(intersect_like_gfx_int_rect(
-        damage_rect.inflated_edges(1, 1, 1, 1),
-        viewport_rect,
-    ))
+    DisplayListDamage {
+        rect: bounded_damage_rect(damage.changed_unbounded_command, damage.damage_rect),
+        layer_rects: damage
+            .damage_of_layers
+            .iter()
+            .map(|layer_damage| bounded_damage_rect(layer_damage.is_unbounded, layer_damage.rect))
+            .collect(),
+    }
 }
 
 #[cfg(test)]
@@ -1684,7 +1805,8 @@ mod tests {
     use crate::display_list::builder::{HEADER_SIZE, note_command};
     use crate::display_list::commands::{
         BackdropFilterRegion, CanvasId, CompositorMainThreadWheelEventRegion, DisplayListCommand, DisplayListGlyph,
-        DrawCanvas, DrawIsolatedGroup, DrawVideoFrame, FillRect, FontResourceId, InlineClipKind, TextShadowLayer,
+        DisplayListResourceId, DrawCanvas, DrawIsolatedGroup, DrawVideoFrame, FillRect, FontResourceId, InlineClipKind,
+        PaintNestedDisplayList, TextShadowLayer,
     };
     use crate::display_list::ffi_bytes::FfiBytes;
     use crate::node_slot_id::NodeSlotId;
@@ -1698,7 +1820,7 @@ mod tests {
     use libgfx_rust::path::Path;
     use libgfx_rust::{
         Color, ColorFilterType, CompositingAndBlendingOperator, CornerRadii, FloatMatrix4x4, FloatPoint, IntPoint,
-        MaskKind, Orientation, ScalingMode, WindingRule, translation_matrix,
+        IntSize, MaskKind, Orientation, ScalingMode, WindingRule, translation_matrix,
     };
 
     const RED: Color = Color(0xffff0000);
@@ -1801,12 +1923,13 @@ mod tests {
         )
     }
 
-    fn glyph_run_command_bytes(inline_padding: usize, font_smoothing: u8) -> TestDisplayList {
+    fn glyph_run_command_bytes(inline_padding: usize, font_smoothing: u8, stroke_width: f32) -> TestDisplayList {
         let glyph = DisplayListGlyph {
             position: FloatPoint { x: 1.0, y: 2.0 },
             glyph_id: 3,
         };
         let command = DrawGlyphRun {
+            stroke_width,
             font_smoothing,
             font_id: FontResourceId(1),
             glyphs: DisplayListDataSpan {
@@ -1903,11 +2026,10 @@ mod tests {
         }
     }
 
-    fn canvas_command_bytes(rect: IntRect, content_generation: u64) -> TestDisplayList {
+    fn canvas_command_bytes(rect: IntRect) -> TestDisplayList {
         let command = DrawCanvas {
             dst_rect: rect,
             canvas_id: CanvasId(1),
-            content_generation,
             scaling_mode: ScalingMode::NearestNeighbor,
         };
         command_bytes(&command, Some(rect), ContextRef::default())
@@ -2053,7 +2175,9 @@ mod tests {
             },
             viewport_rect,
             LiveContentChanges::default(),
+            None,
         )
+        .rect
     }
 
     fn context_in(spatial: SpatialNodeIndex, context: ContextRef) -> ContextRef {
@@ -2073,14 +2197,32 @@ mod tests {
             visual_context_tree: tree,
             scroll_offsets: &[],
         };
-        compute_display_list_damage(frame, frame, IntRect::new(0, 0, 100, 100), live_content_changes)
+        compute_display_list_damage(frame, frame, IntRect::new(0, 0, 100, 100), live_content_changes, None).rect
+    }
+
+    #[test]
+    fn a_record_composited_as_a_media_layer_is_not_damaged_by_its_live_content() {
+        let tree = identity_tree();
+        let mut list = canvas_command_bytes(IntRect::new(10, 10, 20, 20));
+        let media_layer_record_offset = 0;
+        list.extend_from_slice(&fill_command_bytes(IntRect::new(50, 50, 10, 10), RED));
+        list.extend_from_slice(&canvas_command_bytes(IntRect::new(60, 60, 10, 10)));
+        let changed_canvas = LiveContentChanges {
+            canvases: &[CanvasId(1)],
+            offsets_of_records_composited_as_media_layers: &[media_layer_record_offset],
+            ..LiveContentChanges::default()
+        };
+        assert_eq!(
+            damage_for_live_content_changes(&list, &tree, changed_canvas),
+            Some(IntRect::new(59, 59, 12, 12))
+        );
     }
 
     #[test]
     fn changed_live_content_damages_where_it_is_drawn() {
         let tree = identity_tree();
         let rect = IntRect::new(10, 10, 20, 20);
-        let canvas = canvas_command_bytes(rect, 0);
+        let canvas = canvas_command_bytes(rect);
         let changed_canvas = LiveContentChanges {
             canvases: &[CanvasId(1)],
             ..LiveContentChanges::default()
@@ -2159,7 +2301,6 @@ mod tests {
             &DrawCanvas {
                 dst_rect: rect,
                 canvas_id: CanvasId(1),
-                content_generation: 0,
                 scaling_mode: ScalingMode::NearestNeighbor,
             },
             Some(rect),
@@ -2179,7 +2320,7 @@ mod tests {
     fn changed_live_content_inside_a_group_damages_the_whole_group() {
         let tree = identity_tree();
         let group_rect = IntRect::new(5, 5, 40, 40);
-        let content = canvas_command_bytes(IntRect::new(10, 10, 20, 20), 0);
+        let content = canvas_command_bytes(IntRect::new(10, 10, 20, 20));
         let no_data = DisplayListDataSpan { offset: 0, size: 0 };
         let mut group = TestDisplayList::default();
         append_record(
@@ -2218,7 +2359,6 @@ mod tests {
             SpatialData::Scroll(ScrollData {
                 state_slot: NO_SCROLL_STATE_SLOT,
                 owner_paintable: NodeSlotId::INVALID,
-                registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
             }),
             VISUAL_VIEWPORT_NODE_INDEX,
         );
@@ -2236,7 +2376,6 @@ mod tests {
             SpatialData::Scroll(ScrollData {
                 state_slot: NO_SCROLL_STATE_SLOT,
                 owner_paintable: NodeSlotId::INVALID,
-                registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
             }),
             VISUAL_VIEWPORT_NODE_INDEX,
         );
@@ -2266,6 +2405,47 @@ mod tests {
         assert_eq!(
             damage(&old_commands, &in_order, &new_commands, &permuted),
             Some(IntRect::default())
+        );
+    }
+
+    #[test]
+    fn content_under_nested_fractional_scrolls_is_damaged_where_replay_draws_it() {
+        let mut tree = identity_tree();
+        let mut scroll_node = VISUAL_VIEWPORT_NODE_INDEX;
+        for _ in 0..3 {
+            scroll_node = tree.append_spatial(
+                SpatialData::Scroll(ScrollData {
+                    state_slot: NO_SCROLL_STATE_SLOT,
+                    owner_paintable: NodeSlotId::INVALID,
+                }),
+                scroll_node,
+            );
+        }
+        let mut scroll_offsets = vec![FloatPoint { x: 0.0, y: -0.9 }; 4];
+        scroll_offsets[0] = FloatPoint::default();
+        let rect = IntRect::new(10, 10, 20, 20);
+        let new_commands = command_bytes(
+            &FillRect {
+                rect,
+                color: RED,
+                compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
+                background_color_animation_effect: EffectNodeIndex::NONE,
+            },
+            Some(rect),
+            context_in(scroll_node, ContextRef::default()),
+        );
+        // Each of the three offsets rounds to a whole pixel, so the rect is drawn 3px above where it was recorded.
+        assert_eq!(
+            damage_with_scroll_offsets(
+                &TestDisplayList::default(),
+                &tree,
+                &scroll_offsets,
+                &new_commands,
+                &tree,
+                &scroll_offsets,
+                IntRect::new(0, 0, 100, 100),
+            ),
+            Some(IntRect::new(9, 6, 22, 22))
         );
     }
 
@@ -2350,6 +2530,7 @@ mod tests {
             expanded_gutter_rect: IntRect::default(),
             scroll_size: 0.75,
             thumb_color: RED,
+            thumb_outline_color: Color::TRANSPARENT,
             track_color: Color::TRANSPARENT,
             vertical: false,
         };
@@ -2377,7 +2558,6 @@ mod tests {
             SpatialData::Scroll(ScrollData {
                 state_slot: 1,
                 owner_paintable: NodeSlotId::INVALID,
-                registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
             }),
             VISUAL_VIEWPORT_NODE_INDEX,
         );
@@ -2455,7 +2635,6 @@ mod tests {
             SpatialData::Scroll(ScrollData {
                 state_slot: 1,
                 owner_paintable: NodeSlotId::INVALID,
-                registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
             }),
             VISUAL_VIEWPORT_NODE_INDEX,
         );
@@ -2577,7 +2756,6 @@ mod tests {
             SpatialData::Scroll(ScrollData {
                 state_slot: 1,
                 owner_paintable: NodeSlotId::INVALID,
-                registry_parent_node: VISUAL_VIEWPORT_NODE_INDEX,
             }),
             VISUAL_VIEWPORT_NODE_INDEX,
         );
@@ -2700,8 +2878,8 @@ mod tests {
     #[test]
     fn inline_payload_alignment_does_not_damage_glyph_runs() {
         let tree = identity_tree();
-        let old_display_list = glyph_run_command_bytes(0, FONT_SMOOTHING_AUTO);
-        let new_display_list = glyph_run_command_bytes(4, FONT_SMOOTHING_AUTO);
+        let old_display_list = glyph_run_command_bytes(0, FONT_SMOOTHING_AUTO, 0.0);
+        let new_display_list = glyph_run_command_bytes(4, FONT_SMOOTHING_AUTO, 0.0);
         assert_eq!(
             damage(&old_display_list, &tree, &new_display_list, &tree),
             Some(IntRect::default())
@@ -2711,8 +2889,19 @@ mod tests {
     #[test]
     fn changing_font_smoothing_damages_glyph_runs() {
         let tree = identity_tree();
-        let old_display_list = glyph_run_command_bytes(0, FONT_SMOOTHING_AUTO);
-        let new_display_list = glyph_run_command_bytes(0, FONT_SMOOTHING_ANTIALIASED);
+        let old_display_list = glyph_run_command_bytes(0, FONT_SMOOTHING_AUTO, 0.0);
+        let new_display_list = glyph_run_command_bytes(0, FONT_SMOOTHING_ANTIALIASED, 0.0);
+        assert_eq!(
+            damage(&old_display_list, &tree, &new_display_list, &tree),
+            Some(IntRect::new(9, 9, 22, 22))
+        );
+    }
+
+    #[test]
+    fn changing_text_stroke_width_damages_glyph_runs() {
+        let tree = identity_tree();
+        let old_display_list = glyph_run_command_bytes(0, FONT_SMOOTHING_AUTO, 1.0);
+        let new_display_list = glyph_run_command_bytes(0, FONT_SMOOTHING_AUTO, 2.0);
         assert_eq!(
             damage(&old_display_list, &tree, &new_display_list, &tree),
             Some(IntRect::new(9, 9, 22, 22))
@@ -2785,6 +2974,7 @@ mod tests {
             append_record(
                 &mut bytes,
                 &DrawGlyphRun {
+                    stroke_width: 0.0,
                     font_smoothing: FONT_SMOOTHING_AUTO,
                     font_id: FontResourceId(1),
                     glyphs: DisplayListDataSpan::default(),
@@ -2852,6 +3042,7 @@ mod tests {
                 min_scroll_offset: 0.0,
                 max_scroll_offset: 100.0,
                 thumb_color: RED,
+                thumb_outline_color: Color::TRANSPARENT,
                 track_color: Color::TRANSPARENT,
                 vertical: true,
                 is_painted_by_compositor,
@@ -3331,7 +3522,12 @@ mod tests {
     #[test]
     fn unchanged_static_mask_content_does_not_damage() {
         let rect = IntRect::new(10, 10, 20, 20);
-        let make_scene = |color, insert_effect, dynamic| {
+        enum MaskContent {
+            Fill,
+            Canvas,
+            NestedDisplayList(u64),
+        }
+        let make_scene = |color, insert_effect, mask_content| {
             let mut tree = identity_tree();
             if insert_effect {
                 effect_context(&mut tree, mask(rect));
@@ -3343,19 +3539,26 @@ mod tests {
                 compositing_and_blending_operator: CompositingAndBlendingOperator::Normal,
                 background_color_animation_effect: EffectNodeIndex::NONE,
             };
-            let content = if dynamic {
-                command_bytes(
+            let content = match mask_content {
+                MaskContent::Fill => command_bytes(&fill, Some(rect), context),
+                MaskContent::Canvas => command_bytes(
                     &DrawCanvas {
                         dst_rect: rect,
                         canvas_id: CanvasId(1),
-                        content_generation: 1,
                         scaling_mode: ScalingMode::NearestNeighbor,
                     },
                     Some(rect),
                     context,
-                )
-            } else {
-                command_bytes(&fill, Some(rect), context)
+                ),
+                MaskContent::NestedDisplayList(id) => command_bytes(
+                    &PaintNestedDisplayList {
+                        display_list_id: DisplayListResourceId(id),
+                        rect: rect.to_float(),
+                        list_size: IntSize { width: 20, height: 20 },
+                    },
+                    Some(rect),
+                    context,
+                ),
             };
             let mut bytes = TestDisplayList::default();
             append_record(
@@ -3376,8 +3579,8 @@ mod tests {
             bytes.extend_from_slice(&command_bytes(&FillRect { color: BLUE, ..fill }, Some(rect), context));
             (bytes, tree)
         };
-        let (old_bytes, old_tree) = make_scene(RED, false, false);
-        let (new_bytes, new_tree) = make_scene(RED, true, false);
+        let (old_bytes, old_tree) = make_scene(RED, false, MaskContent::Fill);
+        let (new_bytes, new_tree) = make_scene(RED, true, MaskContent::Fill);
         assert_eq!(
             damage(&old_bytes, &old_tree, &old_bytes, &old_tree),
             Some(IntRect::default())
@@ -3387,15 +3590,27 @@ mod tests {
             damage(&old_bytes, &old_tree, &new_bytes, &new_tree),
             Some(IntRect::default())
         );
-        let (new_bytes, new_tree) = make_scene(GREEN, true, false);
+        let (new_bytes, new_tree) = make_scene(GREEN, true, MaskContent::Fill);
         assert_eq!(
             damage(&old_bytes, &old_tree, &new_bytes, &new_tree),
             Some(rect.inflated_edges(1, 1, 1, 1))
         );
         // External content retains conservative damage.
-        let (bytes, tree) = make_scene(RED, false, true);
+        let (bytes, tree) = make_scene(RED, false, MaskContent::Canvas);
         assert_eq!(
             damage(&bytes, &tree, &bytes, &tree),
+            Some(rect.inflated_edges(1, 1, 1, 1))
+        );
+        // A nested display list is the same content for as long as its id is.
+        let (old_bytes, old_tree) = make_scene(RED, false, MaskContent::NestedDisplayList(1));
+        let (new_bytes, new_tree) = make_scene(RED, false, MaskContent::NestedDisplayList(1));
+        assert_eq!(
+            damage(&old_bytes, &old_tree, &new_bytes, &new_tree),
+            Some(IntRect::default())
+        );
+        let (new_bytes, new_tree) = make_scene(RED, false, MaskContent::NestedDisplayList(2));
+        assert_eq!(
+            damage(&old_bytes, &old_tree, &new_bytes, &new_tree),
             Some(rect.inflated_edges(1, 1, 1, 1))
         );
     }
@@ -3505,20 +3720,9 @@ mod tests {
     }
 
     #[test]
-    fn changed_canvas_content_generation_damages_canvas_rect() {
+    fn canvas_without_new_content_is_not_damaged() {
         let tree = identity_tree();
-        let old_display_list = canvas_command_bytes(IntRect::new(10, 10, 20, 20), 1);
-        let new_display_list = canvas_command_bytes(IntRect::new(10, 10, 20, 20), 2);
-        assert_eq!(
-            damage(&old_display_list, &tree, &new_display_list, &tree),
-            Some(IntRect::new(9, 9, 22, 22))
-        );
-    }
-
-    #[test]
-    fn unchanged_canvas_content_generation_does_not_damage_canvas() {
-        let tree = identity_tree();
-        let canvas = canvas_command_bytes(IntRect::new(10, 10, 20, 20), 1);
+        let canvas = canvas_command_bytes(IntRect::new(10, 10, 20, 20));
         let old_fill = fill_command_bytes(IntRect::new(50, 50, 10, 10), RED);
         let new_fill = fill_command_bytes(IntRect::new(50, 50, 10, 10), BLUE);
         let mut old_display_list = canvas.clone();

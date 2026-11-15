@@ -10,9 +10,8 @@
 #include <AK/Function.h>
 #include <AK/Noncopyable.h>
 #include <AK/Optional.h>
+#include <LibCore/Timer.h>
 #include <LibGfx/GpuDeviceIdentity.h>
-
-#include <cstdint>
 
 #ifdef USE_DIRECTX
 #    include <LibGfx/Direct3DContext.h>
@@ -29,13 +28,6 @@
 class GrDirectContext;
 class SkSurface;
 
-#ifdef SK_GRAPHITE
-namespace skgpu::graphite {
-class Context;
-class Recorder;
-}
-#endif
-
 namespace Gfx {
 
 struct VulkanContext;
@@ -48,12 +40,6 @@ class SkiaBackendContext : public AtomicRefCounted<SkiaBackendContext> {
     AK_MAKE_NONMOVABLE(SkiaBackendContext);
 
 public:
-    enum class SurfaceAccess {
-        Internal,
-        External,
-        SharedImage,
-    };
-
 #ifdef USE_DIRECTX
     static RefPtr<SkiaBackendContext> create_direct3d_context(NonnullRefPtr<Direct3DContext>);
 #endif
@@ -74,38 +60,22 @@ public:
     SkiaBackendContext() { }
     virtual ~SkiaBackendContext() { }
 
-    // Frees cached GPU resources no frame has used for at least `age`, such as after a page stops drawing.
-    void purge_resources_unused_for(AK::Duration age);
-    // Frees unlocked scratch resources promptly when the system reports memory pressure.
-    void purge_unlocked_scratch_resources();
-
     void flush_and_submit(PaintingSurface&);
-    void flush_and_submit_async(PaintingSurface&, Function<void()>&&, uint64_t presentation_signal_value = 0);
-    void flush_and_submit(SkSurface*, SurfaceAccess);
-    void flush_and_submit_async(SkSurface*, SurfaceAccess, Function<void()>&&, uint64_t presentation_signal_value = 0);
+    void flush_and_submit_async(PaintingSurface&, Function<void()>&&);
+    // Flushes the work drawn into every surface.
+    void flush_and_submit_async(Function<void()>&&);
     void check_async_work_completion();
     size_t resource_cache_bytes() const;
     virtual GrDirectContext* sk_context() const = 0;
-
-#ifdef SK_GRAPHITE
-    virtual skgpu::graphite::Context* graphite_context() const { return nullptr; }
-    virtual skgpu::graphite::Recorder* graphite_recorder() const { return nullptr; }
-#endif
-
-    // Compiles the next GPU program recent sessions used, ahead of its first use, so that a first paint does not wait
-    // for the compiles. Returns whether any are left; backends without a program cache have none.
-    virtual bool precompile_next_shader() { return false; }
 
     virtual MetalContext& metal_context() = 0;
     virtual VulkanContext const& vulkan_context() = 0;
     virtual Direct3DContext& direct3d_context() { VERIFY_NOT_REACHED(); }
 
-protected:
-    virtual void flush_and_submit_impl(SkSurface*, SurfaceAccess) = 0;
-    virtual void flush_and_submit_async_impl(SkSurface*, SurfaceAccess, Function<void()>&&, uint64_t presentation_signal_value) = 0;
-
 private:
     void perform_post_flush_cleanup();
+
+    RefPtr<Core::Timer> m_idle_cleanup_timer;
 };
 
 }

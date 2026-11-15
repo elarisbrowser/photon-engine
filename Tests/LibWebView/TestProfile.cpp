@@ -20,7 +20,6 @@
 #include <LibHTTP/NetworkIsolationKey.h>
 #include <LibTest/TestCase.h>
 #include <LibURL/Parser.h>
-#include <LibWebView/BookmarkStore.h>
 #include <LibWebView/CookieJar.h>
 #include <LibWebView/FaviconStore.h>
 #include <LibWebView/HSTSStore.h>
@@ -88,14 +87,20 @@ TEST_CASE(named_and_default_layouts)
     EXPECT_EQ(named.paths().runtime, LexicalPath::join(profile_roots.runtime, "Ladybird/Profiles/work"sv).string());
 
     auto default_profile = MUST(WebView::Profile::create({}, profile_roots));
-    EXPECT_EQ(default_profile.identifier(), "default"sv);
-    EXPECT_EQ(default_profile.paths().config, LexicalPath::join(profile_roots.config, "Ladybird/Profiles/default"sv).string());
-    EXPECT_EQ(default_profile.paths().data, LexicalPath::join(profile_roots.data, "Ladybird/Profiles/default"sv).string());
-    EXPECT_EQ(default_profile.paths().cache, LexicalPath::join(profile_roots.cache, "Ladybird/Profiles/default"sv).string());
-    EXPECT_EQ(default_profile.paths().runtime, LexicalPath::join(profile_roots.runtime, "Ladybird/Profiles/default"sv).string());
+    auto default_profile_path = LexicalPath::join("Ladybird/Profiles"sv, WebView::DEFAULT_PROFILE_NAME).string();
+    EXPECT_EQ(default_profile.identifier(), WebView::DEFAULT_PROFILE_NAME);
+    EXPECT_EQ(default_profile.paths().config, LexicalPath::join(profile_roots.config, default_profile_path).string());
+    EXPECT_EQ(default_profile.paths().data, LexicalPath::join(profile_roots.data, default_profile_path).string());
+    EXPECT_EQ(default_profile.paths().cache, LexicalPath::join(profile_roots.cache, default_profile_path).string());
+    EXPECT_EQ(default_profile.paths().runtime, LexicalPath::join(profile_roots.runtime, default_profile_path).string());
 
     auto explicit_default_profile = MUST(WebView::Profile::create({ .name = "default" }, profile_roots));
-    EXPECT_EQ(explicit_default_profile.paths().identity, default_profile.paths().identity);
+    auto explicit_developer_profile = MUST(WebView::Profile::create({ .name = "developer" }, profile_roots));
+    EXPECT_EQ(explicit_default_profile.identifier(), "default"sv);
+    EXPECT_EQ(explicit_developer_profile.identifier(), "developer"sv);
+    EXPECT_NE(explicit_default_profile.paths().identity, explicit_developer_profile.paths().identity);
+    auto explicitly_selected_default = MUST(WebView::Profile::create({ .name = WebView::DEFAULT_PROFILE_NAME }, profile_roots));
+    EXPECT_EQ(default_profile.paths().identity, explicitly_selected_default.paths().identity);
     remove_test_root();
 }
 
@@ -155,7 +160,7 @@ TEST_CASE(temporary_profiles_are_unique_and_removed)
     remove_test_root();
 }
 
-TEST_CASE(profile_settings_and_bookmarks_are_isolated)
+TEST_CASE(profile_settings_are_isolated)
 {
     remove_test_root();
     auto first_profile = MUST(WebView::Profile::create({ .name = "first" }, roots()));
@@ -171,17 +176,6 @@ TEST_CASE(profile_settings_and_bookmarks_are_isolated)
     EXPECT_NE(first_settings_background_networking_enabled, second_settings.background_networking_enabled());
     EXPECT_EQ(first_settings_background_networking_enabled, WebView::Settings::create(first_settings_path).background_networking_enabled());
 
-    auto first_bookmarks_path = LexicalPath::join(first_profile.paths().config, "Bookmarks.json"sv).string();
-    auto second_bookmarks_path = LexicalPath::join(second_profile.paths().config, "Bookmarks.json"sv).string();
-    auto url = URL::Parser::basic_parse("https://profile-isolation.example/"sv).release_value();
-    auto first_bookmarks = WebView::BookmarkStore::create(first_bookmarks_path);
-    first_bookmarks.add_bookmark(url, {}, "favicon-hash"_string);
-    EXPECT(first_bookmarks.favicon_hashes().contains("favicon-hash"sv));
-    auto second_bookmarks = WebView::BookmarkStore::create(second_bookmarks_path);
-    EXPECT(!second_bookmarks.is_bookmarked(url));
-    auto reloaded_first_bookmarks = WebView::BookmarkStore::create(first_bookmarks_path);
-    EXPECT(reloaded_first_bookmarks.is_bookmarked(url));
-    EXPECT(reloaded_first_bookmarks.favicon_hashes().contains("favicon-hash"sv));
     remove_test_root();
 }
 
@@ -204,7 +198,7 @@ TEST_CASE(profile_databases_are_isolated)
             .value = "first"_string,
             .expiry_time_from_expires_attribute = UnixDateTime::now() + AK::Duration::from_seconds(3600),
         };
-        cookie_jar->set_cookie(url, cookie, HTTP::Cookie::Source::Http, {});
+        cookie_jar->set_cookie(url, cookie, HTTP::Cookie::Source::Http, {}, HTTP::Cookie::SameSiteContext::same_site());
 
         auto hsts_store = TRY_OR_FAIL(WebView::HSTSStore::create(*database));
         hsts_store->store_policy("profile-isolation.example"_string, HTTP::HSTS::ParsedHSTSPolicy { AK::Duration::from_seconds(3600), false });

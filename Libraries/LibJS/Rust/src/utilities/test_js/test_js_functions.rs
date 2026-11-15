@@ -14,8 +14,9 @@ use ak::Utf16FlyString;
 
 use super::javascript_test_runner::{JSFileResult, parse_module, parse_script};
 use super::test_runner::{Case, Suite, TestResult, get_time_in_ms, relative_path};
+use crate::bytecode::flushing::{ALL_FLUSH_LAYERS, FlushLayer};
 use crate::bytecode::property_access::Strict;
-use crate::gc::class::{Extends, GcCell};
+use crate::gc::class::{Extends, ExternalMemorySize, GcCell};
 use crate::interpreter::vm::Vm;
 use crate::layout::cell::Gc;
 use crate::layout::object::Object;
@@ -26,6 +27,7 @@ use crate::runtime::abstract_operations::{call, can_be_held_weakly};
 use crate::runtime::array_buffer::{ArrayBuffer, Order, detach_array_buffer};
 use crate::runtime::completion::ThrowCompletionOr;
 use crate::runtime::date::clear_system_time_zone_cache;
+use crate::runtime::ecmascript_function_object::EcmascriptFunctionObject;
 use crate::runtime::error::ErrorKind;
 use crate::runtime::error_types::ErrorType;
 use crate::runtime::finalization_registry::FinalizationRegistry;
@@ -44,8 +46,15 @@ use crate::utf16::Utf16View;
 pub const EXPOSED_GLOBAL_FUNCTIONS: &[(&str, RawNativeFunctionPointer)] = &[
     ("canParseSource", raw_native!(can_parse_source)),
     ("haveSameShape", raw_native!(have_same_shape)),
+    (
+        "getStringExternalMemorySize",
+        raw_native!(get_string_external_memory_size),
+    ),
     ("setDictionaryGeneration", raw_native!(set_dictionary_generation)),
     ("gc", raw_native!(collect_garbage)),
+    ("flushCode", raw_native!(flush_code)),
+    ("isCodeFlushed", raw_native!(is_code_flushed)),
+    ("parkSourceTexts", raw_native!(park_source_texts)),
     (
         "collectGarbageOnEveryAllocation",
         raw_native!(collect_garbage_on_every_allocation),
@@ -54,6 +63,7 @@ pub const EXPOSED_GLOBAL_FUNCTIONS: &[(&str, RawNativeFunctionPointer)] = &[
     ("evaluateSource", raw_native!(evaluate_source)),
     ("evaluateModule", raw_native!(evaluate_module)),
     ("runQueuedPromiseJobs", raw_native!(run_queued_promise_jobs)),
+    ("runAsyncWaitJobs", raw_native!(run_async_wait_jobs)),
     ("clearKeptObjects", raw_native!(clear_kept_objects)),
     (
         "runQueuedFinalizationRegistryCleanupJobs",
@@ -90,6 +100,11 @@ fn have_same_shape(vm: &Vm) -> ThrowCompletionOr<Value> {
     Ok(Value::from_bool(lhs.as_object().shape() == rhs.as_object().shape()))
 }
 
+fn get_string_external_memory_size(vm: &Vm) -> ThrowCompletionOr<Value> {
+    let string = vm.argument(0).to_primitive_string(vm)?;
+    Ok(Value::from_f64(string.external_memory_size() as f64))
+}
+
 fn set_dictionary_generation(vm: &Vm) -> ThrowCompletionOr<Value> {
     let shape = vm.argument(0).to_object(vm)?.shape();
     if !shape.is_dictionary() {
@@ -110,6 +125,46 @@ fn can_parse_source(vm: &Vm) -> ThrowCompletionOr<Value> {
 fn collect_garbage(vm: &Vm) -> ThrowCompletionOr<Value> {
     vm.heap().collect_garbage();
     Ok(Value::UNDEFINED)
+}
+
+/// Runs collections that flush the code of every function that nothing but the function holds, whatever its age:
+/// only the JIT code if the argument is "jit", and the whole executable otherwise.
+fn flush_code(vm: &Vm) -> ThrowCompletionOr<Value> {
+    let layers = if vm.argument(0).is_undefined() {
+        ALL_FLUSH_LAYERS
+    } else if vm.argument(0).to_primitive_string(vm)?.to_utf8() == "jit" {
+        1 << FlushLayer::Jit as u8
+    } else {
+        ALL_FLUSH_LAYERS
+    };
+    // NB: A compile job holds its executable, which would keep the code from being flushed.
+    crate::jit::tier_up::wait_for_compile_jobs(vm);
+    vm.code_flushing.flush_at_next_collection(layers);
+    vm.heap().collect_garbage();
+    // NB: JIT code holds its executable until it is flushed after the first collection, so the second one can flush
+    //     the bytecode too.
+    if layers != 1 << FlushLayer::Jit as u8 {
+        vm.code_flushing.flush_at_next_collection(layers);
+        vm.heap().collect_garbage();
+    }
+    Ok(Value::UNDEFINED)
+}
+
+/// Compresses every source text that is large enough for that, whatever its age, and returns how many there are.
+#[allow(clippy::unnecessary_wraps, reason = "native functions return a completion")]
+fn park_source_texts(_vm: &Vm) -> ThrowCompletionOr<Value> {
+    Ok(Value::from_f64(crate::source_text::park_all_source_texts_now() as f64))
+}
+
+/// Whether the code of a function was flushed, and not compiled again yet.
+fn is_code_flushed(vm: &Vm) -> ThrowCompletionOr<Value> {
+    let Some(function) = as_if::<EcmascriptFunctionObject>(vm.argument(0)) else {
+        return vm.throw_completion(ErrorKind::TypeError, ErrorType::NotAFunction, &[&vm.argument(0)]);
+    };
+    let shared_data = function.shared_data();
+    Ok(Value::from_bool(
+        shared_data.executable().is_none() && shared_data.has_flushed_code(),
+    ))
 }
 
 fn collect_garbage_on_every_allocation(vm: &Vm) -> ThrowCompletionOr<Value> {
@@ -151,12 +206,23 @@ fn evaluate_module(vm: &Vm) -> ThrowCompletionOr<Value> {
         Err(error) => return vm.throw_completion_with_message(ErrorKind::SyntaxError, error.error.to_string()),
     };
 
-    vm.run_module(module)
+    vm.run_module(module).map(Value::from_object)
 }
 
 #[allow(clippy::unnecessary_wraps, reason = "native functions return a completion")]
 fn run_queued_promise_jobs(vm: &Vm) -> ThrowCompletionOr<Value> {
     vm.run_queued_promise_jobs();
+    Ok(Value::UNDEFINED)
+}
+
+fn run_async_wait_jobs(vm: &Vm) -> ThrowCompletionOr<Value> {
+    if vm.is_running_promise_jobs() {
+        return vm.throw_completion_with_message(
+            ErrorKind::Error,
+            "runAsyncWaitJobs cannot run inside a promise job".to_owned(),
+        );
+    }
+    vm.run_async_wait_jobs_until(|| false)?;
     Ok(Value::UNDEFINED)
 }
 

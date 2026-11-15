@@ -23,6 +23,7 @@ use crate::snapshot::FunctionFrameFields;
 use crate::snapshot::RuntimeLayout;
 use crate::snapshot::RuntimeOffsets;
 use crate::snapshot::Snapshot;
+use libjs_runtime_macros::jit_abi;
 use std::cell::RefCell;
 
 /// Words of the fake `ExecutionContext` before its slots.
@@ -37,6 +38,7 @@ fn offsets() -> RuntimeOffsets {
         execution_context_private_environment: 16,
         execution_context_frame_initialized: 24,
         execution_context_executable: 32,
+        executable_idle_collection_count: 0,
         execution_context_slots: (8 * FRAME_HEADER_WORDS) as u32,
         vm_running_execution_context: 0,
         vm_jit_native_stack_limit: 8,
@@ -69,6 +71,8 @@ fn offsets() -> RuntimeOffsets {
         execution_context_argument_count: 152,
         execution_context_returns_to_native_caller: 156,
         execution_context_runs_jit_code: 157,
+        execution_context_caller_is_derived_construct: 158,
+        execution_context_new_target: 160,
         ecmascript_function_environment: 0,
         ecmascript_function_private_environment: 8,
         shared_function_script_or_module: 24,
@@ -238,7 +242,12 @@ struct SlowPathResult {
     value: u64,
 }
 
-extern "C" fn add_values(vm: *mut u64, pc: u32, dst: *mut u64, lhs: u64, rhs: u64) -> i64 {
+#[jit_abi]
+extern "C" fn add_values(vm: *mut u64, pc: u32, dst: *mut u64, lhs: u64, rhs: u64, length: u32) -> i64 {
+    let next_pc = decode_instruction(&test_state(vm).borrow().bytecodes[running_executable(vm)], pc)
+        .unwrap()
+        .next_pc();
+    assert_eq!(pc + length, next_pc);
     let control = continuation_after(vm, pc);
     if control >= 0 && control as u64 & CONTINUATION_BIT != 0 {
         // SAFETY: Compiled code passes the address of a frame slot.
@@ -247,6 +256,7 @@ extern "C" fn add_values(vm: *mut u64, pc: u32, dst: *mut u64, lhs: u64, rhs: u6
     control
 }
 
+#[jit_abi]
 extern "C" fn jump_less_than(vm: *mut u64, pc: u32, lhs: u64, rhs: u64, if_true: u32, if_false: u32) -> i64 {
     if let Some((fail_pc, control)) = test_state(vm).borrow().fail
         && fail_pc == pc
@@ -256,23 +266,66 @@ extern "C" fn jump_less_than(vm: *mut u64, pc: u32, lhs: u64, rhs: u64, if_true:
     i64::from(if int(lhs) < int(rhs) { if_true } else { if_false })
 }
 
+/// Whether the slow path of the instruction at `instruction` takes every operand in a record, which has a word per
+/// field, as slow paths on Windows do, like its interpreter.
+///
+/// # Safety
+///
+/// `instruction` must point at an instruction.
+unsafe fn slow_path_takes_record(instruction: *const u8) -> bool {
+    // SAFETY: The caller keeps the contract.
+    let opcode = OpCode::from_u8(unsafe { *instruction }).expect("compiled code passes an instruction");
+    slow_path_layout(opcode).abi == SlowPathAbi::Record
+}
+
+/// An input of a slow path with scalar inputs and outputs in the record: the scalar `input` it got, or else, if the
+/// slow path of the instruction at `instruction` takes every operand in the record, the word of the record with that
+/// field.
+///
+/// # Safety
+///
+/// `instruction` must point at an instruction whose slow path's record has such a field at `index`, and `record` at
+/// the record.
+unsafe fn scalar_or_record_input(instruction: *const u8, record: *const u64, index: usize, input: u64) -> u64 {
+    // SAFETY: The caller keeps the contract.
+    unsafe {
+        if slow_path_takes_record(instruction) {
+            *record.add(index)
+        } else {
+            input
+        }
+    }
+}
+
 /// A fake `ToInt32` or `ToLength` slow path (scalar convention) that
-/// doubles its input.
+/// doubles its input. With records, `value` is the record, which has the
+/// destination and then the input.
+#[jit_abi]
 extern "C" fn to_int32(vm: *mut u64, pc: u32, instruction: *const u8, value: u64) -> SlowPathResult {
     // SAFETY: Compiled code passes a pointer to the instruction in the snapshot's bytecode.
     let opcode = unsafe { *instruction };
     assert!(opcode == OpCode::ToInt32 as u8 || opcode == OpCode::ToLength as u8);
+    let control = continuation_after(vm, pc);
+    // SAFETY: As above.
+    if unsafe { slow_path_takes_record(instruction) } {
+        let record = value as *mut u64;
+        // SAFETY: Compiled code passes the record in the JIT frame.
+        unsafe { *record = value::int32(int(*record.add(1)).wrapping_mul(2)) };
+        return SlowPathResult { control, value: 0 };
+    }
     SlowPathResult {
-        control: continuation_after(vm, pc),
+        control,
         value: value::int32(int(value).wrapping_mul(2)),
     }
 }
 
 /// A fake `Increment` slow path (scalar inputs, outputs in the record).
+#[jit_abi]
 extern "C" fn increment(vm: *mut u64, pc: u32, instruction: *const u8, outputs: *mut u64, dst: u64) -> i64 {
     // SAFETY: See `to_int32`; `outputs` is the record in the JIT frame.
     unsafe {
         assert_eq!(*instruction, OpCode::Increment as u8);
+        let dst = scalar_or_record_input(instruction, outputs, 0, dst);
         *outputs = value::int32(int(dst).wrapping_add(1));
     }
     continuation_after(vm, pc)
@@ -280,6 +333,7 @@ extern "C" fn increment(vm: *mut u64, pc: u32, instruction: *const u8, outputs: 
 
 /// A fake `ConcatString` slow path (scalar inputs, outputs in the record)
 /// that adds its operands.
+#[jit_abi]
 extern "C" fn concat_string(
     vm: *mut u64,
     pc: u32,
@@ -291,12 +345,15 @@ extern "C" fn concat_string(
     // SAFETY: See `to_int32`; `outputs` is the record in the JIT frame.
     unsafe {
         assert_eq!(*instruction, OpCode::ConcatString as u8);
+        let dst = scalar_or_record_input(instruction, outputs, 0, dst);
+        let src = scalar_or_record_input(instruction, outputs, 1, src);
         *outputs = value::int32(int(dst).wrapping_add(int(src)));
     }
     continuation_after(vm, pc)
 }
 
 /// A fake `NewArray` slow path (record convention) that sums its elements.
+#[jit_abi]
 extern "C" fn new_array(vm: *mut u64, pc: u32, instruction: *const u8, values: *mut u64) -> i64 {
     let Instruction::NewArray { elements, .. } = decoded(vm, pc) else {
         panic!("not a NewArray");
@@ -311,6 +368,7 @@ extern "C" fn new_array(vm: *mut u64, pc: u32, instruction: *const u8, values: *
 }
 
 /// A fake `libjs_jit_call` that "calls" an int32 callee by adding the arguments to it.
+#[jit_abi]
 extern "C" fn jit_call(vm: *mut u64, frame: *mut u64, pc: u32) -> i64 {
     let Instruction::Call {
         dst, callee, arguments, ..
@@ -343,6 +401,7 @@ fn fake_arguments_object(mapped: bool) -> u64 {
 }
 
 /// A fake `libjs_jit_create_arguments`.
+#[jit_abi]
 extern "C" fn create_arguments(vm: *mut u64, _frame: *mut u64, mapped: u32) -> u64 {
     test_state(vm).borrow_mut().arguments_created += 1;
     fake_arguments_object(mapped != 0)
@@ -350,6 +409,7 @@ extern "C" fn create_arguments(vm: *mut u64, _frame: *mut u64, mapped: u32) -> u
 
 /// A fake `libjs_jit_call_forwarding_arguments` that "calls" its function, an
 /// int32, by adding the frame's passed arguments to it.
+#[jit_abi]
 extern "C" fn call_forwarding_arguments(vm: *mut u64, frame: *mut u64, pc: u32) -> i64 {
     let Instruction::Call { dst, this_value, .. } = decoded(vm, pc) else {
         panic!("not a Call");
@@ -371,6 +431,7 @@ extern "C" fn call_forwarding_arguments(vm: *mut u64, frame: *mut u64, pc: u32) 
 /// A fake `asm_helper_to_boolean`, for values that are no strings, symbols
 /// or bigints: doubles by their value, and other values truthy unless they
 /// are undefined or null.
+#[jit_abi]
 extern "C" fn to_boolean(value: u64) -> u64 {
     const NAN_BASE_TAG: u64 = 0x7FF8;
     if (value >> 48) & NAN_BASE_TAG != NAN_BASE_TAG {
@@ -381,6 +442,7 @@ extern "C" fn to_boolean(value: u64) -> u64 {
 
 /// A fake `libjs_jit_exit` that writes the exit's values into the frame,
 /// like the runtime does. Leaves neither count as exits nor move the pc.
+#[jit_abi]
 extern "C" fn jit_exit(vm: *mut u64, frame: *mut u64, exit_index: u32, dump: *const u64) {
     if test_state(vm).borrow().exits[exit_index as usize].kind == SiteKind::Publish {
         publish_frames(vm, exit_index);
@@ -471,6 +533,8 @@ fn write_frame_states(vm: *mut u64, frame: *mut u64, exit_index: u32, dump: *con
                                 value::boxed_constant(*((frame_pointer as i64 + i64::from(offset)) as *const u64), repr)
                             }
                             ValueLocation::Constant(bits) => bits,
+                            // NB: Exit stubs pass the compiled function's frame.
+                            ValueLocation::Frame(slot) => *frame.add(FRAME_HEADER_WORDS + slot as usize),
                             ValueLocation::ArgumentsObject { mapped } => fake_arguments_object(mapped),
                             ValueLocation::VirtualObject(_) => unreachable!("tests make no virtual objects"),
                         };
@@ -609,6 +673,22 @@ pub(super) mod fake_heap {
     fn region() -> &'static Region {
         static REGION: OnceLock<Region> = OnceLock::new();
         REGION.get_or_init(|| {
+            #[cfg(windows)]
+            // SAFETY: A fresh reservation that nothing else uses.
+            unsafe {
+                let reservation = ak::windows_code_memory::reserve(2 * REGION_SIZE);
+                assert!(!reservation.is_null());
+                let base = reservation.expose_provenance().next_multiple_of(REGION_SIZE);
+                assert!(ak::windows_code_memory::make_writable(
+                    core::ptr::with_exposed_provenance_mut(base),
+                    COMMITTED_SIZE,
+                ));
+                Region {
+                    base,
+                    next: Mutex::new(base + FIRST_CELL_OFFSET),
+                }
+            }
+            #[cfg(not(windows))]
             // SAFETY: A fresh reservation that nothing else uses.
             unsafe {
                 let reservation = libc::mmap(
@@ -684,31 +764,64 @@ pub(super) mod fake_heap {
             let mut hint = LOWEST_ADDRESS;
             loop {
                 assert!(hint + COMMITTED_SIZE <= REGION_SIZE, "no room for the low fake heap");
-                // NB: The address is only a hint, so this never replaces an
-                //     existing mapping, which MAP_FIXED_NOREPLACE would need
-                //     and only Linux has. The kernel places the mapping at the
-                //     hint if that is free, and anywhere else otherwise.
-                // SAFETY: A fresh private anonymous mapping.
-                let mapping = unsafe {
-                    libc::mmap(
-                        core::ptr::with_exposed_provenance_mut(hint),
-                        COMMITTED_SIZE,
-                        libc::PROT_READ | libc::PROT_WRITE,
-                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
-                        -1,
-                        0,
-                    )
-                };
-                assert_ne!(mapping, libc::MAP_FAILED);
-                let address = mapping.expose_provenance();
-                if address >= LOWEST_ADDRESS && address + COMMITTED_SIZE <= REGION_SIZE {
-                    return Region {
-                        base: address,
-                        next: Mutex::new(address),
+                #[cfg(windows)]
+                {
+                    const MEM_COMMIT_AND_RESERVE: u32 = 0x3000;
+                    const PAGE_READWRITE: u32 = 0x04;
+                    unsafe extern "system" {
+                        fn VirtualAlloc(
+                            address: *mut core::ffi::c_void,
+                            size: usize,
+                            allocation_type: u32,
+                            protect: u32,
+                        ) -> *mut core::ffi::c_void;
+                    }
+                    // NB: This fails if the address is taken.
+                    // SAFETY: Allocating memory at a given address replaces nothing.
+                    let mapping = unsafe {
+                        VirtualAlloc(
+                            core::ptr::with_exposed_provenance_mut(hint),
+                            COMMITTED_SIZE,
+                            MEM_COMMIT_AND_RESERVE,
+                            PAGE_READWRITE,
+                        )
                     };
+                    if !mapping.is_null() {
+                        let address = mapping.expose_provenance();
+                        return Region {
+                            base: address,
+                            next: Mutex::new(address),
+                        };
+                    }
                 }
-                // SAFETY: The mapping was just made, and nothing uses it.
-                assert_eq!(unsafe { libc::munmap(mapping, COMMITTED_SIZE) }, 0);
+                #[cfg(not(windows))]
+                {
+                    // NB: The address is only a hint, so this never replaces an
+                    //     existing mapping, which MAP_FIXED_NOREPLACE would need
+                    //     and only Linux has. The kernel places the mapping at the
+                    //     hint if that is free, and anywhere else otherwise.
+                    // SAFETY: A fresh private anonymous mapping.
+                    let mapping = unsafe {
+                        libc::mmap(
+                            core::ptr::with_exposed_provenance_mut(hint),
+                            COMMITTED_SIZE,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                            -1,
+                            0,
+                        )
+                    };
+                    assert_ne!(mapping, libc::MAP_FAILED);
+                    let address = mapping.expose_provenance();
+                    if address >= LOWEST_ADDRESS && address + COMMITTED_SIZE <= REGION_SIZE {
+                        return Region {
+                            base: address,
+                            next: Mutex::new(address),
+                        };
+                    }
+                    // SAFETY: The mapping was just made, and nothing uses it.
+                    assert_eq!(unsafe { libc::munmap(mapping, COMMITTED_SIZE) }, 0);
+                }
                 hint += 1 << 30;
             }
         })
@@ -832,7 +945,7 @@ impl Machine {
         let trampoline = crate::asm::executable_code::ExecutableCode::new(
             &generate_entry_trampoline::<crate::asm::MacroAssembler>().expect("the trampoline assembles"),
         );
-        type Trampoline = extern "C" fn(*mut u64, *mut u64, u64) -> JitResult;
+        type Trampoline = extern "sysv64" fn(*mut u64, *mut u64, u64) -> JitResult;
         // SAFETY: The trampoline implements `Trampoline`, and compiled code
         // implements the JIT entry ABI.
         let enter: Trampoline = unsafe { trampoline.function() };
@@ -1336,13 +1449,11 @@ mod execution {
                 Instruction::Enter,
                 Instruction::Mov { dst: r(6), src: a(0) },
                 Instruction::Call {
-                    value_feedback: 0,
                     call_feedback: 0,
                     dst: r(7),
                     callee: c(1),
                     this_value: c(0),
                     argument_count: 2,
-                    expression_string: None,
                     arguments: vec![r(6), c(1)],
                 },
                 // r6 still holds the argument, which lived across the call.
@@ -1472,7 +1583,7 @@ mod execution {
         let program = assemble(|_| {
             vec![
                 Instruction::Enter,
-                Instruction::Mov { dst: r(6), src: a(0) },
+                add(r(6), a(0), c(1)),
                 Instruction::ConcatString { dst: r(5), src: c(1) },
                 Instruction::Mov { dst: l(0), src: r(6) },
                 Instruction::Mov { dst: l(1), src: r(5) },
@@ -1482,8 +1593,35 @@ mod execution {
         });
         let (result, machine) = run_with(&program, test_layout(), &[value::int32(5)], &[5], |_| {});
         assert_eq!(result.status, RESUME);
-        assert_eq!(machine.slot(l(0)), value::int32(5));
+        assert_eq!(machine.slot(l(0)), value::int32(15));
         // Enter emptied r5, which the fake ConcatString treats as 0.
+        assert_eq!(machine.slot(l(1)), value::int32(10));
+    }
+
+    #[test]
+    fn exit_values_survive_in_frame_slots_that_nothing_writes_across_calls() {
+        // r6 holds the argument across a call, and its frame slot holds it for the exit after the call.
+        let program = assemble(|_| {
+            vec![
+                Instruction::Enter,
+                Instruction::Mov { dst: r(6), src: a(0) },
+                Instruction::ConcatString { dst: r(5), src: c(1) },
+                Instruction::Mov { dst: l(0), src: r(6) },
+                Instruction::Mov { dst: l(1), src: r(5) },
+                add(r(7), l(0), l(1)),
+                Instruction::Return { value: r(7) },
+            ]
+        });
+        let (_, compiled) = compile_program(&program, test_layout(), &[5]);
+        assert!(compiled.sites.iter().any(|site| {
+            site.frames[0]
+                .values
+                .iter()
+                .any(|(slot, location)| *slot == l(0).raw() && *location == ValueLocation::Frame(a(0).raw()))
+        }));
+        let (result, machine) = run_with(&program, test_layout(), &[value::int32(5)], &[5], |_| {});
+        assert_eq!(result.status, RESUME);
+        assert_eq!(machine.slot(l(0)), value::int32(5));
         assert_eq!(machine.slot(l(1)), value::int32(10));
     }
 
@@ -2074,9 +2212,16 @@ mod execution {
         let program = assemble(|_| vec![Instruction::Enter, Instruction::Return { value: a(0) }]);
         let (result, machine) = run_with(&program, test_layout(), &[value::int32(1)], &[], |machine| {
             machine.vm[1] = u64::MAX - 1;
+            // NB: The code has to make the frame the running one before it resumes in the interpreter.
+            machine.vm[0] = 0;
         });
         assert_eq!(result.status, RESUME);
         assert_eq!(machine.frame[3], 0, "the frame was not initialized");
+        assert_eq!(
+            machine.vm[0],
+            machine.frame.as_ptr() as u64,
+            "the frame is the running one"
+        );
     }
 }
 
@@ -2127,6 +2272,62 @@ fn jumps_skip_blocks_that_only_jump_on() {
 }
 
 #[test]
+fn prologues_check_the_stack_limit_before_they_move_the_stack_pointer() {
+    // NB: A frame larger than the headroom below the native stack limit could otherwise skip past the guard page at
+    //     the end of the stack, and the prologue would write past it.
+    let program = assemble(|_| vec![Instruction::Enter, Instruction::Return { value: a(0) }]);
+    let mut snapshot = crate::builder::tests::snapshot_for(&program, test_layout());
+    snapshot.runtime = runtime();
+    let x86_64 = compile_for::<crate::asm::x86_64::MacroAssembler>(&snapshot, &|_| true).unwrap();
+    let aarch64 = compile_for::<crate::asm::aarch64::MacroAssembler>(&snapshot, &|_| true).unwrap();
+    for (architecture, compiled, is_branch, writes_stack) in [
+        (
+            crate::asm::Architecture::X86_64,
+            &x86_64,
+            (|text: &str| text.starts_with('j') && !text.starts_with("jmp ")) as fn(&str) -> bool,
+            (|text: &str| {
+                let (mnemonic, operands) = text.split_once(' ').unwrap_or((text, ""));
+                let destination = operands.split(',').next().unwrap_or("");
+                matches!(mnemonic, "push" | "call")
+                    || destination == "rsp"
+                    || (mnemonic.starts_with("mov") && destination.contains('['))
+            }) as fn(&str) -> bool,
+        ),
+        (
+            crate::asm::Architecture::AArch64,
+            &aarch64,
+            |text: &str| text.starts_with("b.") || text.starts_with("cb") || text.starts_with("tb"),
+            |text: &str| {
+                let (mnemonic, operands) = text.split_once(' ').unwrap_or((text, ""));
+                mnemonic.starts_with("st") || mnemonic == "bl" || operands.starts_with("sp,")
+            },
+        ),
+    ] {
+        let listing =
+            crate::asm::disassembler::listing_with_data(architecture, &compiled.code, compiled.data_offset as usize);
+        let check = listing
+            .iter()
+            .position(|instruction| is_branch(&instruction.text))
+            .unwrap_or_else(|| panic!("{architecture:?}: the prologue does not branch"));
+        assert!(check > 0);
+        for instruction in &listing[..check] {
+            assert!(
+                !writes_stack(&instruction.text),
+                "{architecture:?}: {} at {:#x} comes before the stack limit check",
+                instruction.text,
+                instruction.offset
+            );
+        }
+        assert!(
+            listing[check..]
+                .iter()
+                .any(|instruction| writes_stack(&instruction.text)),
+            "{architecture:?}: the test does not recognize the prologue"
+        );
+    }
+}
+
+#[test]
 fn aarch64_code_disassembles() {
     let program = assemble(|label| {
         vec![
@@ -2159,8 +2360,13 @@ fn aarch64_code_disassembles() {
     let compiled = compile_for::<crate::asm::aarch64::MacroAssembler>(&snapshot, &|pc| pc != never_ran).unwrap();
     let lines = crate::asm::disassembler::aarch64(&compiled.code[..compiled.data_offset as usize]);
     let text = lines.join("\n");
-    // The prologue links the frame, slow paths and helpers are called through registers.
-    assert!(lines[0].starts_with("stp x29, x30, [sp"), "{text}");
+    // The prologue links the frame right after the stack limit check, slow paths and helpers are called through
+    // registers.
+    let check = lines
+        .iter()
+        .position(|line| line.starts_with("b."))
+        .expect("a stack limit check");
+    assert!(lines[check + 1].starts_with("stp x29, x30, [sp"), "{text}");
     assert!(text.contains("blr"), "{text}");
     assert!(text.contains("ret"), "{text}");
     // NB: The slow paths of JumpLessThan and NewArray leave through sites.
@@ -2172,7 +2378,11 @@ fn aarch64_code_disassembles() {
 
     let compiled = compile_for::<crate::asm::x86_64::MacroAssembler>(&snapshot, &|pc| pc != never_ran).unwrap();
     let lines = crate::asm::disassembler::x86_64(&compiled.code[..compiled.data_offset as usize]);
-    assert_eq!(lines[0], "push rbp");
+    let check = lines
+        .iter()
+        .position(|line| line.starts_with('j'))
+        .expect("a stack limit check");
+    assert_eq!(lines[check + 1], "push rbp");
 
     // The dump names exits, slow paths and the shared tails on both architectures.
     snapshot.options.dump_asm = true;
@@ -2263,6 +2473,36 @@ fn slow_paths_save_no_more_registers_than_the_saves_area_holds() {
     }
     check::<crate::asm::x86_64::MacroAssembler>();
     check::<crate::asm::aarch64::MacroAssembler>();
+}
+
+#[test]
+fn x86_64_shifts_find_their_amount_in_cl() {
+    let program = assemble(|_| {
+        vec![
+            Instruction::Enter,
+            Instruction::BitwiseXorRhsInt32 {
+                arith_feedback: 1,
+                dst: r(4),
+                lhs: a(0),
+                rhs: 5,
+            },
+            Instruction::LeftShift {
+                arith_feedback: 0,
+                dst: r(5),
+                lhs: a(0),
+                rhs: r(4),
+            },
+            Instruction::Return { value: r(5) },
+        ]
+    });
+    let mut snapshot = crate::builder::tests::snapshot_for(&program, test_layout());
+    snapshot.runtime = runtime();
+    snapshot.executables[0].feedback.arith = vec![crate::snapshot::arith_feedback::INT32; 2];
+    let compiled = compile_for::<crate::asm::x86_64::MacroAssembler>(&snapshot, &|_| true).unwrap();
+    let text = crate::asm::disassembler::x86_64(&compiled.code[..compiled.data_offset as usize]).join("\n");
+    // NB: The macro assembler shifts amounts in other registers in a scratch register, saving RCX in another.
+    assert!(text.contains(", cl"), "{text}");
+    assert!(!text.contains("r11d, cl") && !text.contains("mov r10, rcx"), "{text}");
 }
 
 #[test]
@@ -2507,7 +2747,7 @@ mod property_access {
 
         /// The fake growing helper, which leaves the value in the array's
         /// unused named property storage word.
-        extern "C" fn grow(array: *mut u64, value: u64) -> u64 {
+        extern "sysv64" fn grow(array: *mut u64, value: u64) -> u64 {
             // SAFETY: Compiled code passes a fake array of six words.
             unsafe { *array.add(2) = value };
             value::int32(99)
@@ -2575,13 +2815,11 @@ mod property_access {
                         Instruction::Enter,
                         get_by_id(r(6), a(0), 0),
                         Instruction::Call {
-                            value_feedback: 0,
                             call_feedback: 0,
                             dst: r(5),
                             callee: r(6),
                             this_value: a(0),
                             argument_count: 1,
-                            expression_string: None,
                             arguments: vec![c(1)],
                         },
                         Instruction::Return { value: r(5) },
@@ -2696,13 +2934,11 @@ mod property_access {
                 get_by_id(r(5), a(0), 1),
                 get_by_id(r(6), a(0), 1),
                 Instruction::Call {
-                    value_feedback: 0,
                     call_feedback: 0,
                     dst: l(1),
                     callee: c(0),
                     this_value: c(0),
                     argument_count: 0,
-                    expression_string: None,
                     arguments: Vec::new(),
                 },
                 get_by_id(r(7), a(0), 1),
@@ -3114,29 +3350,23 @@ mod virtual_arguments {
                     creates_parameter_bindings: false,
                 },
                 Instruction::GetLength {
-                    value_feedback: 0,
                     keyed_feedback: 0,
                     dst: r(5),
                     base: l(0),
-                    base_identifier: None,
                     cache: 0,
                 },
                 Instruction::GetByValue {
-                    value_feedback: 0,
                     keyed_feedback: 0,
                     dst: r(6),
                     base: l(0),
                     property: argument(2),
-                    base_identifier: None,
                     cache: 0,
                 },
                 add(r(7), r(5), r(6)),
                 Instruction::GetLength {
-                    value_feedback: 0,
                     keyed_feedback: 0,
                     dst: r(6),
                     base: l(0),
-                    base_identifier: None,
                     cache: 0,
                 },
                 add(r(7), r(7), r(6)),
@@ -3257,6 +3487,7 @@ mod direct_calls {
     /// The JIT entry of a fake callee: records its frame and returns. Like
     /// compiled code, it publishes the frame (which direct calls do not)
     /// unless it returns.
+    #[jit_abi]
     extern "C" fn callee_entry(vm: *mut u64, frame: *mut u64) -> JitResult {
         // SAFETY: The callee frame is on the fake interpreter stack, with its
         // slot count in the header.
@@ -3276,6 +3507,7 @@ mod direct_calls {
     /// A fake `libjs_jit_finish_direct_call` that "runs" the callee to
     /// completion like the interpreter: it returns into the caller's
     /// destination and pops its frame.
+    #[jit_abi]
     pub(super) extern "C" fn finish_direct_call(vm: *mut u64, frame: *mut u64, pc: u32, status: u64) -> i64 {
         // SAFETY: The fake VM and frames are live.
         unsafe {
@@ -3341,6 +3573,8 @@ mod direct_calls {
         fn target(&self, strict: bool, uses_this: bool) -> DirectCallTarget {
             DirectCallTarget {
                 function: InlinedFunctionSnapshot {
+                    super_base: None,
+                    has_own_new_target: true,
                     function: CellId(self.function.as_ptr() as u64),
                     formal_parameter_count: 3,
                     strict,
@@ -3519,7 +3753,7 @@ mod direct_calls {
 
         /// The call entry of executables without JIT code, like the
         /// runtime's: publishes the frame and has the interpreter run it.
-        extern "C" fn not_compiled_call_entry(vm: *mut u64, frame: *mut u64) -> JitResult {
+        extern "sysv64" fn not_compiled_call_entry(vm: *mut u64, frame: *mut u64) -> JitResult {
             // SAFETY: The fake VM is live.
             unsafe { *vm = frame as u64 };
             JitResult {
@@ -3974,7 +4208,7 @@ mod direct_calls {
         }
 
         /// A fake `libjs_jit_prepare_call_environment`.
-        extern "C" fn prepare_call_environment(vm: *mut u64, function: u64, this_argument: u64) -> JitResult {
+        extern "sysv64" fn prepare_call_environment(vm: *mut u64, function: u64, this_argument: u64) -> JitResult {
             let mut state = test_state(vm).borrow_mut();
             state.direct.prepared.push((function, this_argument));
             let (value, status) = state.direct.prepared_environment;
@@ -4235,7 +4469,7 @@ mod direct_calls {
 
         /// A fake raw native function: returns the sum of its `this` value
         /// and its arguments (as int32s), and records its frame.
-        extern "C" fn fake_native(vm: *mut u64) -> JitResult {
+        extern "sysv64" fn fake_native(vm: *mut u64) -> JitResult {
             // SAFETY: The running frame is the native frame on the fake
             // interpreter stack.
             unsafe {
@@ -4324,7 +4558,7 @@ mod direct_calls {
             let code = crate::asm::executable_code::ExecutableCode::new(&callee_code.code);
             let mut callee = Callee::new();
             // SAFETY: Compiled code implements the JIT entry ABI.
-            let entry: extern "C" fn(*mut u64, *mut u64) -> JitResult = unsafe { code.function() };
+            let entry: extern "sysv64" fn(*mut u64, *mut u64) -> JitResult = unsafe { code.function() };
             callee.set_entry(entry as *const () as u64);
             let mut target = callee.target(true, false);
             target.function.formal_parameter_count = callee_layout.number_of_arguments;
@@ -4357,6 +4591,8 @@ fn aarch64_direct_calls_disassemble() {
     snapshot.runtime = runtime();
     let target = DirectCallTarget {
         function: InlinedFunctionSnapshot {
+            super_base: None,
+            has_own_new_target: true,
             function: CellId(0x5000),
             formal_parameter_count: 2,
             strict: false,

@@ -11,8 +11,8 @@
 use super::super::bridge::{
     FfiStyleInvalidationField, LayoutTreeRebuildRoot, MainEffects, element_adjustment_fact, element_construction_fact,
 };
+use super::super::computed::StyleRecordView;
 use super::super::publication::pseudo_kind::{MARKER, SEARCH_TEXT, SEARCH_TEXT_CURRENT, SELECTION, SPELLING_ERROR};
-use super::super::style_invalidation::RecordView;
 use super::super::*;
 use crate::css::computed_value_types::AnimationValues;
 use crate::css::computed_value_views::ComputedValuesView;
@@ -238,25 +238,25 @@ impl RetainedState {
     pub(super) fn main_effects(
         &self,
         node: StyleNodeID,
-        old: Option<RecordView<'_>>,
-        new: RecordView<'_>,
+        old: Option<StyleRecordView<'_>>,
+        new: StyleRecordView<'_>,
         facts: InstallationFacts,
     ) -> InstalledElementEffects {
         let adjustment_facts = self.projection.adjustment_facts(node);
         let construction_facts = self.element_construction_facts(node);
-        let new_values = view_values(new);
-        let old_values = old.map(view_values);
+        let new_values = new.computed_values();
+        let old_values = old.map(|record| record.computed_values());
         let is_none = |values: ComputedValuesView<'_>| values.display().is_none();
         let names_anchors = |values: ComputedValuesView<'_>| !values.anchor().anchor_names.as_slice().is_empty();
-        let animation = |record: RecordView<'_>| {
+        let animation = |record: StyleRecordView<'_>| {
             // SAFETY: A live record's animation group payload is a live AnimationValues.
             unsafe {
-                &*record.values.payloads[group_index::ANIMATION]
+                &*record.payloads[group_index::ANIMATION]
                     .as_ptr()
                     .cast::<AnimationValues>()
             }
         };
-        let declares_timelines = |record: RecordView<'_>| {
+        let declares_timelines = |record: StyleRecordView<'_>| {
             crate::css::style_compute::rust_animation_values_declare_timelines(animation(record))
         };
         let timelines_differ = match old {
@@ -272,6 +272,8 @@ impl RetainedState {
             }
         };
         let was_none = old_values.is_none_or(is_none);
+        let native_appearance =
+            |values: ComputedValuesView<'_>| (values.appearance(), values.native_appearance_disabled());
         let (damage_effects, rebuild_root) = super::super::style_invalidation::main_effects_of_damage(
             facts.element_damage,
             facts.pseudo_elements.damages.iter().copied(),
@@ -280,13 +282,7 @@ impl RetainedState {
             facts.element_damage,
             facts.pseudo_elements.damages.iter().copied(),
         );
-        let sets = &self.computed_group_sets;
-        let holds_images = |record: RecordView<'_>| {
-            record
-                .identity
-                .and_then(|identity| sets.style_record_dependency_flags(identity.raw()))
-                .is_some_and(|flags| flags & computed::HOLDS_IMAGE_VALUES != 0)
-        };
+        let holds_images = |record: StyleRecordView<'_>| record.dependency_flags & computed::HOLDS_IMAGE_VALUES != 0;
         let custom_properties = facts.old_environment != Some(facts.new_environment);
         let container_effects = facts.composed_by_the_host || self.container_effects_for_host.get(&node).is_some();
         // A box that is a scroll container registers as a scroll snap container, or forgets what it
@@ -356,7 +352,10 @@ impl RetainedState {
                 MainEffects::ROOT_FONT_METRICS,
                 adjustment_facts & element_adjustment_fact::IS_DOCUMENT_ELEMENT != 0,
             )
-            .with(MainEffects::REVEAL_WAITING, was_none && !is_none(new_values))
+            .with(
+                MainEffects::REVEAL_WAITING,
+                was_none && new.dependency_flags & computed::IN_DISPLAY_NONE_SUBTREE == 0,
+            )
             .with(
                 MainEffects::SVG_REFERENCES,
                 adjustment_facts & element_adjustment_fact::IS_SVG_ELEMENT != 0,
@@ -367,7 +366,10 @@ impl RetainedState {
                 construction_facts
                     & (element_construction_fact::IS_HTML_INPUT_ELEMENT
                         | element_construction_fact::IS_HTML_SELECT_ELEMENT)
-                    != 0,
+                    != 0
+                    || (construction_facts & element_construction_fact::IS_HTML_PROGRESS_OR_METER_ELEMENT != 0
+                        && old_values
+                            .is_none_or(|old_values| native_appearance(old_values) != native_appearance(new_values))),
             );
         InstalledElementEffects {
             style_node: node.raw(),
@@ -416,10 +418,6 @@ pub(crate) fn record_damage_hit_tests_again(damage: u32) -> bool {
         || level >= RELAYOUT_LEVEL
         || damage & FfiStyleInvalidationField::RebuildStackingContext as u32 != 0
         || visual_contexts == VISUAL_CONTEXT_REBUILD
-}
-
-fn view_values(record: RecordView<'_>) -> ComputedValuesView<'_> {
-    ComputedValuesView::of(record.values.payloads)
 }
 
 #[cfg(test)]

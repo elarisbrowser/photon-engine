@@ -27,7 +27,6 @@
 #include <RequestServer/Request.h>
 #include <RequestServer/Resolver.h>
 #include <RequestServer/ResourceSubstitutionMap.h>
-#include <openssl/ssl.h>
 #include <string.h>
 
 namespace RequestServer {
@@ -48,70 +47,6 @@ static ByteString url_without_credentials(URL::URL url)
     url.set_username(""sv);
     url.set_password(""sv);
     return url.to_byte_string();
-}
-
-#ifdef AK_OS_MACOS
-// curl parses the system's root certificates for every connection on macOS, because it keeps its store cache off when
-// verifying through the system trust APIs, and the parsed store costs about 1 MiB for as long as the connection lives.
-// So all connections share one parsed store, replaced as often as curl would replace a store it caches.
-static void share_certificate_store(SSL_CTX* ssl_context)
-{
-    // NB: A custom certificate is only trusted by the handles that set it, so those handles can't share a store.
-    if (!default_certificate_path().is_empty())
-        return;
-
-    static constexpr auto s_shared_store_lifetime = AK::Duration::from_seconds(24 * 60 * 60);
-    static X509_STORE* s_shared_store = nullptr;
-    static MonotonicTime s_shared_store_expiry = MonotonicTime::now_coarse();
-
-    auto now = MonotonicTime::now_coarse();
-    if (!s_shared_store || now >= s_shared_store_expiry) {
-        // NB: curl ignores errors when it loads the store. An empty store stays with this connection only, and the
-        //     next connection tries again.
-        auto* store = SSL_CTX_get_cert_store(ssl_context);
-        if (!store || sk_X509_OBJECT_num(X509_STORE_get0_objects(store)) == 0 || !X509_STORE_up_ref(store))
-            return;
-
-        X509_STORE_free(s_shared_store);
-        s_shared_store = store;
-        s_shared_store_expiry = now + s_shared_store_lifetime;
-        return;
-    }
-
-    // NB: The SSL_CTX takes over the reference, and frees the store curl just parsed for it.
-    if (X509_STORE_up_ref(s_shared_store))
-        SSL_CTX_set_cert_store(ssl_context, s_shared_store);
-}
-#endif
-
-static CURLcode configure_ssl_context(CURL*, [[maybe_unused]] void* ssl_context, [[maybe_unused]] void* aia_collector)
-{
-    // Everything below casts ssl_context to an SSL_CTX, which only holds when curl is built against OpenSSL.
-    [[maybe_unused]] static auto const curl_uses_openssl = [] {
-        auto const* version_info = curl_version_info(CURLVERSION_NOW);
-        VERIFY(version_info);
-        return version_info->ssl_version && StringView { version_info->ssl_version, strlen(version_info->ssl_version) }.starts_with("OpenSSL/"sv);
-    }();
-
-#if defined(SSL_OP_IGNORE_UNEXPECTED_EOF)
-    // Some HTTPS servers, including the Python server used by WPT, close the connection without sending the
-    // mandatory TLS close-notify alert. Other browsers treat such a post-handshake transport EOF as a clean TLS EOF
-    // for compatibility. Do the same while leaving curl responsible for detecting incomplete HTTP framing.
-    if (curl_uses_openssl)
-        SSL_CTX_set_options(static_cast<SSL_CTX*>(ssl_context), SSL_OP_IGNORE_UNEXPECTED_EOF);
-#endif
-
-#ifdef AK_OS_MACOS
-    if (curl_uses_openssl)
-        share_certificate_store(static_cast<SSL_CTX*>(ssl_context));
-#else
-    // curl keeps one SSL context callback per handle, and AIA has to run against the same SSL_CTX configured above. So
-    // both are applied here. The collector arrives as CURLOPT_SSL_CTX_DATA and is null on handles lacking AIA state.
-    if (curl_uses_openssl && aia_collector)
-        apply_aia_verification(static_cast<SSL_CTX*>(ssl_context), *static_cast<AIACollector*>(aia_collector));
-#endif
-
-    return CURLE_OK;
 }
 
 // https://everything.curl.dev/internals/content-encoding.html#supported-content-encodings
@@ -504,11 +439,12 @@ NonnullOwnPtr<Request> Request::fetch(
     NonnullRefPtr<HTTP::HeaderList> request_headers,
     ByteBuffer request_body,
     HTTP::Cookie::IncludeCredentials include_credentials,
+    HTTP::Cookie::SameSiteContext same_site_context,
     Optional<Requests::RequestTransferLeaseKey> transfer_lease,
     Optional<u32> address_selection_hint,
     bool notify_on_cache_miss)
 {
-    auto request = adopt_own(*new Request { request_id, RequestType::Fetch, disk_cache, move(network_isolation_key), cache_mode, client, curl_multi, resolver, move(url), move(method), move(request_headers), move(request_body), include_credentials, move(transfer_lease) });
+    auto request = adopt_own(*new Request { request_id, RequestType::Fetch, disk_cache, move(network_isolation_key), cache_mode, client, curl_multi, resolver, move(url), move(method), move(request_headers), move(request_body), include_credentials, same_site_context, move(transfer_lease) });
     request->m_address_selection_hint = address_selection_hint;
     request->m_notify_on_cache_miss = notify_on_cache_miss;
     request->process();
@@ -541,12 +477,13 @@ NonnullOwnPtr<Request> Request::revalidate(
     ByteString method,
     NonnullRefPtr<HTTP::HeaderList> request_headers,
     ByteBuffer request_body,
-    HTTP::Cookie::IncludeCredentials include_credentials)
+    HTTP::Cookie::IncludeCredentials include_credentials,
+    HTTP::Cookie::SameSiteContext same_site_context)
 {
     // Revalidation headers must not leak into the initiating request.
     request_headers = HTTP::HeaderList::create(request_headers->headers());
 
-    auto request = adopt_own(*new Request { request_id, RequestType::BackgroundRevalidation, disk_cache, move(network_isolation_key), HTTP::CacheMode::Default, client, curl_multi, resolver, move(url), move(method), move(request_headers), move(request_body), include_credentials });
+    auto request = adopt_own(*new Request { request_id, RequestType::BackgroundRevalidation, disk_cache, move(network_isolation_key), HTTP::CacheMode::Default, client, curl_multi, resolver, move(url), move(method), move(request_headers), move(request_body), include_credentials, same_site_context });
     request->process();
 
     return request;
@@ -566,6 +503,7 @@ Request::Request(
     NonnullRefPtr<HTTP::HeaderList> request_headers,
     ByteBuffer request_body,
     HTTP::Cookie::IncludeCredentials include_credentials,
+    HTTP::Cookie::SameSiteContext same_site_context,
     Optional<Requests::RequestTransferLeaseKey> transfer_lease)
     : m_request_id(request_id)
     , m_type(type)
@@ -581,6 +519,7 @@ Request::Request(
     , m_request_headers(move(request_headers))
     , m_request_body(move(request_body))
     , m_include_credentials(include_credentials)
+    , m_same_site_context(same_site_context)
     , m_response_headers(HTTP::HeaderList::create())
     , m_transfer_lease(move(transfer_lease))
 {
@@ -634,7 +573,7 @@ NonnullOwnPtr<Request> Request::import(
     Requests::ExportedRequest exported,
     Optional<Requests::RequestTransferLeaseKey> transfer_lease)
 {
-    auto request = adopt_own(*new Request { request_id, RequestType::Imported, disk_cache, move(exported.network_isolation_key), HTTP::CacheMode::Default, client, nullptr, resolver, move(exported.url), move(exported.method), HTTP::HeaderList::create(move(exported.request_headers)), ByteBuffer {}, HTTP::Cookie::IncludeCredentials::No, move(transfer_lease) });
+    auto request = adopt_own(*new Request { request_id, RequestType::Imported, disk_cache, move(exported.network_isolation_key), HTTP::CacheMode::Default, client, nullptr, resolver, move(exported.url), move(exported.method), HTTP::HeaderList::create(move(exported.request_headers)), ByteBuffer {}, HTTP::Cookie::IncludeCredentials::No, {}, move(transfer_lease) });
     request->m_request_start_time = exported.request_start_time;
     request->m_status_code = exported.status_code;
     request->m_reason_phrase = move(exported.reason_phrase);
@@ -659,12 +598,8 @@ Request::~Request()
     if (m_disk_cache.has_value())
         m_disk_cache->close_entries_read_by(*this);
 
-    if (m_cache_entry_writer.has_value()) {
-        if (m_state == State::Complete && m_curl_result_code == CURLE_OK)
-            (void)m_cache_entry_writer->flush(m_request_headers);
-        else
-            m_cache_entry_writer->remove_incomplete_entry();
-    }
+    // A finished response has closed its entry by now.
+    close_disk_cache_entry(DiskCacheEntryOutcome::Incomplete);
 
     if constexpr (REQUESTSERVER_WIRE_DEBUG)
         wire_stats().remove(this);
@@ -775,7 +710,7 @@ void Request::request_response_storage(ControlConnectionFromClient& connection)
     static u64 s_next_response_storage_request_id = 0;
     m_response_storage_request_id = s_next_response_storage_request_id++;
 
-    connection.async_store_response_cookies_and_hsts_policy(m_client->client_id(), m_request_id, *m_response_storage_request_id, m_url, cookie_partition_context(), m_pending_response_storage->cookies, m_pending_response_storage->hsts_policy);
+    connection.async_store_response_cookies_and_hsts_policy(m_client->client_id(), m_request_id, *m_response_storage_request_id, m_url, cookie_partition_context(), m_same_site_context, m_pending_response_storage->cookies, m_pending_response_storage->hsts_policy);
 }
 
 bool Request::notify_stored_response_cookies_and_hsts_policy(Badge<ControlConnectionFromClient>, u64 store_request_id)
@@ -906,8 +841,14 @@ void Request::handle_fetch_complete(int result_code)
 
     m_curl_result_code = result_code;
 
-    if (m_response_buffer.is_eof())
+    if (m_response_buffer.is_eof()) {
         transition_to_state(State::Complete);
+        return;
+    }
+
+    // The client hasn't taken the whole response yet, and it may never do so. Requests waiting on the cache entry
+    // shouldn't have to wait for it.
+    close_disk_cache_entry(result_code == CURLE_OK ? DiskCacheEntryOutcome::Complete : DiskCacheEntryOutcome::Incomplete);
 }
 
 void Request::reset_for_retry()
@@ -1092,7 +1033,7 @@ void Request::handle_initial_state()
 
                     if (m_cache_entry_reader.has_value()) {
                         if (m_cache_entry_reader->revalidation_type() == HTTP::CacheEntryReader::RevalidationType::StaleWhileRevalidate)
-                            m_client->start_revalidation_request({}, *m_network_isolation_key, m_method, m_url, m_request_headers, m_request_body, m_include_credentials);
+                            m_client->start_revalidation_request({}, *m_network_isolation_key, m_method, m_url, m_request_headers, m_request_body, m_include_credentials, m_same_site_context);
 
                         if (is_revalidation_request())
                             transition_to_state(State::DNSLookup);
@@ -1422,7 +1363,7 @@ void Request::handle_retrieve_cookie_state()
         static u64 s_next_cookie_request_id = 0;
         m_cookie_request_id = s_next_cookie_request_id++;
         mark_lifecycle_event(this, &WireStats::cookie_started_at);
-        connection->async_retrieve_http_cookie(m_client->client_id(), m_request_id, m_type, *m_cookie_request_id, m_url, cookie_partition_context());
+        connection->async_retrieve_http_cookie(m_client->client_id(), m_request_id, m_type, *m_cookie_request_id, m_url, cookie_partition_context(), m_same_site_context);
     } else {
         m_network_error = Requests::NetworkError::RequestServerDied;
         transition_to_state(State::Error);
@@ -1573,7 +1514,9 @@ void Request::handle_fetch_state()
 
     curl_slist* curl_headers = nullptr;
 
-    if (m_method.is_one_of("POST"sv, "PUT"sv, "PATCH"sv, "DELETE"sv)) {
+    // Any method can carry a body (WebDAV's PROPFIND and REPORT, e.g.), and the request's headers already announce
+    // its length, so hand curl the body whatever the method.
+    if (m_method.is_one_of("POST"sv, "PUT"sv, "PATCH"sv, "DELETE"sv) || (!m_request_body.is_empty() && m_method != "HEAD"sv)) {
         set_option(CURLOPT_POSTFIELDSIZE, m_request_body.size());
         set_option(CURLOPT_POSTFIELDS, m_request_body.data());
 
@@ -1721,41 +1664,25 @@ void Request::handle_complete_state()
 
         // Finalize the disk cache entry before notifying WebContent that the request is complete, so that a large body
         // can be handed over as a file from the cache.
-        Optional<HTTP::CacheEntryBodyFile> cached_body_file;
-        if (m_cache_entry_writer.has_value()) {
-            if (m_cache_entry_writer->body_size() >= static_cast<u64>(PAGE_SIZE)) {
-                auto body_file = m_cache_entry_writer->flush_and_take_body_file(m_request_headers);
-                if (!body_file.is_error())
-                    cached_body_file = body_file.release_value();
-            } else {
-                (void)m_cache_entry_writer->flush(m_request_headers);
-            }
-            m_cache_entry_writer.clear();
-        }
+        close_disk_cache_entry(DiskCacheEntryOutcome::Complete);
 
         if (m_export.has_value()) {
             write_export_result();
         } else {
-            if (cached_body_file.has_value())
-                m_client->async_request_cached_body_file_available(m_request_id, IPC::File::adopt_fd(cached_body_file->fd), cached_body_file->offset, cached_body_file->size);
-
             m_client->async_request_finished(m_request_id, m_bytes_transferred_to_client, timing_info, m_network_error);
         }
     }
 
-    if (m_cache_entry_writer.has_value()) {
-        if (m_curl_result_code == CURLE_OK)
-            (void)m_cache_entry_writer->flush(m_request_headers);
-        else
-            m_cache_entry_writer->remove_incomplete_entry();
-        m_cache_entry_writer.clear();
-    }
+    close_disk_cache_entry(m_curl_result_code == CURLE_OK ? DiskCacheEntryOutcome::Complete : DiskCacheEntryOutcome::Incomplete);
 
     m_client->request_complete({}, *this);
 }
 
 void Request::handle_error_state()
 {
+    // A transfer lease can keep this request alive long after it has failed.
+    close_disk_cache_entry(DiskCacheEntryOutcome::Incomplete);
+
     if (m_export.has_value()) {
         write_export_result();
     } else if (delivers_response_to_client()) {
@@ -1965,7 +1892,9 @@ void Request::read_imported_body()
         }
 
         mark_activity();
-        if (auto write_result = m_response_buffer.write_some({ buffer, static_cast<size_t>(result.value()) }); write_result.is_error()) {
+        ReadonlyBytes bytes { buffer, static_cast<size_t>(result.value()) };
+        write_to_disk_cache(bytes);
+        if (auto write_result = m_response_buffer.write_some(bytes); write_result.is_error()) {
             m_network_error = Requests::NetworkError::Unknown;
             transition_to_state(State::Error);
             return;
@@ -2018,6 +1947,7 @@ void Request::complete_import_if_finished()
         return;
 
     m_curl_result_code = CURLE_OK;
+    close_disk_cache_entry(m_import->network_error.has_value() ? DiskCacheEntryOutcome::Incomplete : DiskCacheEntryOutcome::Complete);
     if (auto result = write_queued_bytes_without_blocking(); result.is_error()) {
         m_network_error = Requests::NetworkError::Unknown;
         transition_to_state(State::Error);
@@ -2112,6 +2042,11 @@ size_t Request::on_data_received(void* buffer, size_t size, size_t nmemb, void* 
 
     auto total_size = size * nmemb;
     ReadonlyBytes bytes { static_cast<u8 const*>(buffer), total_size };
+
+    request.write_to_disk_cache(bytes);
+
+    if (request.m_type == RequestType::BackgroundRevalidation)
+        return total_size;
 
     auto result = [&] -> ErrorOr<void> {
         TRY(request.m_response_buffer.write_some(bytes));
@@ -2349,35 +2284,35 @@ void Request::send_headers_to_client()
     m_client->async_headers_became_available(m_request_id, m_response_headers->headers(), m_status_code, m_reason_phrase, cache_state, m_http_version);
 }
 
-ErrorOr<void> Request::write_queued_bytes_without_blocking()
+void Request::write_to_disk_cache(ReadonlyBytes bytes)
 {
-    auto write_bytes_to_disk_cache = [&](ReadonlyBytes bytes) {
-        if (!m_cache_entry_writer.has_value())
-            return;
+    if (!m_cache_entry_writer.has_value())
+        return;
 
-        if (m_cache_entry_writer->write_data(bytes).is_error()) {
-            m_cache_entry_writer.clear();
-            return;
-        }
+    if (m_cache_entry_writer->write_data(bytes).is_error())
+        m_cache_entry_writer.clear();
+}
 
-        // The entry is still filling, even once curl has nothing left to deliver: A client that reads its response
-        // slowly keeps these writes coming long after the transfer is over — so they count as progress too.
-        mark_activity();
-    };
+void Request::close_disk_cache_entry(DiskCacheEntryOutcome outcome)
+{
+    if (!m_cache_entry_writer.has_value())
+        return;
 
-    if (m_type == RequestType::BackgroundRevalidation) {
-        while (!m_response_buffer.is_eof()) {
-            auto bytes = m_response_buffer.peek_some_contiguous();
-            write_bytes_to_disk_cache(bytes);
-            MUST(m_response_buffer.discard(bytes.size()));
-        }
-
-        if (m_curl_result_code.has_value())
-            transition_to_state(State::Complete);
-
-        return {};
+    if (outcome == DiskCacheEntryOutcome::Incomplete) {
+        m_cache_entry_writer->remove_incomplete_entry();
+    } else if (delivers_response_to_client() && !m_export.has_value() && m_cache_entry_writer->body_size() >= static_cast<u64>(PAGE_SIZE)) {
+        // The client may still be reading the response through its pipe, which this file doesn't replace.
+        if (auto body_file = m_cache_entry_writer->flush_and_take_body_file(m_request_headers); !body_file.is_error())
+            m_client->async_request_cached_body_file_available(m_request_id, IPC::File::adopt_fd(body_file.value().fd), body_file.value().offset, body_file.value().size);
+    } else {
+        (void)m_cache_entry_writer->flush(m_request_headers);
     }
 
+    m_cache_entry_writer.clear();
+}
+
+ErrorOr<void> Request::write_queued_bytes_without_blocking()
+{
     if (!m_client_writer_notifier) {
         m_client_writer_notifier = Core::Notifier::construct(m_client_request_pipe->writer_fd(), Core::NotificationType::Write);
         m_client_writer_notifier->set_enabled(false);
@@ -2428,7 +2363,6 @@ ErrorOr<void> Request::write_queued_bytes_without_blocking()
         }
 
         auto written = result.value();
-        write_bytes_to_disk_cache(bytes.slice(0, written));
         MUST(m_response_buffer.discard(written));
 
         m_bytes_transferred_to_client += written;

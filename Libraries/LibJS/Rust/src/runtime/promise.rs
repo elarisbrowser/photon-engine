@@ -126,14 +126,26 @@ impl Deref for Promise {
 impl Promise {
     pub fn create(vm: &Vm, realm: Gc<Realm>) -> Gc<Promise> {
         realm.create_object(vm, |defer_gc| {
-            Promise::new(defer_gc, vm, Self::CLASS, realm.intrinsics().promise_prototype(vm))
+            Promise::new(
+                defer_gc,
+                vm,
+                realm,
+                Self::CLASS,
+                realm.intrinsics().promise_prototype(vm),
+            )
         })
     }
 
     /// A promise with `prototype`, for `class`, which is Promise or a class that extends it.
-    pub fn new(_: &DeferGc<'_>, vm: &Vm, class: &'static Class, prototype: Gc<Object>) -> Promise {
+    pub fn new(_: &DeferGc<'_>, vm: &Vm, realm: Gc<Realm>, class: &'static Class, prototype: Gc<Object>) -> Promise {
         Promise {
-            base: Object::new_with_prototype(vm, class, prototype, MayInterfereWithIndexedPropertyAccess::No),
+            base: Object::new_with_prototype(
+                vm,
+                class,
+                realm,
+                Some(prototype),
+                MayInterfereWithIndexedPropertyAccess::No,
+            ),
             state: Cell::new(PromiseState::Pending),
             is_handled: Cell::new(false),
             has_resolver: Cell::new(false),
@@ -161,6 +173,15 @@ impl Promise {
 
     pub fn set_is_handled(&self) {
         self.is_handled.set(true);
+    }
+
+    /// Sets [[PromiseIsHandled]] to true, first telling the host when that handles a rejection, as PerformPromiseThen
+    /// does when it adds a reaction to a settled promise.
+    pub fn mark_handled(&self, vm: &Vm) {
+        if self.state() == PromiseState::Rejected && !self.is_handled() {
+            vm.host_promise_rejection_tracker()(vm, self.as_gc(), RejectionOperation::Handle);
+        }
+        self.set_is_handled();
     }
 
     fn is_settled(&self) -> bool {

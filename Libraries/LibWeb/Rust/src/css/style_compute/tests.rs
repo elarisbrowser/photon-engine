@@ -50,7 +50,7 @@ fn url_dependencies_only_read_a_base_for_relative_urls() {
         let value = StyleValueData::Url(StyleValueBox::new(UrlPayload {
             url: crate::css::style_value::RetainedString::from_utf16(&url.encode_utf16().collect::<Vec<_>>()).unwrap(),
             url_type: 0,
-            modifiers: crate::css::style_value::RetainedRequestUrlModifierList::from_retained_modifiers(Vec::new()),
+            modifiers: crate::css::style_value::RetainedRequestUrlModifierList::from_vec(Vec::new()),
         }));
         let dependencies = collect_external_value_dependencies(&value);
         assert_eq!(dependencies.needs_document_base_url, needs_base, "{url}");
@@ -177,6 +177,7 @@ fn element_adjustment_input() -> FfiBoxTypeTransformationInput {
         force_position_static: false,
         force_symbol_display_inline: false,
         webkit_box_layout_transformation_applies: false,
+        in_top_layer: false,
     }
 }
 
@@ -866,6 +867,7 @@ fn svg_axis_case(svg: bool, vertical: bool) -> [f64; 3] {
                 &mut results,
                 &mut color_scheme,
                 false,
+                false,
             );
         }
         [prop::WIDTH, prop::HEIGHT, prop::MARGIN_LEFT].map(|property| match writer.get(property).unwrap().data() {
@@ -997,6 +999,7 @@ fn font_phase_axis_case(
                         None,
                         &mut results,
                         &mut color_scheme,
+                        false,
                         false,
                     );
                 }

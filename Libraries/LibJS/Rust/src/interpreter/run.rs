@@ -14,6 +14,7 @@ use ak::ScopeGuard;
 
 use super::vm::Vm;
 use crate::bytecode::executable::Executable;
+use crate::gc::root::Root;
 use crate::jit::code::EntryStatus;
 use crate::layout::cell::Gc;
 use crate::layout::execution_context::{ExecutionContext, ScriptOrModule};
@@ -25,6 +26,7 @@ use crate::runtime::environment::Environment;
 use crate::runtime::error::ErrorKind;
 use crate::runtime::error_types::ErrorType;
 use crate::runtime::native_javascript_backed_function::NativeJavaScriptBackedFunction;
+use crate::runtime::promise::Promise;
 use crate::runtime::source_text_module::SourceTextModule;
 use crate::script::Script;
 use libjs_abi::register;
@@ -100,7 +102,11 @@ impl Vm {
             this_register.set(context_ref.this_value.get());
         }
 
-        if self.interpreter_stack().is_exhausted() || self.did_reach_stack_space_limit() {
+        if self.interrupt_requested() {
+            context_ref
+                .register(register::EXCEPTION)
+                .set(self.interrupt_exception());
+        } else if self.interpreter_stack().is_exhausted() || self.did_reach_stack_space_limit() {
             let Err(throw) =
                 self.throw_completion::<()>(ErrorKind::InternalError, ErrorType::CallStackSizeExceeded, &[])
             else {
@@ -201,7 +207,11 @@ impl Vm {
             return;
         }
 
-        if frame.caller_is_construct.get() && !return_value.is_object() {
+        // NB: The frame of a derived constructor returns its this value only for undefined.
+        if frame.caller_is_construct.get()
+            && !return_value.is_object()
+            && (!frame.caller_is_derived_construct.get() || return_value.is_undefined())
+        {
             return_value = frame.this_value.get();
         }
         // SAFETY: A frame's caller outlives it.
@@ -242,6 +252,8 @@ impl Vm {
         unsafe { context.as_ref() }
             .register(register::ACCUMULATOR)
             .set(initial_accumulator_value);
+        // NB: A resumed frame continues after its Enter, so the resume counts as entering the executable.
+        executable.head.idle_collection_count.set(0);
         self.run_executable(context, executable, entry_point)
     }
 
@@ -259,7 +271,9 @@ impl Vm {
         // NOTE: Spec steps are rearranged in order to compute number of registers+constants+locals before construction of the execution context.
 
         // 11. Let script be scriptRecord.[[ECMAScriptCode]].
-        let executable = script_record.cached_executable();
+        let executable = script_record.cached_executable().expect("a script is evaluated once");
+        // NB: The top-level code runs once, so the script lets it go when this returns, on every path.
+        let _forget_executable_guard = ScopeGuard::new(|| script_record.forget_executable());
         if should_dump_bytecode() {
             executable.dump();
         }
@@ -343,17 +357,17 @@ impl Vm {
         result
     }
 
-    pub fn run_module(&self, module: Gc<SourceTextModule>) -> ThrowCompletionOr<Value> {
+    pub fn run_module(&self, module: Gc<SourceTextModule>) -> ThrowCompletionOr<Gc<Promise>> {
         // FIXME: This is not a entry point as defined in the spec, but is convenient.
         //        To avoid work we use link_and_eval_module however that can already be
         //        dangerous if the vm loaded other modules.
-        self.link_and_eval_module(module.upcast())?;
+        let evaluation = Root::new(self, self.link_and_eval_module(module.upcast())?);
 
         self.run_queued_promise_jobs();
 
         self.run_queued_finalization_registry_cleanup_jobs();
 
-        Ok(Value::UNDEFINED)
+        Ok(evaluation.value())
     }
 
     /// Enters a frame for a call of `callee_function` that the interpreter runs inline, as Return leaves it: the
@@ -428,6 +442,7 @@ impl Vm {
             dst_raw,
         )?;
         callee_context.caller_is_construct.set(is_construct);
+        callee_context.caller_is_derived_construct.set(false);
 
         // Inlined PrepareForOrdinaryCall (avoids function call overhead on hot path).
         callee_context
@@ -435,6 +450,9 @@ impl Vm {
             .set(Some(callee_function.as_function_object_gc()));
         callee_context.realm.set(callee_function.realm());
         callee_context.script_or_module.set(callee_function.script_or_module());
+        callee_context
+            .new_target
+            .set(new_target.map_or(Value::UNDEFINED, Value::from_object));
         let environment = callee_function.inline_call_environment(self, new_target);
         callee_context.lexical_environment.set(environment);
         callee_context.variable_environment.set(environment);
@@ -578,7 +596,14 @@ impl Vm {
 
     /// Unwinds to the innermost handler of an exception thrown at `program_counter` in the running frame, leaving
     /// frames the interpreter entered without returning to the runtime.
+    ///
+    /// Once the VM is interrupted, whatever was thrown becomes the interrupt exception, which no handler catches, not
+    /// even a finally block: it unwinds to the native caller, and no script runs on the way.
     pub fn handle_exception(&self, mut program_counter: u32, exception: Value) -> HandleExceptionResponse {
+        if self.interrupt_requested() {
+            return self.unwind_for_interrupt();
+        }
+
         // An exception that unwinds out to a native caller enters here again in the frame that called it, so remember
         // only where it was first thrown.
         if !self.is_last_throw(exception) {
@@ -605,10 +630,16 @@ impl Vm {
                 previous_context = Some((context.caller_frame.get(), context.caller_return_pc.get()));
 
                 let executable = Executable::from_head(executable);
-                let handler = executable.exception_handlers_for_offset(context_program_counter);
-                if handler.is_some_and(|handler| handler.catches_exception) {
-                    exception_will_be_caught = true;
-                    return ControlFlow::Break(());
+                let mut offset = context_program_counter;
+                for _ in 0..executable.exception_handlers().len() {
+                    let Some(handler) = executable.exception_handlers_for_offset(offset) else {
+                        break;
+                    };
+                    if handler.catches_exception {
+                        exception_will_be_caught = true;
+                        return ControlFlow::Break(());
+                    }
+                    offset = handler.handler_offset;
                 }
                 ControlFlow::Continue(())
             });
@@ -669,6 +700,28 @@ impl Vm {
                 debugger.did_finish_exception_propagation(exception);
             }
             return HandleExceptionResponse::ExitFromExecutable;
+        }
+    }
+
+    /// Like handle_exception() for a thrown interrupt: leaves frames the interpreter entered, up to one that a native
+    /// caller waits for. A native caller that goes on to run code gets the same exception, as the VM stays interrupted.
+    #[cold]
+    #[inline(never)]
+    fn unwind_for_interrupt(&self) -> HandleExceptionResponse {
+        let exception = self.interrupt_exception();
+        loop {
+            let context_pointer = self
+                .running_execution_context()
+                .expect("an exception is thrown in a running frame");
+            // SAFETY: The running context is live until it is deallocated below.
+            let context = unsafe { context_pointer.as_ref() };
+            let caller_frame = context.caller_frame.get();
+            if context.returns_to_native_caller.get() || caller_frame.is_null() {
+                context.register(register::EXCEPTION).set(exception);
+                return HandleExceptionResponse::ExitFromExecutable;
+            }
+            self.interpreter_stack().deallocate(context_pointer.as_ptr().cast());
+            self.head.running_execution_context.set(caller_frame);
         }
     }
 }

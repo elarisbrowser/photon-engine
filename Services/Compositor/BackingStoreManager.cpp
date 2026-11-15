@@ -10,8 +10,6 @@
 #include <Compositor/SkiaBackendContext.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/SharedImageBuffer.h>
-#include <AK/Time.h>
-#include <cstdlib>
 
 #ifdef USE_VULKAN_DMABUF_IMAGES
 #    include <AK/Array.h>
@@ -25,20 +23,13 @@
 
 namespace Compositor {
 
-static bool external_image_lease_trace_enabled()
-{
-    static bool enabled = std::getenv("EXTERNAL_IMAGE_LEASE_TRACE") != nullptr;
-    return enabled;
-}
-
 #if defined(USE_DIRECTX) || defined(USE_VULKAN)
 static NonnullRefPtr<Gfx::PaintingSurface> create_gpu_painting_surface_with_bitmap_flush(Gfx::IntSize size, Gfx::SharedImageBuffer& buffer, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context)
 {
     auto surface = Gfx::PaintingSurface::create_with_size(size, Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, skia_backend_context);
     auto bitmap = buffer.bitmap();
     surface->on_flush = [bitmap = move(bitmap)](auto& surface) {
-        if (!surface.read_into_bitmap(*bitmap))
-            dbgln("GPU frame readback into shareable bitmap failed");
+        surface.read_into_bitmap(*bitmap);
     };
     return surface;
 }
@@ -125,24 +116,20 @@ static ErrorOr<GpuBackingStore> create_shared_gpu_backing_store(Gfx::IntSize siz
 }
 #endif
 
-// The window server can keep reading a replaced surface after the client presents its replacement.
-// A third store lets the compositor render through that interval. A client that samples published
-// stores on its own GPU also holds two: the displayed store and the next one until its GPU work is
-// under way. A fourth store lets the compositor keep rendering while both are held.
-static size_t backing_store_count_for(bool should_publish, [[maybe_unused]] BackingStoreManager::ClientSamplesOnGpu client_samples_on_gpu)
+// A store shown on screen is let go of when the next one is shown, but on macOS the window server is handed the
+// surface itself, and keeps reading it until it has composited the replacement. A third store lets the compositor keep
+// rendering through that window instead of waiting for it.
+static size_t backing_store_count_for([[maybe_unused]] BackingStoreManager::PublicationMode publication_mode)
 {
 #ifdef AK_OS_MACOS
-    if (should_publish)
-        return client_samples_on_gpu == BackingStoreManager::ClientSamplesOnGpu::Yes ? 4 : 3;
-#else
-    (void)should_publish;
+    if (publication_mode != BackingStoreManager::PublicationMode::Unpublished)
+        return 3;
 #endif
     return 2;
 }
 
 Optional<BackingStoreManager::Allocation> BackingStoreManager::resize_backing_stores_if_needed(
-    Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress window_resize_in_progress,
-    bool should_publish, ClientSamplesOnGpu client_samples_on_gpu)
+    Gfx::IntSize viewport_size, Compositing::WindowResizingInProgress window_resize_in_progress, PublicationMode publication_mode)
 {
     if (viewport_size.is_empty())
         return {};
@@ -161,9 +148,8 @@ Optional<BackingStoreManager::Allocation> BackingStoreManager::resize_backing_st
 
     if (needs_allocation) {
         m_allocated_size = allocation_size;
-        ++m_pool_epoch;
+        auto buffer_count = backing_store_count_for(publication_mode);
         Vector<i32> bitmap_ids;
-        auto buffer_count = backing_store_count_for(should_publish, client_samples_on_gpu);
         bitmap_ids.ensure_capacity(buffer_count);
         for (size_t i = 0; i < buffer_count; ++i)
             bitmap_ids.append(m_next_bitmap_id++);
@@ -173,31 +159,46 @@ Optional<BackingStoreManager::Allocation> BackingStoreManager::resize_backing_st
     return {};
 }
 
-Optional<BackingStoreManager::Publication> BackingStoreManager::allocate_backing_stores(Allocation const& allocation, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context, bool should_publish, [[maybe_unused]] GpuSharing gpu_sharing)
+ErrorOr<Optional<BackingStoreManager::Publication>> BackingStoreManager::allocate_backing_stores(Allocation const& allocation, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context, PublicationMode publication_mode, [[maybe_unused]] GpuSharing gpu_sharing, RefPtr<WindowServer> window_server_showing_stores)
 {
     m_backing_stores.clear();
     m_rendering_store_index.clear();
     m_latest_rendered_store_index.clear();
+    m_publication_mode = publication_mode;
+    m_window_server_showing_stores = publication_mode == PublicationMode::ShownInRemoteLayer ? move(window_server_showing_stores) : nullptr;
 
     if (Gfx::Bitmap::size_would_overflow(Gfx::BitmapFormat::BGRA8888, allocation.size))
-        return {};
+        return Optional<Publication> {};
 
     auto buffer_count = allocation.bitmap_ids.size();
     m_backing_store_size = allocation.size;
     m_initial_backing_store_count = buffer_count;
     m_backing_stores.ensure_capacity(buffer_count);
 
-    if (!should_publish) {
+    if (publication_mode == PublicationMode::Unpublished) {
         for (size_t i = 0; i < buffer_count; ++i) {
             m_backing_stores.append({
                 .surface = Gfx::PaintingSurface::create_with_size(allocation.size, Gfx::BitmapFormat::BGRA8888, Gfx::AlphaType::Premultiplied, skia_backend_context),
-                .published_shared_image_buffer = nullptr,
+                .shared_image_buffer = nullptr,
+                .window_server_surface = nullptr,
                 .bitmap_id = allocation.bitmap_ids[i],
                 .state = BufferState::Available,
-                .accumulated_damage = { {}, allocation.size },
             });
         }
-        return {};
+        return Optional<Publication> {};
+    }
+
+    if (publication_mode == PublicationMode::ShownInRemoteLayer) {
+        for (size_t i = 0; i < buffer_count; ++i) {
+            auto store = create_backing_store_shown_by_window_server(allocation.size, allocation.bitmap_ids[i], skia_backend_context);
+            if (store.is_error()) {
+                m_backing_stores.clear();
+                invalidate();
+                return store.release_error();
+            }
+            m_backing_stores.append(store.release_value());
+        }
+        return Optional<Publication> { Publication { .bitmap_ids = allocation.bitmap_ids, .shared_images = {} } };
     }
 
     // The UI installs the first published buffer as its initial front buffer.
@@ -226,19 +227,19 @@ Optional<BackingStoreManager::Publication> BackingStoreManager::allocate_backing
             auto store = backing_store.release_value();
             m_backing_stores.append({
                 .surface = move(store.surface),
-                .published_shared_image_buffer = nullptr,
+                .shared_image_buffer = nullptr,
+                .window_server_surface = nullptr,
                 .bitmap_id = allocation.bitmap_ids[i],
                 .state = initial_buffer_state(i),
-                .accumulated_damage = { {}, allocation.size },
             });
             shared_images.append(move(store.shared_image));
         }
 
         if (allocation_succeeded) {
-            return Publication {
+            return Optional<Publication> { Publication {
                 .bitmap_ids = allocation.bitmap_ids,
                 .shared_images = move(shared_images),
-            };
+            } };
         }
 
         m_backing_stores.clear();
@@ -248,26 +249,39 @@ Optional<BackingStoreManager::Publication> BackingStoreManager::allocate_backing
     Vector<Gfx::SharedImage> shared_images;
     shared_images.ensure_capacity(buffer_count);
     for (size_t i = 0; i < buffer_count; ++i) {
-        m_backing_stores.append(create_published_shareable_backing_store(allocation.size, allocation.bitmap_ids[i], initial_buffer_state(i), skia_backend_context));
-        shared_images.append(m_backing_stores.last().published_shared_image_buffer->export_shared_image());
+        m_backing_stores.append(create_shareable_backing_store(allocation.size, allocation.bitmap_ids[i], initial_buffer_state(i), skia_backend_context));
+        shared_images.append(m_backing_stores.last().shared_image_buffer->export_shared_image());
     }
 
-    return Publication {
+    return Optional<Publication> { Publication {
         .bitmap_ids = allocation.bitmap_ids,
         .shared_images = move(shared_images),
-    };
+    } };
 }
 
-BackingStoreManager::BackingStore BackingStoreManager::create_published_shareable_backing_store(Gfx::IntSize size, i32 bitmap_id, BufferState state, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context)
+BackingStoreManager::BackingStore BackingStoreManager::create_shareable_backing_store(Gfx::IntSize size, i32 bitmap_id, BufferState state, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context)
 {
     auto shared_image_buffer = make<Gfx::SharedImageBuffer>(Gfx::SharedImageBuffer::create(size));
     auto surface = create_shareable_bitmap_backing_store(size, *shared_image_buffer, skia_backend_context);
     return {
         .surface = move(surface),
-        .published_shared_image_buffer = move(shared_image_buffer),
+        .shared_image_buffer = move(shared_image_buffer),
+        .window_server_surface = nullptr,
         .bitmap_id = bitmap_id,
         .state = state,
-        .accumulated_damage = { {}, size },
+    };
+}
+
+ErrorOr<BackingStoreManager::BackingStore> BackingStoreManager::create_backing_store_shown_by_window_server(Gfx::IntSize size, i32 bitmap_id, RefPtr<Gfx::SkiaBackendContext> const& skia_backend_context)
+{
+    VERIFY(m_window_server_showing_stores);
+    auto surface = TRY(m_window_server_showing_stores->try_create_presentable_surface(size, skia_backend_context));
+    return BackingStore {
+        .surface = surface->painting_surface(),
+        .shared_image_buffer = nullptr,
+        .window_server_surface = move(surface),
+        .bitmap_id = bitmap_id,
+        .state = BufferState::Available,
     };
 }
 
@@ -284,7 +298,7 @@ Optional<BackingStoreManager::Publication> BackingStoreManager::add_backing_stor
 
     for (size_t i = 0; i < m_backing_stores.size(); ++i) {
         auto const& store = m_backing_stores[i];
-        if (!store.published_shared_image_buffer)
+        if (!store.shared_image_buffer && !store.window_server_surface)
             return {};
         bool client_displays_store = i == *m_latest_rendered_store_index;
         if (client_displays_store && store.state != BufferState::Presented)
@@ -294,10 +308,18 @@ Optional<BackingStoreManager::Publication> BackingStoreManager::add_backing_stor
     }
 
     auto bitmap_id = m_next_bitmap_id++;
-    m_backing_stores.append(create_published_shareable_backing_store(m_backing_store_size, bitmap_id, BufferState::Available, skia_backend_context));
+    if (m_publication_mode == PublicationMode::ShownInRemoteLayer) {
+        auto store = create_backing_store_shown_by_window_server(m_backing_store_size, bitmap_id, skia_backend_context);
+        if (store.is_error())
+            return {};
+        m_backing_stores.append(store.release_value());
+    } else {
+        m_backing_stores.append(create_shareable_backing_store(m_backing_store_size, bitmap_id, BufferState::Available, skia_backend_context));
+    }
 
     Vector<Gfx::SharedImage> shared_images;
-    shared_images.append(m_backing_stores.last().published_shared_image_buffer->export_shared_image());
+    if (m_publication_mode == PublicationMode::Published)
+        shared_images.append(m_backing_stores.last().shared_image_buffer->export_shared_image());
     return Publication {
         .bitmap_ids = { bitmap_id },
         .shared_images = move(shared_images),
@@ -316,7 +338,7 @@ Vector<i32> BackingStoreManager::retire_idle_surplus_backing_stores()
         auto const& store = m_backing_stores[i];
         if (m_latest_rendered_store_index == i)
             continue;
-        if (store.state != BufferState::Available || store.was_rendered_into_since_last_retirement_check || published_surface_is_in_use(store))
+        if (store.state != BufferState::Available || store.was_rendered_into_since_last_retirement_check || shared_surface_is_in_use(store))
             continue;
 
         retired_bitmap_ids.append(store.bitmap_id);
@@ -335,12 +357,14 @@ bool BackingStoreManager::is_valid() const
     return !m_backing_stores.is_empty();
 }
 
-bool BackingStoreManager::published_surface_is_in_use(BackingStore const& store)
+bool BackingStoreManager::shared_surface_is_in_use(BackingStore const& store)
 {
+    if (store.window_server_surface)
+        return store.window_server_surface->is_read_by_window_server();
 #ifdef AK_OS_MACOS
     // The send right exported to the UI counts as use as well, so a freshly published store reads as in use until
     // the UI has imported it.
-    return store.published_shared_image_buffer && store.published_shared_image_buffer->iosurface_handle().is_in_use();
+    return store.shared_image_buffer && store.shared_image_buffer->iosurface_handle().is_in_use();
 #else
     (void)store;
     return false;
@@ -351,11 +375,11 @@ bool BackingStoreManager::store_can_be_rendered_into(BackingStore const& store)
 {
     if (store.state != BufferState::Available)
         return false;
-    // Only the client hands a store to the window server, so whatever uses a store the client was never presented
-    // is the send right still on its way there.
-    if (!store.was_presented_to_client)
+    // Only a store shown on screen is handed to the window server, so whatever uses a store that never was is the
+    // send right on its way to the client.
+    if (!store.was_shown_on_screen)
         return true;
-    return !published_surface_is_in_use(store);
+    return !shared_surface_is_in_use(store);
 }
 
 bool BackingStoreManager::has_available_buffer() const
@@ -363,113 +387,57 @@ bool BackingStoreManager::has_available_buffer() const
     return any_of(m_backing_stores, [](auto const& store) { return store_can_be_rendered_into(store); });
 }
 
-Optional<BackingStoreManager::RenderTarget> BackingStoreManager::acquire_render_target(Gfx::IntRect frame_damage)
+Optional<BackingStoreManager::RenderTarget> BackingStoreManager::acquire_render_target()
 {
     VERIFY(!m_rendering_store_index.has_value());
-    for (auto& store : m_backing_stores)
-        store.accumulated_damage.unite(frame_damage);
 
     for (size_t i = 0; i < m_backing_stores.size(); ++i) {
         auto& store = m_backing_stores[i];
         if (!store_can_be_rendered_into(store))
             continue;
 
-        auto acquired_at = MonotonicTime::now();
         store.state = BufferState::Rendering;
-        store.consumer_gpu_work_complete = false;
         store.was_rendered_into_since_last_retirement_check = true;
         m_rendering_store_index = i;
-        if (external_image_lease_trace_enabled())
-            dbgln("[ExternalImageLease][Pool] at_ns={} backing_id={} bitmap_id={} pool_epoch={} frame_id=not-assigned state=AVAILABLE->RENDERING", MonotonicTime::now().nanoseconds(), static_cast<u64>(store.bitmap_id) + 1, store.bitmap_id, m_pool_epoch);
-        if (external_image_lease_trace_enabled() && store.last_consumer_release_time.has_value())
-            dbgln("[ExternalImageLease][Pool] at_ns={} backing_id={} pool_epoch={} state=ACQUIRED release_to_acquire_us={}", acquired_at.nanoseconds(), static_cast<u64>(store.bitmap_id) + 1, m_pool_epoch, (acquired_at - *store.last_consumer_release_time).to_microseconds());
-        auto damage_rect = store.accumulated_damage;
-        store.accumulated_damage = {};
-        return RenderTarget { *store.surface, store.bitmap_id, damage_rect };
+        return RenderTarget { *store.surface, store.bitmap_id };
     }
     return {};
 }
 
-void BackingStoreManager::complete_rendering(i32 bitmap_id, bool wait_for_release)
+void BackingStoreManager::complete_rendering(i32 bitmap_id)
 {
     VERIFY(m_rendering_store_index.has_value());
     auto& store = m_backing_stores[*m_rendering_store_index];
     VERIFY(store.state == BufferState::Rendering);
     VERIFY(store.bitmap_id == bitmap_id);
 
-    if (!wait_for_release && m_latest_rendered_store_index.has_value())
+    bool client_releases_presented_stores = m_publication_mode == PublicationMode::Published;
+    if (!client_releases_presented_stores && m_latest_rendered_store_index.has_value())
         m_backing_stores[*m_latest_rendered_store_index].state = BufferState::Available;
 
     store.state = BufferState::Presented;
-    if (wait_for_release)
-        store.was_presented_to_client = true;
+    if (m_publication_mode != PublicationMode::Unpublished)
+        store.was_shown_on_screen = true;
     m_latest_rendered_store_index = m_rendering_store_index;
     m_rendering_store_index.clear();
-    if (external_image_lease_trace_enabled())
-        dbgln("[ExternalImageLease][Pool] at_ns={} backing_id={} bitmap_id={} pool_epoch={} frame_id=not-assigned state=RENDERING->PRESENTED wait_for_consumer_release={}", MonotonicTime::now().nanoseconds(), static_cast<u64>(store.bitmap_id) + 1, store.bitmap_id, m_pool_epoch, wait_for_release);
 }
 
-bool BackingStoreManager::release_buffer(i32 bitmap_id, bool consumer_gpu_work_complete)
+bool BackingStoreManager::release_buffer(i32 bitmap_id)
 {
     for (auto& store : m_backing_stores) {
-        if (store.bitmap_id != bitmap_id)
+        if (store.bitmap_id != bitmap_id || store.state != BufferState::Presented)
             continue;
-        auto received_at = MonotonicTime::now();
-        if (external_image_lease_trace_enabled())
-            dbgln("[ExternalImageLease][Pool] at_ns={} backing_id={} pool_epoch={} state=RELEASE_RECEIVED buffer_state={} presented_to_client={} iosurface_in_use={} renderable={} consumer_gpu_work_complete={}", received_at.nanoseconds(), static_cast<u64>(bitmap_id) + 1, m_pool_epoch, static_cast<unsigned>(store.state), store.was_presented_to_client, published_surface_is_in_use(store), store_can_be_rendered_into(store), consumer_gpu_work_complete);
-        if (store.state != BufferState::Presented)
-            return false;
         store.state = BufferState::Available;
-        store.last_consumer_release_time = received_at;
-        store.consumer_gpu_work_complete = consumer_gpu_work_complete;
-        // An explicit native GPU completion release proves the client is no
-        // longer sampling this frame, even if its cached Metal texture keeps
-        // IOSurfaceIsInUse set while the backing remains registered.
-        if (consumer_gpu_work_complete)
-            store.was_presented_to_client = false;
-        if (external_image_lease_trace_enabled())
-            dbgln("[ExternalImageLease][Pool] at_ns={} backing_id={} bitmap_id={} pool_epoch={} frame_id=not-assigned state=PRESENTED->AVAILABLE consumer_gpu_work_complete={} available_for_rendering={}", MonotonicTime::now().nanoseconds(), static_cast<u64>(store.bitmap_id) + 1, store.bitmap_id, m_pool_epoch, consumer_gpu_work_complete, store_can_be_rendered_into(store));
-        if (external_image_lease_trace_enabled())
-            dbgln("[ExternalImageLease][Pool] at_ns={} backing_id={} pool_epoch={} state=REUSE_GATE_UPDATED presented_to_client={} consumer_release_gpu_complete={} iosurface_in_use={} iosurface_gate_bypassed={} renderable={} release_to_renderable_us={}", MonotonicTime::now().nanoseconds(), static_cast<u64>(bitmap_id) + 1, m_pool_epoch, store.was_presented_to_client, store.consumer_gpu_work_complete, published_surface_is_in_use(store), !store.was_presented_to_client, store_can_be_rendered_into(store), (MonotonicTime::now() - received_at).to_microseconds());
         return true;
     }
     return false;
 }
 
-void BackingStoreManager::log_pool_state(StringView event) const
-{
-    if (!external_image_lease_trace_enabled())
-        return;
-    size_t available = 0;
-    size_t state_available = 0;
-    size_t rendering = 0;
-    size_t presented = 0;
-    for (auto const& store : m_backing_stores) {
-        switch (store.state) {
-        case BufferState::Available: ++state_available; break;
-        case BufferState::Rendering: ++rendering; break;
-        case BufferState::Presented: ++presented; break;
-        }
-    }
-    for (auto const& store : m_backing_stores) {
-        if (store_can_be_rendered_into(store))
-            ++available;
-    }
-    dbgln("[ExternalImageLease][Pool] at_ns={} event={} pool_epoch={} allocated={} available={} state_available={} rendering={} presented={} outstanding_presented={}", MonotonicTime::now().nanoseconds(), event, m_pool_epoch, m_backing_stores.size(), available, state_available, rendering, presented, presented);
-    for (auto const& store : m_backing_stores) {
-        auto state = store.state == BufferState::Available ? "AVAILABLE"sv : store.state == BufferState::Rendering ? "RENDERING"sv : "PRESENTED"sv;
-        dbgln("[ExternalImageLease][Pool] at_ns={} event={} backing_id={} bitmap_id={} pool_epoch={} frame_id=not-assigned state={} presented_to_client={} consumer_release_gpu_complete={} iosurface_in_use={} iosurface_gate_bypassed={} available_for_rendering={}", MonotonicTime::now().nanoseconds(), event, static_cast<u64>(store.bitmap_id) + 1, store.bitmap_id, m_pool_epoch, state, store.was_presented_to_client, store.consumer_gpu_work_complete, published_surface_is_in_use(store), !store.was_presented_to_client, store_can_be_rendered_into(store));
-    }
-}
-
 void BackingStoreManager::release_all_presented_buffers()
 {
     for (auto& store : m_backing_stores) {
-        if (store.state != BufferState::Presented)
-            continue;
-        store.state = BufferState::Available;
-        store.was_presented_to_client = false;
-        store.consumer_gpu_work_complete = true;
+        if (store.state == BufferState::Presented)
+            store.state = BufferState::Available;
     }
 }
 
@@ -478,6 +446,13 @@ RefPtr<Gfx::PaintingSurface> BackingStoreManager::latest_rendered_surface() cons
     if (!m_latest_rendered_store_index.has_value())
         return nullptr;
     return m_backing_stores[*m_latest_rendered_store_index].surface;
+}
+
+PresentableSurface* BackingStoreManager::window_server_surface_of_latest_rendered_store() const
+{
+    if (!m_latest_rendered_store_index.has_value())
+        return nullptr;
+    return m_backing_stores[*m_latest_rendered_store_index].window_server_surface.ptr();
 }
 
 }

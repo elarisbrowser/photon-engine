@@ -75,13 +75,9 @@ struct Sheet {
     /// sheets hold their rules alike share. An edit copies them first.
     rules_shared: bool,
     attachments: Vec<Attachment>,
-    /// A disabled sheet keeps its program, identities, and order tokens; only its activation
-    /// changes, which is why `disabled` is a predicate update rather than a detach.
-    enabled: bool,
     /// Whether the sheet's own conditions currently hold. A sheet whose media does not match
     /// contributes nothing, and a rule inside it can reach no element.
     conditions_hold: bool,
-    live: bool,
     /// The arenas the selector lists of the sheet's rules are in.
     selectors: SheetSelectors,
     /// The sheet of the process's user agent rules this one stands for, which holds its rules.
@@ -180,9 +176,6 @@ struct Rule {
     /// `@media` that does not match keeps its identity, its position and its selectors; it
     /// simply decides nothing, which is the same shape a disabled sheet has.
     conditions_hold: bool,
-    /// Whether this rule sits in a cascade layer. Layer order decides between declarations that are
-    /// in layers, so a rule outside every layer cannot change hands when that order moves.
-    in_a_layer: bool,
     parent: Option<RuleID>,
     children_slot: Option<NonZeroU32>,
     nested_order: OrderToken,
@@ -200,7 +193,6 @@ impl Rule {
         let Self {
             sheet,
             conditions_hold,
-            in_a_layer,
             parent,
             children_slot,
             nested_order,
@@ -211,7 +203,6 @@ impl Rule {
         (
             sheet,
             conditions_hold,
-            in_a_layer,
             parent,
             children_slot,
             nested_order,
@@ -390,7 +381,7 @@ impl PartialEq for RuleDeclarations {
 }
 
 /// The document's stylesheet program: identities, versions, order, and attachment.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct RuleStore {
     /// What the host published of each rule beside its program: its declarations, the conditions of
     /// the container rules around it, and the identity of the rule object it came from.
@@ -403,9 +394,6 @@ pub struct RuleStore {
     /// How many rules declare a custom property. A document without any resolves no environment
     /// of its own, and a cascade need not look.
     rules_declaring_custom_properties: usize,
-    /// How many rules sit behind a container query. A document without any answers that no rule
-    /// is gated without reading the rule's record.
-    rules_gated_by_container_query: usize,
     rule_versions: RuleVersionTable,
 
     /// Sheet order within each tree context. Sheets in different tree contexts are ordered by the
@@ -422,8 +410,9 @@ pub struct RuleStore {
 
     scopes_using_document_sheets: BitColumn,
     /// The `@scope` levels the scoped style rules are inside, by the scope their versions name,
-    /// from one on.
-    scope_chains: Vec<Arc<super::super::bridge::BoundScopeChain>>,
+    /// from one on. Each scope is one version's, and goes with it: a rule that left its sheet or
+    /// whose version moved to another scope holds the levels' selectors alive no longer.
+    scope_chains: Vec<Option<Arc<super::super::bridge::BoundScopeChain>>>,
     /// The process's user agent rules the document's user agent sheets stand for, which the
     /// document reads rather than recording them.
     user_agent: Option<UserAgentBinding>,
@@ -438,8 +427,15 @@ impl RuleStore {
         if chain.levels.is_empty() {
             return StyleScopeID::NONE;
         }
-        self.scope_chains.push(Arc::new(chain.clone()));
+        self.scope_chains.push(Some(Arc::new(chain.clone())));
         StyleScopeID(u32::try_from(self.scope_chains.len()).expect("style scope space exhausted"))
+    }
+
+    /// Let go of the `@scope` levels `scope` names, which no version names any more.
+    pub(in crate::css::style) fn release_scope(&mut self, scope: StyleScopeID) {
+        if scope != StyleScopeID::NONE {
+            self.scope_chains[scope.0 as usize - 1] = None;
+        }
     }
 
     /// The `@scope` levels `scope` names, or none for a rule inside no `@scope`.
@@ -447,7 +443,11 @@ impl RuleStore {
         &self,
         scope: StyleScopeID,
     ) -> Option<&Arc<super::super::bridge::BoundScopeChain>> {
-        (scope != StyleScopeID::NONE).then(|| &self.scope_chains[scope.0 as usize - 1])
+        (scope != StyleScopeID::NONE).then(|| {
+            self.scope_chains[scope.0 as usize - 1]
+                .as_ref()
+                .expect("the scope a version names is held")
+        })
     }
 
     /// The bytes of what the cascade reads of the declarations of the store's rules: each block's
@@ -517,6 +517,13 @@ impl RuleStore {
             + vec_bytes(&self.rule_children)
             + self.rule_children.iter().map(vec_bytes).sum::<usize>()
             + self.rule_versions.heap_size(sizer)
+            + vec_bytes(&self.scope_chains)
+            + self
+                .scope_chains
+                .iter()
+                .flatten()
+                .map(|chain| sizer.arc(chain))
+                .sum::<usize>()
             + order
             + sheets_by_scope
             + layer_ranks
@@ -545,7 +552,7 @@ impl RuleStore {
         }
         // NB: What the host and the summaries read of a rule's selectors names the atoms of their
         //     arena, which a sweep has to keep the document's names of.
-        for sheet in self.sheets.iter().filter(|sheet| sheet.live) {
+        for sheet in &self.sheets {
             for (_, arena) in &sheet.selectors.arenas {
                 let leased = arena.leased_atoms();
                 visited += u64::try_from(leased.len()).expect("atom count exceeds u64");
@@ -566,22 +573,7 @@ impl RuleStore {
 
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            native: Default::default(),
-            custom_declarations: HashMap::default(),
-            sheets: Vec::new(),
-            rules: RuleRecordTable::default(),
-            rule_children: Vec::new(),
-            rules_declaring_custom_properties: 0,
-            rules_gated_by_container_query: 0,
-            rule_versions: RuleVersionTable::default(),
-            sheet_order: Column::default(),
-            sheets_by_scope: Column::default(),
-            layer_ranks: Column::default(),
-            scopes_using_document_sheets: BitColumn::default(),
-            scope_chains: Vec::new(),
-            user_agent: None,
-        }
+        Self::default()
     }
 
     // -- Sheets ------------------------------------------------------------------------------
@@ -594,9 +586,7 @@ impl RuleStore {
             rule_order: Arc::default(),
             rules_shared: false,
             attachments: Vec::new(),
-            enabled: true,
             conditions_hold: true,
-            live: true,
             selectors: SheetSelectors::default(),
             user_agent: None,
         });
@@ -609,15 +599,6 @@ impl RuleStore {
         let index = tree_scope.0 as usize;
         self.sheet_order.ensure(index);
         self.sheet_order[index].get_or_insert_with(OrderMaintenance::new)
-    }
-
-    /// Enabling or disabling a sheet updates its activation, not its attachment: identities, order
-    /// tokens, and compiled programs all survive.
-    pub fn set_sheet_enabled(&mut self, sheet: SheetID, enabled: bool) {
-        if self.sheets[sheet.0 as usize].enabled == enabled {
-            return;
-        }
-        self.sheets[sheet.0 as usize].enabled = enabled;
     }
 
     /// Record whether a sheet's own conditions hold. This is activation, not attachment: the sheet
@@ -638,7 +619,7 @@ impl RuleStore {
     #[must_use]
     pub fn sheet_contributes(&self, sheet: SheetID) -> bool {
         let sheet = &self.sheets[sheet.0 as usize];
-        sheet.live && sheet.enabled && sheet.conditions_hold
+        sheet.conditions_hold
     }
 
     /// Whether a rule can decide anything right now: it is still in its sheet, and its sheet is
@@ -679,18 +660,6 @@ impl RuleStore {
             return self.user_agent_binding().rule_conditions_hold(rule);
         }
         self.rules[rule.0 as usize].conditions_hold
-    }
-
-    pub fn set_rule_in_a_layer(&mut self, rule: RuleID, in_a_layer: bool) {
-        if self.rules[rule.0 as usize].in_a_layer == in_a_layer {
-            return;
-        }
-        self.rules[rule.0 as usize].in_a_layer = in_a_layer;
-    }
-
-    #[must_use]
-    pub fn rule_is_in_a_layer(&self, rule: RuleID) -> bool {
-        self.record(rule).in_a_layer
     }
 
     #[must_use]
@@ -835,7 +804,6 @@ impl RuleStore {
         self.rules.push(Rule {
             sheet,
             conditions_hold: true,
-            in_a_layer: false,
             parent,
             children_slot: None,
             nested_order: order,
@@ -986,10 +954,18 @@ impl RuleStore {
     /// did not change are preserved, so a consumer can tell a declaration edit from a selector edit
     /// by comparing components.
     pub fn replace_rule_version(&mut self, rule: RuleID, contents: RuleVersion) {
-        self.rule_versions.set(rule.0 as usize, contents);
+        self.set_rule_version(rule, contents);
     }
 
     pub(crate) fn replace_reserved_rule_version(&mut self, rule: RuleID, contents: RuleVersion) {
+        self.set_rule_version(rule, contents);
+    }
+
+    fn set_rule_version(&mut self, rule: RuleID, contents: RuleVersion) {
+        let previous = self.rule_versions[rule.0 as usize].scope;
+        if previous != contents.scope {
+            self.release_scope(previous);
+        }
         self.rule_versions.set(rule.0 as usize, contents);
     }
 
@@ -1025,13 +1001,6 @@ impl RuleStore {
                 self.rules_declaring_custom_properties -= 1;
             }
         }
-        if entry.gated_by_container_query {
-            if live {
-                self.rules_gated_by_container_query += 1;
-            } else {
-                self.rules_gated_by_container_query -= 1;
-            }
-        }
         entry.live = live;
         true
     }
@@ -1055,13 +1024,17 @@ impl RuleStore {
         let removed = self.rule_subtree(rule);
         for &id in &removed {
             self.set_rule_live(id, false);
-            // A rule that left its sheet never decides again, so its selectors are let go with it
-            // rather than kept alive, and their names, for nothing.
+            // A rule that left its sheet never decides again, so its selectors and the `@scope`
+            // levels it is inside are let go with it rather than kept alive, and their names, for
+            // nothing.
             let slot = id.0 as usize;
-            if self.rule_versions[slot].selectors != SheetListStart::NONE {
+            if self.rule_versions[slot].selectors != SheetListStart::NONE
+                || self.rule_versions[slot].scope != StyleScopeID::NONE
+            {
                 let mut version = self.rule_versions[slot].clone();
                 version.selectors = SheetListStart::NONE;
-                self.rule_versions.set(slot, version);
+                version.scope = StyleScopeID::NONE;
+                self.set_rule_version(id, version);
             }
             let order = self.rules[id.0 as usize].nested_order;
             let order_axis = self.rule_order_mut(sheet);
@@ -1232,22 +1205,12 @@ impl RuleStore {
     /// can disagree about it. Until the style-layout coordinator can answer it, matching reports
     /// the rule and the consumer applies the query, which is what the matcher already does.
     pub fn set_rule_gated_by_container_query(&mut self, rule: RuleID, gated: bool) {
-        if self.rules[rule.0 as usize].gated_by_container_query == gated {
-            return;
-        }
         self.rules[rule.0 as usize].gated_by_container_query = gated;
-        if self.rules[rule.0 as usize].live {
-            if gated {
-                self.rules_gated_by_container_query += 1;
-            } else {
-                self.rules_gated_by_container_query -= 1;
-            }
-        }
     }
 
     #[must_use]
     pub fn rule_is_gated_by_container_query(&self, rule: RuleID) -> bool {
-        self.rules_gated_by_container_query != 0 && self.record(rule).gated_by_container_query
+        self.record(rule).gated_by_container_query
     }
 
     /// Record the declarations a rule declares.
@@ -1447,12 +1410,6 @@ impl RuleStore {
     }
 }
 
-impl Default for RuleStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 impl RuleStore {
     /// Attach a sheet to a style scope at the end of that scope's sheet order.
@@ -1525,10 +1482,6 @@ impl RuleStore {
         let tree_scope = before.tree_scope;
         self.detach_sheet(sheet, tree_scope);
         self.attach_sheet_before(sheet, before);
-    }
-
-    pub fn sheet_is_enabled(&self, sheet: SheetID) -> bool {
-        self.sheets[sheet.0 as usize].enabled
     }
 
     /// Append a rule to a sheet or to a grouping rule.
@@ -1789,18 +1742,6 @@ mod tests {
     }
 
     #[test]
-    fn disabling_a_sheet_keeps_its_program_and_position() {
-        let (mut program, sheet) = program_with_sheet();
-        let rule = program.append_rule(sheet, None, RuleKind::Style);
-        let version = program.rule_version(rule).clone();
-
-        program.set_sheet_enabled(sheet, false);
-        assert!(!program.sheet_is_enabled(sheet));
-        assert_eq!(program.sheets_in_scope(TreeScopeID::DOCUMENT), vec![sheet]);
-        assert_eq!(*program.rule_version(rule), version);
-    }
-
-    #[test]
     fn layer_topology_changes_ranks_without_touching_rules() {
         let mut program = RuleStore::new();
         let base = CascadeLayerID(1);
@@ -1833,32 +1774,5 @@ mod tests {
         for _ in 0..100 {
             program.append_rule(sheet, None, RuleKind::Style);
         }
-    }
-
-    #[test]
-    fn container_gate_count_tracks_rule_liveness() {
-        let (mut program, sheet) = program_with_sheet();
-        let parent = program.append_rule(sheet, None, RuleKind::Style);
-        let child = program.append_rule(sheet, Some(parent), RuleKind::Style);
-        program.set_rule_gated_by_container_query(parent, true);
-        program.set_rule_gated_by_container_query(child, true);
-        assert_eq!(program.rules_gated_by_container_query, 2);
-
-        program.remove_rule(parent);
-        assert_eq!(program.rules_gated_by_container_query, 0);
-        assert!(!program.set_rule_live(parent, false));
-        assert_eq!(program.rules_gated_by_container_query, 0);
-
-        program.set_rule_gated_by_container_query(child, false);
-        program.set_rule_gated_by_container_query(child, true);
-        assert_eq!(program.rules_gated_by_container_query, 0);
-        program.set_rule_liveness(&[(parent, true), (child, true)]);
-        assert_eq!(program.rules_gated_by_container_query, 2);
-        assert!(program.rule_is_gated_by_container_query(child));
-        program.set_rule_liveness(&[(parent, true), (child, true)]);
-        assert_eq!(program.rules_gated_by_container_query, 2);
-        program.set_rule_gated_by_container_query(parent, false);
-        program.set_rule_gated_by_container_query(child, false);
-        assert_eq!(program.rules_gated_by_container_query, 0);
     }
 }

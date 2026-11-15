@@ -51,7 +51,6 @@ set(SOURCES
     Loader/SiteCompatibility.cpp
     MimeSniff/MimeType.cpp
     MimeSniff/Resource.cpp
-    Page/AsyncScrollNodeStableID.cpp
     Page/DragEvent.cpp
     Page/InputEvent.cpp
     Page/InputRoutingDecision.cpp
@@ -118,9 +117,14 @@ invoke_py_generator(
 compile_ipc(ContentSecurityPolicy/RemoteViolationDirective.ipc ContentSecurityPolicy/RemoteViolationDirectiveCodecs.h)
 compile_ipc(HTML/NavigationResponse.ipc HTML/NavigationResponseCodecs.h)
 compile_ipc(MixedContent/ProhibitsMixedSecurityContexts.ipc MixedContent/ProhibitsMixedSecurityContextsCodecs.h)
+compile_ipc(Page/AsyncScrollNodeStableID.ipc Page/AsyncScrollNodeStableIDCodecs.h)
 compile_ipc(Page/InputEvent.ipc Page/InputEventCodecs.h)
+compile_ipc(Page/InputRoutingDecision.ipc Page/InputRoutingDecisionCodecs.h)
+compile_ipc(Page/InputTrace.ipc Page/InputTraceCodecs.h)
 compile_ipc(Page/TextEditingCommand.ipc Page/TextEditingCommandCodecs.h)
 compile_ipc(PixelUnits.ipc PixelUnitsCodecs.h)
+compile_ipc(UIEvents/KeyCode.ipc UIEvents/KeyCodeCodecs.h)
+compile_ipc(UIEvents/MouseButton.ipc UIEvents/MouseButtonCodecs.h)
 compile_ipc(UpgradeInsecureRequests/InsecureRequestsPolicy.ipc UpgradeInsecureRequests/InsecureRequestsPolicyCodecs.h)
 compile_ipc(WebView/AccessibilityNodeData.ipc WebView/AccessibilityNodeDataCodecs.h)
 compile_ipc(WebView/DictionaryLookup.ipc WebView/DictionaryLookupCodecs.h)
@@ -130,7 +134,6 @@ compile_ipc(WebDriver/BiDi.ipc WebDriver/BiDiCodecs.h)
 #     both sides generate their endpoints from here.
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/Services/WebContent)
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/Services/WebDriver)
-file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/Services/WebWorker)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebContentClient.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebContentClientEndpoint.h)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebContentServer.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebContentServerEndpoint.h)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebContentTestClient.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebContentTestClientEndpoint.h)
@@ -139,8 +142,8 @@ compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebDriver/WebDriverBrowserClient.ipc
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebDriver/WebDriverBrowserServer.ipc ${CMAKE_BINARY_DIR}/Services/WebDriver/WebDriverBrowserServerEndpoint.h)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebUIClient.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebUIClientEndpoint.h)
 compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebUIServer.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebUIServerEndpoint.h)
-compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebWorker/WebWorkerClient.ipc ${CMAKE_BINARY_DIR}/Services/WebWorker/WebWorkerClientEndpoint.h)
-compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebWorker/WebWorkerServer.ipc ${CMAKE_BINARY_DIR}/Services/WebWorker/WebWorkerServerEndpoint.h)
+compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebWorkerClient.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebWorkerClientEndpoint.h)
+compile_ipc(${LADYBIRD_SOURCE_DIR}/Services/WebContent/WebWorkerServer.ipc ${CMAKE_BINARY_DIR}/Services/WebContent/WebWorkerServerEndpoint.h)
 
 set(GENERATED_SOURCES
     CSS/PropertyList.cpp
@@ -151,8 +154,8 @@ set(GENERATED_SOURCES
     ../../Services/WebContent/WebContentTestServerEndpoint.h
     ../../Services/WebDriver/WebDriverBrowserClientEndpoint.h
     ../../Services/WebDriver/WebDriverBrowserServerEndpoint.h
-    ../../Services/WebWorker/WebWorkerClientEndpoint.h
-    ../../Services/WebWorker/WebWorkerServerEndpoint.h
+    ../../Services/WebContent/WebWorkerClientEndpoint.h
+    ../../Services/WebContent/WebWorkerServerEndpoint.h
     ../../Services/WebContent/WebUIClientEndpoint.h
     ../../Services/WebContent/WebUIServerEndpoint.h
 )
@@ -164,7 +167,7 @@ endif()
 ladybird_lib(LibWebCommon webcommon EXPLICIT_SYMBOL_EXPORT)
 # NB: The enumerations of LibWeb's IDL modules are generated into LibWebCommon along with LibWeb's bindings.
 add_dependencies(LibWebCommon generate_bindings)
-target_link_libraries(LibWebCommon PRIVATE LibCore LibCrypto LibFileSystem LibGfx LibHTTP LibIPC LibRequests LibURL)
+target_link_libraries(LibWebCommon PRIVATE LibCore LibCrypto LibGfx LibHTTP LibIPC LibRequests LibURL)
 
 import_rust_crate(MANIFEST_PATH Rust/Cargo.toml CRATE_NAME libwebcommon_rust FEATURES allocator FFI_HEADER RustFFI.h)
 target_link_libraries(LibWebCommon PRIVATE libwebcommon_rust)

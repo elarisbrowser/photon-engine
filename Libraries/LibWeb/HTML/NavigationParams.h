@@ -10,6 +10,7 @@
 #include <AK/RefCounted.h>
 #include <AK/Utf16String.h>
 #include <LibGC/CellAllocator.h>
+#include <LibGC/Forward.h>
 #include <LibGC/Ptr.h>
 #include <LibURL/Origin.h>
 #include <LibWeb/Bindings/PerformanceNavigationTiming.h>
@@ -32,6 +33,7 @@ namespace Web::HTML {
 // NB: Reconstructed response callbacks and download adoption share one terminal-event owner.
 struct NavigationResponseNetworkEventState : RefCounted<NavigationResponseNetworkEventState> {
     AK_ALLOC_WITH_KMALLOC;
+    GC_HOLDS_NO_CELL_EDGES;
 
     enum class Owner {
         Renderer,
@@ -83,6 +85,13 @@ struct NavigationParams : GC::Cell {
     // AD-HOC: The group of the new top-level browsing context the UI process obtained for the new Document, when a
     //         browsing context group switch gave it one.
     Optional<u64> new_browsing_context_group_id;
+
+    // AD-HOC: The browsing context obtained for the new Document when the response arrived.
+    GC::Ptr<BrowsingContext> browsing_context;
+
+    // AD-HOC: The id of the new Window's environment when there is no reserved environment. The UI process learns it
+    //         before the Document is created.
+    Optional<EnvironmentId> environment_id;
 
     // AD-HOC: The permissions policy the UI process created for the new Document.
     Optional<PermissionsPolicy::PermissionsPolicy> permissions_policy;

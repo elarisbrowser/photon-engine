@@ -157,16 +157,16 @@ enum AllocationKind {
 
 impl Heap {
     /// Creates a heap that calls `gather_roots` with `context` whenever it gathers its roots. A heap that becomes the
-    /// process default is the one GC::Heap::the() returns to C++ code.
+    /// default of its thread is the one GC::Heap::the() returns to C++ code on that thread.
     ///
     /// # Safety
     ///
     /// `context` must stay valid for as long as the heap exists, including while it is being destroyed.
-    pub unsafe fn new(gather_roots: GCGatherRootsCallback, context: *mut c_void, become_process_default: bool) -> Self {
+    pub unsafe fn new(gather_roots: GCGatherRootsCallback, context: *mut c_void, become_thread_default: bool) -> Self {
         let layout = check_layout();
         crate::layout_forward::initialize_heap_region_base();
         // SAFETY: The caller keeps the context alive for the heap's lifetime.
-        let raw = unsafe { capi::gc_heap_create(gather_roots, context, become_process_default) };
+        let raw = unsafe { capi::gc_heap_create(gather_roots, context, become_thread_default) };
         let raw = NonNull::new(raw).expect("LibGC creates the heap");
         // NB: LibGC reports offsets of fields of its heap.
         let counter = |offset: u32| {
@@ -302,9 +302,9 @@ impl Heap {
     }
 
     /// allocate_with_size_class() for a cell that another cell keeps its storage in, instead of malloc memory: it never
-    /// collects garbage and does not count towards the next collection, so storage can grow while its owner is between
-    /// states nothing may observe, and callers can hold on to anything across the growth. Live storage counts once a
-    /// collection finds it, through the live cell bytes that set the next threshold.
+    /// collects garbage, so storage can grow while its owner is between states nothing may observe, and callers can hold
+    /// on to anything across the growth. It still counts towards the next collection, which the next allocation that
+    /// may collect starts.
     pub fn allocate_storage_with_size_class<T: GcCell, E: Copy>(
         &self,
         size_class: SizeClassAllocator,
@@ -486,13 +486,11 @@ impl Heap {
                 cursor_cell
             };
             let cell = NonNull::new_unchecked(cell);
-            if let AllocationKind::Cell = kind {
-                let allocated_bytes = info.allocated_bytes_since_last_gc.read() + cell_size;
-                if allocated_bytes > info.gc_bytes_threshold.read() {
-                    return None;
-                }
-                info.allocated_bytes_since_last_gc.write(allocated_bytes);
+            let allocated_bytes = info.allocated_bytes_since_last_gc.read() + cell_size;
+            if matches!(kind, AllocationKind::Cell) && allocated_bytes > info.gc_bytes_threshold.read() {
+                return None;
             }
+            info.allocated_bytes_since_last_gc.write(allocated_bytes);
             info.total_allocated_bytes
                 .write(info.total_allocated_bytes.read() + cell_size);
             if from_list {
@@ -728,6 +726,11 @@ impl Heap {
         } else if old_size > new_size {
             self.did_free_external_memory(old_size - new_size);
         }
+    }
+
+    /// Whether the heap gathers its roots and marks the live cells for a collection now, rather than for a graph dump.
+    pub fn is_marking_for_collection(&self) -> bool {
+        capi::gc_heap_is_marking_for_collection(self.handle())
     }
 
     pub fn should_collect_on_every_allocation(&self) -> bool {

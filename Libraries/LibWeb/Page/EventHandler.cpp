@@ -12,7 +12,6 @@
 #include <AK/Debug.h>
 #include <AK/Math.h>
 #include <LibCompositing/DisplayList/DisplayListResourceStorage.h>
-#include <LibGC/ConservativeHashTable.h>
 #include <LibGC/Heap.h>
 #include <LibGC/RootHashTable.h>
 #include <LibGC/RootVector.h>
@@ -88,7 +87,6 @@
 #include <LibWeb/UIEvents/TextEvent.h>
 #include <LibWeb/UIEvents/TouchEvent.h>
 #include <LibWeb/UIEvents/WheelEvent.h>
-#include <LibWeb/VisualLines.h>
 #include <LibWebCommon/Clipboard/SystemClipboard.h>
 #include <LibWebCommon/Infra/Strings.h>
 #include <LibWebCommon/UIEvents/MouseButton.h>
@@ -322,7 +320,7 @@ static Optional<EventResult> dispatch_event_to_nested_navigable(EventHandler& pa
         return {};
 
     if (Painting::is_navigable_container_viewport_paintable(layout_node)) {
-        auto position = Painting::transform_to_local_coordinates(layout_node, viewport_position) - Painting::absolute_rect(layout_node).location();
+        auto position = Painting::point_to_local(layout_node, viewport_position, Layout::RustFFI::ViewportSpace::VisualViewport) - Painting::absolute_rect(layout_node).location();
         if (auto content_navigable = as_if<HTML::NavigableContainer>(*node)->content_navigable()) {
             if (auto* local_navigable = as_if<HTML::LocalNavigable>(*content_navigable)) {
                 // The nested navigable handles the event as the input event it is, outdated or not.
@@ -505,6 +503,22 @@ EventResult EventHandler::handle_mousedown(CSSPixelPoint visual_viewport_positio
 #if defined(AK_OS_MACOS)
     is_context_menu_trigger |= button == UIEvents::MouseButton::Primary && (modifiers & UIEvents::KeyModifier::Mod_Ctrl) != 0;
 #endif
+
+    if (is_context_menu_trigger && dispatch_result == PointerEventDispatchResult::RunDefaultActions && !pressed_on_chrome) {
+        // Focus the clicked control before dispatching contextmenu so the menu acts on that control.
+        if (m_navigable->active_document() != document)
+            return EventResult::Accepted;
+        document->update_layout(DOM::UpdateLayoutReason::EventHandlerHandleMouseDown);
+        if (!has_committed_root_box())
+            return EventResult::Accepted;
+
+        if (auto focus_candidate = focus_candidate_for_position(read, visual_viewport_position))
+            HTML::run_focusing_steps(focus_candidate, nullptr, HTML::FocusTrigger::Click);
+
+        // NB: Focusing may have run script that navigated away from the document.
+        if (m_navigable->active_document() != document)
+            return EventResult::Accepted;
+    }
 
     // FIXME: The spec allows this to be fired following mousedown or mouseup. The native behavior on Windows is to
     //        do so in mouseup, so we should make this configurable by the UI.
@@ -800,7 +814,7 @@ EventResult EventHandler::handle_mouseup(CSSPixelPoint visual_viewport_position,
         stop_updating_selection();
 
         if (middle_button_autoscrolled && button == UIEvents::MouseButton::Middle)
-            m_middle_button_scroll_handler = nullptr;
+            stop_middle_button_scroll();
     });
 
     if (should_ignore_device_input_event()) {
@@ -928,25 +942,6 @@ EventResult EventHandler::handle_mouseup(CSSPixelPoint visual_viewport_position,
     return EventResult::Handled;
 }
 
-// https://drafts.csswg.org/cssom-view/#dom-mouseevent-offsetx
-static CSSPixelPoint compute_mouse_event_offset(CSSPixelPoint position, Layout::Node const& layout_node)
-{
-    // If the event’s dispatch flag is set,
-    // FIXME: Is this guaranteed to be dispatched?
-
-    // return the x-coordinate of the position where the event occurred,
-    // ignoring the transforms that apply to the element and its ancestors,
-    CSSPixelPoint offset_position = position;
-    offset_position = Painting::inverse_transform_point(layout_node, position);
-
-    // relative to the origin of the padding edge of the target node
-    auto const top_left_of_layout_node = Painting::box_type_agnostic_position(layout_node);
-    auto offset = offset_position - top_left_of_layout_node;
-
-    // and terminate these steps.
-    return offset;
-}
-
 struct VisualViewportPanAxes {
     bool x { false };
     bool y { false };
@@ -1068,13 +1063,12 @@ EventResult EventHandler::handle_mousewheel(CSSPixelPoint visual_viewport_positi
         auto local_root = m_navigable->local_root();
         if (!local_root->needs_to_record_display_list() && !local_root->has_recording_in_flight())
             return false;
-        auto display_list = local_root->presenter().compositor_display_list();
+        auto compositor_structural_epoch = local_root->presenter().compositor_display_list_structural_epoch();
         auto root_document = local_root->active_document();
-        if (!display_list || !root_document || !root_document->has_paint_state())
+        if (!compositor_structural_epoch.has_value() || !root_document || !root_document->has_paint_state())
             return false;
         Layout::ForcedReadScope root_read { *root_document };
-        root_document->update_paint_and_hit_testing_properties_if_needed();
-        return display_list->compatible_visual_context_tree_structural_epoch() != root_document->paint_state().visual_context_tree_structural_epoch_without_update(root_read);
+        return *compositor_structural_epoch != root_document->paint_state().visual_context_tree_structural_epoch(root_read);
     };
 
     // An event that no compositor has seen, such as one a test makes, goes there first, as the UI's events do. The
@@ -1307,8 +1301,7 @@ EventResult EventHandler::dispatch_wheel_event(Layout::BegunRead const& read, La
     auto viewport_position = document->visual_viewport()->map_to_layout_viewport(visual_viewport_position);
     auto page_offset = compute_mouse_event_page_offset(viewport_position);
     auto const* offset_layout_node = Painting::has_committed_box(*layout_node) ? layout_node : &hit_layout_node;
-    auto scroll_offset = document->navigable()->viewport_scroll_offset();
-    auto offset = compute_mouse_event_offset(visual_viewport_position.translated(scroll_offset), *offset_layout_node);
+    auto offset = Painting::mouse_event_offset(*offset_layout_node, viewport_position);
     auto cancelability = is_cancelable ? UIEvents::WheelEventIsCancelable::Yes : UIEvents::WheelEventIsCancelable::No;
     auto event = UIEvents::WheelEvent::create_from_platform_event(HTML::relevant_global_object(*node), m_navigable->active_window_proxy(), UIEvents::EventNames::wheel, screen_position, page_offset, viewport_position, offset, wheel_delta_x, wheel_delta_y, wheel_tick_120ths_x, wheel_tick_120ths_y, button, buttons, modifiers, cancelability).release_value_but_fixme_should_propagate_errors();
     return node->dispatch_event(event) ? EventResult::Accepted : EventResult::Cancelled;
@@ -2093,7 +2086,7 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
     if (key == UIEvents::KeyCode::Key_Escape) {
         // NB: Exit autoscroll if active before handling other close requests.
         if (m_middle_button_scroll_handler) {
-            m_middle_button_scroll_handler = nullptr;
+            stop_middle_button_scroll();
             return EventResult::Handled;
         }
 
@@ -2136,13 +2129,23 @@ EventResult EventHandler::handle_keydown(UIEvents::KeyCode key, u32 modifiers, u
         if (key == UIEvents::KeyCode::Key_X)
             return perform_cut_action();
         if (key == UIEvents::KeyCode::Key_V)
-            return perform_paste_action();
+            return perform_paste_action(Clipboard::PasteMode::AllMimeTypes);
         if (key == UIEvents::KeyCode::Key_Z)
             return Editing::perform_history_action(*document, Editing::HistoryAction::Undo);
 #if !defined(AK_OS_MACOS)
         // INTEROP: Chromium redoes on Ctrl+Y on Windows and Linux; on macOS Cmd+Y is not a redo shortcut.
         if (key == UIEvents::KeyCode::Key_Y)
             return Editing::perform_history_action(*document, Editing::HistoryAction::Redo);
+#endif
+    }
+    if ((modifiers & UIEvents::Mod_PlatformCtrl) != 0 && (modifiers & UIEvents::Mod_Shift) != 0 && key == UIEvents::KeyCode::Key_V) {
+#if defined(AK_OS_MACOS)
+        // INTEROP: On macOS the system-wide Paste and Match Style shortcut also holds Option. Gecko accepts it with and
+        //          without Option, and Blink accepts it with Option.
+        return perform_paste_action(Clipboard::PasteMode::PlainTextOnly);
+#else
+        if ((modifiers & UIEvents::Mod_Alt) == 0)
+            return perform_paste_action(Clipboard::PasteMode::PlainTextOnly);
 #endif
     }
     if ((modifiers & UIEvents::Mod_PlatformCtrl) != 0 && (modifiers & UIEvents::Mod_Shift) != 0 && (modifiers & UIEvents::Mod_Alt) == 0
@@ -2496,8 +2499,7 @@ EventResult EventHandler::handle_drag_and_drop_event(DragEvent::Type type, CSSPi
         return *dispath_result;
 
     auto page_offset = compute_mouse_event_page_offset(viewport_position);
-    auto scroll_offset = document.navigable()->viewport_scroll_offset();
-    auto offset = compute_mouse_event_offset(visual_viewport_position.translated(scroll_offset), *target_layout_node);
+    auto offset = Painting::mouse_event_offset(*target_layout_node, viewport_position);
 
     auto was_dragging = should_ignore_device_input_event();
     ScopeGuard update_keyboard_routing = [&] {
@@ -2619,13 +2621,12 @@ static bool fire_clipboard_event(DOM::Document& document, Utf16FlyString const& 
     if (!target)
         return true;
 
-    Bindings::ClipboardEventInit event_init {};
+    DOM::EventInit event_init {};
     event_init.bubbles = true;
     event_init.cancelable = true;
     event_init.composed = true;
-    event_init.clipboard_data = data_transfer;
 
-    auto event = Clipboard::ClipboardEvent::create(event_name, event_init, HighResolutionTime::current_high_resolution_time(HTML::relevant_global_object(document)));
+    auto event = Clipboard::create_clipboard_event(HTML::relevant_realm(document), event_name, event_init, data_transfer);
     event->set_is_trusted(true);
     return target->dispatch_event(event);
 }
@@ -2643,7 +2644,7 @@ static void write_data_transfer_to_clipboard(DOM::Document& document, HTML::Drag
         representations.empend(move(mime_type), item.data.to_byte_string());
     }
     if (!representations.is_empty())
-        document.page().client().page_did_insert_clipboard_item({ move(representations) }, "unspecified"sv);
+        document.page().client().page_did_insert_clipboard_item({ move(representations) }, "unspecified"sv, document.id());
 }
 
 EventResult EventHandler::perform_copy_action()
@@ -2717,7 +2718,7 @@ bool EventHandler::perform_copy_action(ClipboardActionTrigger trigger)
         if (!text.is_empty())
             representations.empend("text/plain"_string, text.to_byte_string());
         if (!representations.is_empty())
-            document->page().client().page_did_insert_clipboard_item({ move(representations) }, "unspecified"sv);
+            document->page().client().page_did_insert_clipboard_item({ move(representations) }, "unspecified"sv, document->id());
 
         // FIXME: 2. Fire a clipboard event named clipboardchange.
     }
@@ -2797,7 +2798,7 @@ bool EventHandler::perform_cut_action(ClipboardActionTrigger trigger)
             if (!text.is_empty())
                 representations.empend("text/plain"_string, text.to_byte_string());
             if (!representations.is_empty())
-                document->page().client().page_did_insert_clipboard_item({ move(representations) }, "unspecified"sv);
+                document->page().client().page_did_insert_clipboard_item({ move(representations) }, "unspecified"sv, document->id());
 
             // 2. Remove the contents of the selection from the document and collapse the selection.
             // 4. Queue tasks to fire any events that should fire due to the modification.
@@ -2837,7 +2838,7 @@ bool EventHandler::perform_cut_action(ClipboardActionTrigger trigger)
 }
 
 // https://w3c.github.io/clipboard-apis/#paste-action
-EventResult EventHandler::perform_paste_action()
+EventResult EventHandler::perform_paste_action(Clipboard::PasteMode paste_mode)
 {
     auto document = m_navigable->active_document();
     if (!document || !document->is_fully_active())
@@ -2845,68 +2846,79 @@ EventResult EventHandler::perform_paste_action()
 
     // NB: The system clipboard lives in the UI process. So, retrieve its contents first — and run the rest of the paste
     //     action once the contents arrive.
-    document->page().request_clipboard_entries(GC::create_function(document->heap(), [document = GC::Ref { *document }](Vector<Clipboard::SystemClipboardItem> items) {
-        auto data_store = HTML::DragDataStore::create();
-
-        auto add_text_item = [&](Utf16FlyString type, Utf16String data) {
-            data_store->add_item({
-                .kind = HTML::DragDataStoreItem::Kind::Text,
-                .type_string = move(type),
-                .data = move(data),
-                .file_data = {},
-                .file_name = {},
-            });
-        };
-
-        auto add_file_item = [&](Utf16FlyString type, Utf16String name, ByteBuffer data) {
-            data_store->add_item({
-                .kind = HTML::DragDataStoreItem::Kind::File,
-                .type_string = move(type),
-                .data = {},
-                .file_data = move(data),
-                .file_name = move(name),
-            });
-        };
-
-        if (!items.is_empty()) {
-            for (auto& representation : items.first().system_clipboard_representations) {
-                auto mime_type = MimeSniff::MimeType::parse(representation.name);
-                if (!mime_type.has_value())
-                    continue;
-
-                auto essence = Utf16FlyString::from_utf8(mime_type->essence());
-
-                representation.data.visit(
-                    [&](ByteString const& text) {
-                        auto data = String::from_utf8_with_replacement_character(text);
-
-                        if (essence.is_one_of("text/plain"sv, "text/html"sv)) {
-                            add_text_item(move(essence), Utf16String::from_utf8_with_replacement_character(text));
-                        } else if (essence == "image/png"sv) {
-                            // AD-HOC: The spec doesn't say what to do here, but other engines add a file named
-                            //         image.png for any PNG inserted via navigator.clipboard. Note that only PNG
-                            //         images are supported via that API.
-                            add_file_item(move(essence), "image.png"_utf16, text.to_byte_buffer());
-                        }
-                    },
-                    [&](HTML::SelectedFile& file) {
-                        add_file_item(move(essence), file.name(), file.take_contents());
-                    });
-            }
-        }
+    document->page().request_clipboard_entries_for_paste(GC::create_function(document->heap(), GC::captures(GC::Ref { *document }, paste_mode), [](auto& document, auto paste_mode, Vector<Clipboard::SystemClipboardItem> system_clipboard_data) {
+        for (auto& item : system_clipboard_data)
+            Clipboard::apply_paste_mode(item, paste_mode);
 
         if (auto navigable = document->navigable())
-            navigable->event_handler().perform_paste_action(data_store);
+            navigable->event_handler().perform_paste_action(system_clipboard_data);
     }));
 
     return EventResult::Handled;
 }
 
 // https://w3c.github.io/clipboard-apis/#paste-action
-// This is the paste action from the point where the content to paste is already in hand, either because async retrieval
-// of the system clipboard's contents above finished, or because the paste arrived through LocalNavigable::paste() —
-// which the UI process hands the content to paste directly.
-EventResult EventHandler::perform_paste_action(NonnullRefPtr<HTML::DragDataStore> const& data_store)
+// This is the paste action from the point where the system clipboard's contents are in hand, either because async
+// retrieval of them above finished, or because the UI process handed them over with its own Paste command.
+EventResult EventHandler::perform_paste_action(Vector<Clipboard::SystemClipboardItem> const& system_clipboard_data)
+{
+    auto data_store = HTML::DragDataStore::create();
+
+    auto add_text_item = [&](Utf16FlyString type, Utf16String data) {
+        data_store->add_item({
+            .kind = HTML::DragDataStoreItem::Kind::Text,
+            .type_string = move(type),
+            .data = move(data),
+            .file_data = {},
+            .file_name = {},
+        });
+    };
+
+    auto add_file_item = [&](Utf16FlyString type, Utf16String name, ByteBuffer data) {
+        data_store->add_item({
+            .kind = HTML::DragDataStoreItem::Kind::File,
+            .type_string = move(type),
+            .data = {},
+            .file_data = move(data),
+            .file_name = move(name),
+        });
+    };
+
+    if (!system_clipboard_data.is_empty()) {
+        for (auto const& representation : system_clipboard_data.first().system_clipboard_representations) {
+            auto mime_type = MimeSniff::MimeType::parse(representation.name);
+            if (!mime_type.has_value())
+                continue;
+
+            auto essence = Utf16FlyString::from_utf8(mime_type->essence());
+
+            representation.data.visit(
+                [&](ByteString const& text) {
+                    auto data = String::from_utf8_with_replacement_character(text);
+
+                    if (essence.is_one_of("text/plain"sv, "text/html"sv)) {
+                        add_text_item(move(essence), Utf16String::from_utf8_with_replacement_character(text));
+                    } else if (essence == "image/png"sv) {
+                        // AD-HOC: The spec doesn't say what to do here, but other engines add a file named
+                        //         image.png for any PNG inserted via navigator.clipboard. Note that only PNG
+                        //         images are supported via that API.
+                        add_file_item(move(essence), "image.png"_utf16, text.to_byte_buffer());
+                    }
+                },
+                [&](HTML::SelectedFile const& file) {
+                    auto contents = file;
+                    add_file_item(move(essence), file.name(), contents.take_contents());
+                });
+        }
+    }
+
+    return perform_paste_action(data_store, &system_clipboard_data);
+}
+
+// https://w3c.github.io/clipboard-apis/#paste-action
+// This is the paste action from the point where the content to paste is in a data store: the system clipboard's contents,
+// or content that the UI process hands over in their place through LocalNavigable::paste().
+EventResult EventHandler::perform_paste_action(NonnullRefPtr<HTML::DragDataStore> const& data_store, Vector<Clipboard::SystemClipboardItem> const* system_clipboard_data)
 {
     auto document = m_navigable->active_document();
     if (!document || !document->is_fully_active())
@@ -2915,8 +2927,16 @@ EventResult EventHandler::perform_paste_action(NonnullRefPtr<HTML::DragDataStore
     data_store->set_mode(HTML::DragDataStore::Mode::ReadOnly);
     auto data_transfer = HTML::DataTransfer::create(data_store);
 
+    // NB: Pasting the system clipboard is the user's interaction with the user agent's "Paste" control, so script
+    //     running as a result of the paste event may read the data being pasted. A paste of handed-over content lets
+    //     the page see only that content.
+    GC::Ref window = *document->window();
+    auto const* data_being_pasted = window->system_clipboard_data_being_pasted();
+    window->set_system_clipboard_data_being_pasted(system_clipboard_data);
+
     // 2. Fire a clipboard event named paste.
     bool event_was_not_canceled = fire_clipboard_event(*document, HTML::EventNames::paste, data_transfer);
+    window->set_system_clipboard_data_being_pasted(data_being_pasted);
     data_store->set_mode(HTML::DragDataStore::Mode::Protected);
 
     // 3. If the event was not canceled, then: if there is a selection or cursor in an editable context where
@@ -3410,8 +3430,7 @@ bool EventHandler::fire_click_events(GC::Ref<DOM::Node> node, MouseEventCoordina
 EventHandler::MouseEventCoordinates EventHandler::compute_mouse_event_coordinates(CSSPixelPoint visual_viewport_position, CSSPixelPoint viewport_position, Layout::Node const& layout_node) const
 {
     auto page_offset = compute_mouse_event_page_offset(viewport_position);
-    auto scroll_offset = m_navigable->active_document()->navigable()->viewport_scroll_offset();
-    auto offset = compute_mouse_event_offset(visual_viewport_position.translated(scroll_offset), layout_node);
+    auto offset = Painting::mouse_event_offset(layout_node, viewport_position);
     return { page_offset, visual_viewport_position, viewport_position, offset };
 }
 
@@ -3491,6 +3510,14 @@ Optional<EventHandler::Target> EventHandler::target_for_mouse_position(CSSPixelP
 
 GC::Ptr<DOM::Node> EventHandler::target_node_for_mouse_position(CSSPixelPoint position)
 {
+    // NB: A hit test records the document again where its display list isn't current, and recording reads layout, so
+    //     bring layout up to date first, as the mouse handlers do.
+    if (auto document = m_navigable->active_document()) {
+        document->update_layout(DOM::UpdateLayoutReason::EventHandlerTargetNodeAtPosition);
+        if (!has_committed_root_box())
+            return {};
+    }
+
     auto target = target_for_mouse_position(position);
     if (!target.has_value())
         return {};
@@ -3505,7 +3532,7 @@ GC::Ptr<DOM::Node> EventHandler::target_node_for_mouse_position(CSSPixelPoint po
     Layout::ForcedReadScope read { *document };
     if (auto* layout_node = target->layout_node(read)) {
         if (auto nested_navigable = local_nested_navigable_at(*layout_node, node)) {
-            auto nested_position = Painting::transform_to_local_coordinates(*layout_node, position) - Painting::absolute_rect(*layout_node).location();
+            auto nested_position = Painting::point_to_local(*layout_node, position, Layout::RustFFI::ViewportSpace::VisualViewport) - Painting::absolute_rect(*layout_node).location();
             if (auto nested_node = nested_navigable->event_handler().target_node_for_mouse_position(nested_position))
                 return nested_node;
         }
@@ -3542,7 +3569,7 @@ static bool is_inside_button(GC::Ptr<DOM::Node const> node)
 void EventHandler::run_mousedown_default_actions(Layout::BegunRead const& read, DOM::Document& document, CSSPixelPoint visual_viewport_position, unsigned button, unsigned modifiers, int click_count)
 {
     if (m_middle_button_scroll_handler) {
-        m_middle_button_scroll_handler = nullptr;
+        stop_middle_button_scroll();
         return;
     }
 
@@ -3722,11 +3749,11 @@ Optional<Painting::CaretPosition> EventHandler::caret_position_for_mouse_selecti
         auto& text_control_element = text_control->text_control_to_html_element();
         if (text_control_element.is_shadow_including_inclusive_ancestor_of(*editable_hit_node_before_focus)) {
             if (auto selection_scope = text_control->mouse_selection_scope())
-                caret_position = document.caret_position_from_point_for_selection(read, visual_viewport_position, selection_scope);
+                caret_position = document.caret_position_from_point(read, visual_viewport_position, selection_scope);
         }
     }
     if (!caret_position.has_value())
-        caret_position = document.caret_position_from_point_for_selection_start(read, visual_viewport_position);
+        caret_position = document.caret_position_from_point(read, visual_viewport_position);
     if (editable_hit_node_before_focus && editable_hit_node_before_focus->is_connected() && editing_host_before_focus && should_use_caret_position_from_editable_hit_node(caret_position, *editable_hit_node_before_focus, *editing_host_before_focus)) {
         if (auto caret_position_from_hit_node = caret_position_from_editable_hit_node(read, *editable_hit_node_before_focus); caret_position_from_hit_node.has_value())
             caret_position = caret_position_from_hit_node;
@@ -3737,6 +3764,18 @@ Optional<Painting::CaretPosition> EventHandler::caret_position_for_mouse_selecti
     if (editable_hit_node_before_focus && editable_hit_node_before_focus->is_connected() && !editing_host_before_focus) {
         if (auto beside = caret_position_beside_block_editing_host(read, *caret_position, *editable_hit_node_before_focus); beside.has_value())
             caret_position = beside;
+    }
+
+    // INTEROP: A click outside an editing host that resolves to a position beside it, in content that is not editable,
+    //          places no selection.
+    if (caret_position->secondary_boundary.has_value()) {
+        auto boundary = caret_position->boundary_point();
+        auto secondary_boundary = caret_position->secondary_boundary->resolve(document);
+        if (boundary.has_value() && secondary_boundary.has_value() && !boundary->node->is_editable_or_editing_host()) {
+            auto* beside = boundary->node->child_at_index(min(boundary->offset, secondary_boundary->offset));
+            if (beside && beside->is_editing_host())
+                return {};
+        }
     }
 
     return caret_position;
@@ -3888,7 +3927,7 @@ void EventHandler::finish_selection_from_preserved_mousedown(DOM::Document& docu
     if (!has_committed_root_box())
         return;
 
-    auto caret_position = document.caret_position_from_point_for_selection_start(read, visual_viewport_position);
+    auto caret_position = document.caret_position_from_point(read, visual_viewport_position);
     if (!caret_position.has_value())
         return;
 
@@ -4084,9 +4123,12 @@ void EventHandler::maybe_show_context_menu(GC::Ref<DOM::Node> node, MouseEventCo
         image_url = image_element->document().encoding_parse_url(image_element->current_src());
 
     if (image_url.has_value()) {
-        Optional<Gfx::Bitmap const*> bitmap;
+        RefPtr<Gfx::Bitmap const> bitmap_of_current_frame;
         if (auto frame = image_element->current_image_frame(); frame.has_value())
-            bitmap = &frame->bitmap();
+            bitmap_of_current_frame = frame->bitmap_sharing_pixels();
+        Optional<Gfx::Bitmap const*> bitmap;
+        if (bitmap_of_current_frame)
+            bitmap = bitmap_of_current_frame.ptr();
 
         // NB: An image inside a link, or under an image map's link, offers both the image and the link.
         Optional<HTML::PreparedNavigationDescriptor> link_navigation;
@@ -4394,7 +4436,7 @@ Optional<Editing::ContextMenuMisspelling> EventHandler::select_context_menu_miss
 {
     if (!document.has_spelling_markers())
         return {};
-    auto caret_position = document.caret_position_from_point_for_selection_start(read, coordinates.visual_viewport_position);
+    auto caret_position = document.caret_position_from_point(read, coordinates.visual_viewport_position);
     if (!caret_position.has_value())
         return {};
     auto* text = as_if<DOM::Text>(caret_position->boundary_node().ptr());
@@ -4403,23 +4445,6 @@ Optional<Editing::ContextMenuMisspelling> EventHandler::select_context_menu_miss
     auto marker = document.spelling_markers().marker_containing(*text, caret_position->boundary.offset);
     if (!marker.has_value() || !range_contains_viewport_position(DOM::Range::create(*text, marker->start, *text, marker->end), coordinates.viewport_position))
         return {};
-
-    // A misspelling in a field the user has left gets the field focused first, so the guess the user picks can replace
-    // it there.
-    if (!document.active_input_events_target(text)) {
-        if (auto focus_candidate = focus_candidate_for_position(read, coordinates.visual_viewport_position))
-            HTML::run_focusing_steps(focus_candidate, nullptr, HTML::FocusTrigger::Click);
-        else if (auto editing_host = text->editing_host())
-            HTML::run_focusing_steps(editing_host, nullptr, HTML::FocusTrigger::Click);
-
-        // NB: Focusing may have invalidated layout.
-        document.update_layout(DOM::UpdateLayoutReason::EventHandlerShowContextMenu);
-
-        // A focus listener runs inside the focusing steps, and an edit it makes moves or drops the text's markers — so
-        // the misspelling the click landed on counts only if its marker is still where it was.
-        if (!document.spelling_markers().markers_for(*text).contains_slow(*marker))
-            return {};
-    }
 
     // A field that didn't take focus has nowhere for a guess to go.
     auto* target = document.active_input_events_target(text);
@@ -4431,6 +4456,32 @@ Optional<Editing::ContextMenuMisspelling> EventHandler::select_context_menu_miss
 
     auto word = Utf16String::from_utf16(text->data().utf16_view().substring_view(marker->start, marker->end - marker->start));
     return Editing::ContextMenuMisspelling { *text, marker->start, marker->end, move(word) };
+}
+
+// The word at `offset` in `hit_node`, whose layout node is `layout_text_node`. A word runs on through inline elements
+// into the text of other text nodes, as in super<span>cali</span>fragilistic.
+struct WordBoundaries {
+    GC::Ref<DOM::Text> start_node;
+    size_t start_offset;
+    GC::Ref<DOM::Text> end_node;
+    size_t end_offset;
+};
+
+static WordBoundaries word_boundaries_at(DOM::Document& document, DOM::Text& hit_node, Layout::TextNode const& layout_text_node, size_t offset)
+{
+    Layout::RustFFI::FfiDomTextRange range {};
+    if (Layout::RustFFI::layout_text_inline_word_range(layout_text_node.document_host(), Layout::Node::slot_id(&layout_text_node), offset, &range)) {
+        auto text_node = [&](u32 identity) {
+            return as_if<DOM::Text>(document.style_computer().node_for_style_node(CSS::StyleNodeID { identity }).ptr());
+        };
+        auto* start = text_node(range.start_text_node);
+        auto* end = text_node(range.end_text_node);
+        if (start && end && &start->root() == &end->root() && start->is_connected() && end->is_connected()
+            && range.start_offset <= start->length() && range.end_offset <= end->length() && end->is_following(*start))
+            return { *start, range.start_offset, *end, range.end_offset };
+    }
+    auto word_range = layout_text_node.word_range_at(offset);
+    return { hit_node, word_range.start, hit_node, word_range.start + word_range.length };
 }
 
 bool EventHandler::initiate_word_selection(Layout::BegunRead const& read, DOM::Document& document, Painting::CaretPosition const& caret_position, CSS::UserSelect user_select)
@@ -4445,24 +4496,37 @@ bool EventHandler::initiate_word_selection(Layout::BegunRead const& read, DOM::D
     if (!hit_layout_text_node)
         return false;
 
-    auto word_range = hit_layout_text_node->word_range_at(hit_index);
-    auto previous_boundary = word_range.start;
-    auto next_boundary = word_range.start + word_range.length;
+    auto word = word_boundaries_at(document, hit_node, *hit_layout_text_node, hit_index);
 
     m_selection_mode = SelectionMode::Word;
-    m_selection_origin = DOM::Range::create(hit_node, previous_boundary, hit_node, next_boundary);
+    m_selection_origin = DOM::Range::create(word.start_node, word.start_offset, word.end_node, word.end_offset);
 
     if (auto* target = document.active_input_events_target(&hit_node)) {
         m_mouse_selection_target = target;
-        target->set_selection_anchor(hit_node, previous_boundary);
-        target->set_selection_focus(hit_node, next_boundary);
+        target->set_selection_anchor(word.start_node, word.start_offset);
+        target->set_selection_focus(word.end_node, word.end_offset);
     } else if (auto selection = document.get_selection()) {
         m_mouse_selection_target = nullptr;
-        set_user_selection(hit_node, previous_boundary, hit_node, next_boundary, selection, user_select);
+        set_user_selection(word.start_node, word.start_offset, word.end_node, word.end_offset, selection, user_select);
     }
 
     m_selection_mode = SelectionMode::Word;
     return true;
+}
+
+static size_t find_line_start(Utf16View const& view, size_t offset)
+{
+    while (offset != 0 && view.code_unit_at(offset - 1) != '\n')
+        --offset;
+    return offset;
+}
+
+static size_t find_line_end(Utf16View const& view, size_t offset)
+{
+    auto length = view.length_in_code_units();
+    while (offset < length && view.code_unit_at(offset) != '\n')
+        ++offset;
+    return offset;
 }
 
 bool EventHandler::initiate_paragraph_selection(DOM::Document& document, Painting::CaretPosition const& caret_position, CSS::UserSelect user_select)
@@ -4501,7 +4565,7 @@ bool EventHandler::initiate_paragraph_selection(DOM::Document& document, Paintin
 
 bool EventHandler::select_context_menu_text(Layout::BegunRead const& read, DOM::Document& document, MouseEventCoordinates const& coordinates)
 {
-    auto caret_position = document.caret_position_from_point_for_selection_start(read, coordinates.visual_viewport_position);
+    auto caret_position = document.caret_position_from_point(read, coordinates.visual_viewport_position);
     if (!caret_position.has_value() || selection_contains_position(document, *caret_position))
         return false;
 
@@ -4645,7 +4709,7 @@ void EventHandler::apply_mouse_selection(Layout::BegunRead const& read, CSSPixel
     if (m_mouse_selection_target)
         constraint_scope = m_mouse_selection_target->mouse_selection_scope();
 
-    auto caret_position = document.caret_position_from_point_for_selection(read, visual_viewport_position, constraint_scope);
+    auto caret_position = document.caret_position_from_point(read, visual_viewport_position, constraint_scope);
     if (!caret_position.has_value())
         return;
 
@@ -4669,9 +4733,7 @@ void EventHandler::apply_mouse_selection(Layout::BegunRead const& read, CSSPixel
         auto const* text_layout_node = as_if<Layout::TextNode>(focus_boundary.node.bound_layout_node(read, *caret_position->arena));
         if (!text_layout_node)
             return;
-        auto word_range = text_layout_node->word_range_at(focus_index);
-        auto word_start = word_range.start;
-        auto word_end = word_range.start + word_range.length;
+        auto word = word_boundaries_at(document, as<DOM::Text>(*focus_node), *text_layout_node, focus_index);
 
         // Determine cursor position relative to anchor.
         auto position = m_selection_origin->compare_point(*focus_node, focus_index);
@@ -4680,12 +4742,14 @@ void EventHandler::apply_mouse_selection(Layout::BegunRead const& read, CSSPixel
                 // Cursor is before anchor: select from anchor end to current word start.
                 anchor_node = m_selection_origin->end_container();
                 anchor_offset = m_selection_origin->end_offset();
-                focus_index = word_start;
+                focus_node = word.start_node;
+                focus_index = word.start_offset;
             } else if (position.value() > 0) {
                 // Cursor is after anchor: select from anchor start to current word end.
                 anchor_node = m_selection_origin->start_container();
                 anchor_offset = m_selection_origin->start_offset();
-                focus_index = word_end;
+                focus_node = word.end_node;
+                focus_index = word.end_offset;
             } else {
                 // Cursor is within anchor: keep original word selected.
                 anchor_node = m_selection_origin->start_container();
@@ -4837,7 +4901,7 @@ void EventHandler::update_pointer_hover(Layout::BegunRead const& read, PointerSt
     pointer.hovered_node = target;
 
     // INTEROP: Traverse the flat tree like Blink and Gecko do for mouse boundary events.
-    GC::ConservativeHashTable<DOM::Node*> previous_ancestors;
+    GC::RootHashTable<DOM::Node*> previous_ancestors;
     for (auto* node = previous.ptr(); node; node = node->flat_tree_parent())
         previous_ancestors.set(node);
     DOM::Node* common_ancestor = nullptr;
@@ -4850,6 +4914,8 @@ void EventHandler::update_pointer_hover(Layout::BegunRead const& read, PointerSt
     struct BoundaryTarget {
         GC::Ref<DOM::Node> node;
         MouseEventCoordinates coordinates;
+
+        void visit_edges(GC::Cell::Visitor& visitor) { visitor.visit(node); }
     };
     auto make_target = [&](DOM::Node& node) {
         auto target_coordinates = coordinates;
@@ -4857,8 +4923,8 @@ void EventHandler::update_pointer_hover(Layout::BegunRead const& read, PointerSt
             target_coordinates = compute_mouse_event_coordinates(coordinates.visual_viewport_position, coordinates.viewport_position, *layout_node);
         return BoundaryTarget { node, target_coordinates };
     };
-    GC::ConservativeVector<BoundaryTarget> left;
-    GC::ConservativeVector<BoundaryTarget> entered;
+    GC::RootVector<BoundaryTarget> left;
+    GC::RootVector<BoundaryTarget> entered;
     for (auto* node = previous.ptr(); node && node != common_ancestor; node = node->flat_tree_parent())
         left.append(make_target(*node));
     for (auto* node = target.ptr(); node && node != common_ancestor; node = node->flat_tree_parent())
@@ -5832,16 +5898,24 @@ void EventHandler::report_hovered_link_to_client(GC::Ptr<DOM::Node> target)
 {
     auto& page = m_navigable->page();
 
-    Optional<URL::URL> hovered_link_url;
-    Optional<UniqueNodeID> hovered_document;
-    if (target) {
-        hovered_document = target->document().unique_id();
-        // NB: A link in editable content is text to edit, which clicking does not follow.
-        auto const* hovered_link_element = target->enclosing_link_element();
-        if (hovered_link_element && !hovered_link_element->hyperlink_element_utils_element().is_editable_or_editing_host())
-            hovered_link_url = target->document().encoding_parse_url(hovered_link_element->href());
+    // With no target, the pointer is over nothing of this handler's document: It left the view, or the iframe this
+    // handler is for, or the document is going away. So, end only a link asked for over this document. Another
+    // document's link stands — e.g., one of the page around an iframe the pointer just left, which a hover of the render
+    // clock may have reported before this handler heard that the pointer left.
+    if (!target) {
+        if (auto document = m_navigable->active_document())
+            page.hover_link().withdraw(document->unique_id());
+        if (page.hover_reporting_navigable() == m_navigable)
+            page.set_hover_reporting_navigable({}, nullptr);
+        return;
     }
-    page.hover_link().request(move(hovered_link_url), hovered_document);
+
+    Optional<URL::URL> hovered_link_url;
+    // NB: A link in editable content is text to edit, which clicking does not follow.
+    auto const* hovered_link_element = target->enclosing_link_element();
+    if (hovered_link_element && !hovered_link_element->hyperlink_element_utils_element().is_editable_or_editing_host())
+        hovered_link_url = target->document().encoding_parse_url(hovered_link_element->href());
+    page.hover_link().request(move(hovered_link_url), target->document().unique_id());
 
     // Whatever the client shows now, this handler reported — so the hover is this handler's to end.
     GC::Ptr<HTML::LocalNavigable> hover_reporting_navigable;
@@ -5979,6 +6053,14 @@ bool EventHandler::has_committed_root_box() const
     return document && document->has_committed_viewport_box();
 }
 
+void EventHandler::stop_middle_button_scroll()
+{
+    if (!m_middle_button_scroll_handler)
+        return;
+    m_middle_button_scroll_handler->request_indicator_repaint();
+    m_middle_button_scroll_handler = nullptr;
+}
+
 void EventHandler::release_held_scroll_key()
 {
     m_held_scroll_key.clear();
@@ -5990,8 +6072,8 @@ void EventHandler::clear_per_test_input_state(Badge<Internals::Internals>)
     clear_mousedown_tracking();
     stop_updating_selection();
     release_held_scroll_key();
+    stop_middle_button_scroll();
 
-    m_middle_button_scroll_handler = nullptr;
     m_mouse_pointer.prevent_mouse_event = false;
     m_additional_pointers.clear();
     m_captured_chrome_widget = nullptr;

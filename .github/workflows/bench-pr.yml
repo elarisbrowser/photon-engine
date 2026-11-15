@@ -244,7 +244,17 @@ jobs:
           export SCCACHE_DIR=$state/cache/sccache SCCACHE_CACHE_SIZE=5G
           # Both arms build with the CI image's clang, as the master runs do.
           [ "$RUNNER_OS" = Linux ] && export CC=clang CXX=clang++
-          trap 'cp "$XDG_CACHE_HOME"/ladybird-bench/compile-*.log "$out"/ 2> /dev/null || true' EXIT
+          # The raw results hold each round's timings per arm and suite, which the report summarizes away: They're what
+          # it takes to tell a real mover from noise in a test, e.g. a bimodal timing, or a drift across the rounds.
+          save_logs_and_raw_results() {
+            cp "$XDG_CACHE_HOME"/ladybird-bench/compile-*.log "$out"/ 2> /dev/null || true
+            local raw
+            raw=$(sed -n 's/.*(raw results: \(.*\))$/\1/p' "$out/bench_pr.log" 2> /dev/null | tail -n 1)
+            if [ -n "$raw" ] && [ -d "$raw" ]; then
+              cp -R "$raw" "$out/raw-results" || true
+            fi
+          }
+          trap save_logs_and_raw_results EXIT
 
           src=$state/src
           if [ ! -d "$src/.git" ]; then
@@ -309,7 +319,8 @@ jobs:
 
   report:
     needs: [prepare, bench]
-    if: ${{ always() && needs.prepare.result != 'skipped' }}
+    # A run that a newer run for the same PR cancelled leaves its report to that newer run.
+    if: ${{ !cancelled() && needs.prepare.result != 'skipped' }}
     runs-on: blacksmith-2vcpu-ubuntu-2404
 
     # Runs nothing from the PR.
@@ -317,8 +328,10 @@ jobs:
       pull-requests: write
 
     steps:
+      # A bench job that lost its runner reports neither success nor failure — so these steps check only that the bench
+      # jobs ran, and the description then reports a platform without results as one that didn't finish.
       - name: 'Download the results'
-        if: ${{ needs.prepare.outputs.pr != '' && contains(fromJSON('["success", "failure"]'), needs.bench.result) }}
+        if: ${{ needs.prepare.outputs.pr != '' && needs.bench.result != 'skipped' }}
         uses: actions/download-artifact@v8
         with:
           pattern: bench-pr-*
@@ -327,7 +340,7 @@ jobs:
 
       # The section goes between markers at the end of the description, so a later run replaces it in place.
       - name: "Add the results to the PR's description"
-        if: ${{ needs.prepare.outputs.pr != '' && contains(fromJSON('["success", "failure"]'), needs.bench.result) }}
+        if: ${{ needs.prepare.outputs.pr != '' && needs.bench.result != 'skipped' }}
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}

@@ -18,7 +18,7 @@ use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
+use std::sync::{Condvar, LazyLock, Mutex, PoisonError};
 
 /// The host's name for its document's render state, which it mints without asking the owner.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -46,6 +46,8 @@ pub(crate) struct SharedWithHost {
     /// The flag the state's arena raises once any `::first-letter` box takes a style derived from the element
     /// containing its letter, and never lowers.
     pub(super) first_letter_styles_derived: Arc<AtomicBool>,
+    /// The flag the state's arena raises while any text row waits for paint timing to look at it.
+    pub(super) text_rows_noted_for_first_paint: Arc<AtomicBool>,
     /// The flag the state's style engine raises while it keeps any row's container effects for the host.
     pub(super) container_effects_held: Arc<AtomicBool>,
     /// The versions the state's style engine mints declaration blocks from, which the host mints from as well.
@@ -69,9 +71,44 @@ impl SharedWithHost {
     }
 }
 
+/// The turns threads take at the slot, in the order they ask for them. A thread that holds the slot over and over, as
+/// the ticks of a clock that falls behind do, would otherwise take it ahead of a thread waiting to wake, for as long as
+/// it goes on.
+#[derive(Default)]
+struct Turns {
+    next: AtomicU64,
+    serving: AtomicU64,
+    waiting: Mutex<()>,
+    turn_ended: Condvar,
+}
+
+impl Turns {
+    fn take(&self) {
+        // NB: These operations are sequentially consistent, or this thread could read the turn as not yet its own while
+        //     the holder ending it reads no ticket past its own, and wakes nobody.
+        let ticket = self.next.fetch_add(1, Ordering::SeqCst);
+        if self.serving.load(Ordering::SeqCst) == ticket {
+            return;
+        }
+        let mut waiting = self.waiting.lock().unwrap_or_else(PoisonError::into_inner);
+        while self.serving.load(Ordering::SeqCst) != ticket {
+            waiting = self.turn_ended.wait(waiting).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    fn end(&self) {
+        let serving = self.serving.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.next.load(Ordering::SeqCst) != serving {
+            // NB: A waiter holds the lock from reading the turn until it sleeps, so this reaches it.
+            drop(self.waiting.lock().unwrap_or_else(PoisonError::into_inner));
+            self.turn_ended.notify_all();
+        }
+    }
+}
+
 /// The slot every document's render state lives in, which one thread holds at a time.
 struct Slot {
-    held: Mutex<()>,
+    held: Turns,
     /// Each document's render state and clock lanes, which only the thread that holds the slot reaches. An entry is
     /// boxed, so a job reaching it keeps reaching it while the job makes another document's state.
     states: RefCell<HashMap<DocumentId, Box<DocumentEntry>>>,
@@ -95,12 +132,26 @@ const _: () = {
 };
 
 static SLOT: LazyLock<Slot> = LazyLock::new(|| Slot {
-    held: Mutex::new(()),
+    held: Turns::default(),
     states: RefCell::new(HashMap::new()),
     process_style: Arc::default(),
     tsan_key: AtomicBool::new(false),
     style_layout_pool: Arc::new(crate::style_layout_pool::StyleLayoutPool::of_process()),
 });
+
+/// Has the style and layout threads of the process give back the memory they freed, which they keep until they
+/// allocate again. Each does so between its jobs, and this does not wait for them. The Paint and Render threads both
+/// ask for this when they go idle, as either can stay busy for long while the workers have nothing to do.
+#[cfg(feature = "allocator")]
+pub(crate) fn release_unused_memory_of_style_layout_threads() {
+    if let Some(pool) = SLOT.style_layout_pool.started() {
+        pool.spawn_broadcast(|_| ak::release_unused_allocator_memory());
+    }
+}
+
+/// Standalone Rust tests do not link the C++ allocator, so there is nothing to release.
+#[cfg(not(feature = "allocator"))]
+pub(crate) fn release_unused_memory_of_style_layout_threads() {}
 
 /// The style data every document's style engine shares with the others, which any thread reaches without the slot: only
 /// what it guards itself is written once it is made.
@@ -130,15 +181,17 @@ pub(super) fn is_held_here() -> bool {
 /// Runs `job` holding the slot, which the calling thread takes first where it does not hold it yet, waiting for
 /// whichever thread holds it to let go.
 pub(super) fn hold<R>(job: impl FnOnce() -> R) -> R {
-    struct Holding(Option<MutexGuard<'static, ()>>);
+    struct Holding {
+        took_the_slot: bool,
+    }
     impl Drop for Holding {
         fn drop(&mut self) {
             HOLDS.set(HOLDS.get() - 1);
-            let Some(guard) = self.0.take() else {
+            if !self.took_the_slot {
                 return;
-            };
+            }
             crate::stage_thread::tsan::release(&SLOT.tsan_key);
-            drop(guard);
+            SLOT.held.end();
             // NB: Taken out before dropping them, since a drop may hold the slot again.
             let dropped = DROPPED_AFTER_HOLD.take();
             // A lane's drop resumes the panic of the recording it waits for, which a thread that is already unwinding
@@ -150,13 +203,13 @@ pub(super) fn hold<R>(job: impl FnOnce() -> R) -> R {
             }
         }
     }
-    let taken = (!is_held_here()).then(|| {
-        let guard = SLOT.held.lock().unwrap_or_else(PoisonError::into_inner);
+    let took_the_slot = !is_held_here();
+    if took_the_slot {
+        SLOT.held.take();
         crate::stage_thread::tsan::acquire(&SLOT.tsan_key);
-        guard
-    });
+    }
     HOLDS.set(HOLDS.get() + 1);
-    let _holding = Holding(taken);
+    let _holding = Holding { took_the_slot };
     job()
 }
 

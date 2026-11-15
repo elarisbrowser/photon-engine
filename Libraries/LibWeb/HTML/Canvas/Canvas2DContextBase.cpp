@@ -26,6 +26,7 @@
 #include <LibWeb/CSS/FontResolution.h>
 #include <LibWeb/CSS/Parser/Parser.h>
 #include <LibWeb/CSS/PropertyID.h>
+#include <LibWeb/CSS/Sizing.h>
 #include <LibWeb/CSS/StyleComputer.h>
 #include <LibWeb/CSS/StyleValues/FilterStyleValue.h>
 #include <LibWeb/CSS/StyleValues/FontStyleStyleValue.h>
@@ -51,6 +52,7 @@
 #include <LibWeb/HTML/HTMLImageElement.h>
 #include <LibWeb/HTML/HTMLVideoElement.h>
 #include <LibWeb/HTML/ImageBitmap.h>
+#include <LibWeb/HTML/ImageBitmapRenderingContext.h>
 #include <LibWeb/HTML/ImageRequest.h>
 #include <LibWeb/HTML/OffscreenCanvas.h>
 #include <LibWeb/HTML/OffscreenCanvasRenderingContext2D.h>
@@ -173,7 +175,7 @@ void web_canvas_2d_style_value_ref(CSS::StyleValue const*);
 void web_canvas_2d_style_value_unref(CSS::StyleValue const*);
 Gfx::DecodedImageFrame* web_canvas_2d_image_frame_from_pixels(u8 const* first_row, size_t pitch, i32 width, i32 height, u8 color_space);
 u8 web_canvas_2d_check_usability_of_image(void* source_wrapper, CanvasImageSourceKind, FlatPtr* out_message);
-void web_canvas_2d_image_source_size(void* source_wrapper, CanvasImageSourceKind, i32* out_width, i32* out_height);
+void web_canvas_2d_image_source_size(void* source_wrapper, CanvasImageSourceKind, i32 default_width, i32 default_height, i32* out_width, i32* out_height);
 bool web_canvas_2d_image_is_not_origin_clean(void* source_wrapper, CanvasImageSourceKind);
 bool web_canvas_2d_image_source_canvas_id(void* source_wrapper, CanvasImageSourceKind, u64* out_canvas_id, bool* out_source_is_2d);
 Gfx::DecodedImageFrame* web_canvas_2d_image_source_frame(void* source_wrapper, CanvasImageSourceKind, i32 raster_width, i32 raster_height, bool* out_rasterized);
@@ -257,12 +259,12 @@ Bindings::PredefinedColorSpace Canvas2DContextBase::color_space() const
     return predefined_color_space_from_underlying(web_canvas_2d_context_color_space(cell_of(*this)));
 }
 
-RefPtr<Gfx::Bitmap> Canvas2DContextBase::read_pixels(Gfx::IntRect const& rect, Gfx::AlphaType alpha_type, Bindings::PredefinedColorSpace color_space)
+Optional<Gfx::DecodedImageFrame> Canvas2DContextBase::read_pixels(Gfx::IntRect const& rect, Gfx::AlphaType alpha_type, Bindings::PredefinedColorSpace color_space)
 {
-    auto* bitmap = static_cast<Gfx::Bitmap*>(web_canvas_2d_context_read_pixels(this, rect, to_underlying(alpha_type), to_underlying(color_space)));
-    if (!bitmap)
-        return nullptr;
-    return adopt_ref(*bitmap);
+    auto frame = adopt_own_if_nonnull(static_cast<Gfx::DecodedImageFrame*>(web_canvas_2d_context_read_pixels(this, rect, to_underlying(alpha_type), to_underlying(color_space))));
+    if (!frame)
+        return {};
+    return move(*frame);
 }
 
 bool Canvas2DContextBase::draw_image(ImageBitmap& image_bitmap, float x, float y)
@@ -280,7 +282,7 @@ void Canvas2DContextBase::notify_backing_storage_lost()
     // When the user agent detects that the backing storage associated with a canvas context has been lost, then it
     // must queue a global task on the DOM manipulation task source given canvas's relevant global object to run
     // these steps:
-    queue_global_task(HTML::Task::Source::DOMManipulation, canvas_host().canvas_relevant_global_object(), GC::create_function(GC::Heap::the(), [context = GC::Ref { *this }] {
+    queue_global_task(HTML::Task::Source::DOMManipulation, canvas_host().canvas_relevant_global_object(), GC::create_function(GC::Heap::the(), GC::captures(GC::Ref { *this }), [](auto& context) {
         // 1. Let canvas be context's canvas element.
         auto& canvas = context->canvas_host();
 
@@ -699,15 +701,17 @@ void web_canvas_2d_style_value_unref(CSS::StyleValue const* style_value)
 
 Gfx::DecodedImageFrame* web_canvas_2d_image_frame_from_pixels(u8 const* first_row, size_t pitch, i32 width, i32 height, u8 color_space)
 {
-    // NB: The bitmap is shareable, so that flushing to the Compositor passes the pixels by file descriptor instead of
-    //     copying them again.
+    // NB: The bitmap is shareable, so that the frame shares its memory instead of copying the pixels again.
     auto bitmap = Gfx::Bitmap::create_shareable(Gfx::BitmapFormat::RGBA8888, Gfx::AlphaType::Unpremultiplied, { width, height });
     if (bitmap.is_error())
         return nullptr;
     auto row_size = static_cast<size_t>(width) * sizeof(Gfx::RawPixel);
     for (int y = 0; y < height; ++y)
         __builtin_memcpy(bitmap.value()->scanline(y), first_row + static_cast<size_t>(y) * pitch, row_size);
-    return new Gfx::DecodedImageFrame { *bitmap.release_value(), Gfx::AlphaType::Unpremultiplied, gfx_color_space_for(predefined_color_space_from_underlying(color_space)) };
+    auto frame = Gfx::DecodedImageFrame::create(*bitmap.release_value(), gfx_color_space_for(predefined_color_space_from_underlying(color_space)));
+    if (frame.is_error())
+        return nullptr;
+    return new Gfx::DecodedImageFrame { frame.release_value() };
 }
 
 static CanvasImageSource image_source_from(void* source_wrapper, CanvasImageSourceKind kind)
@@ -746,33 +750,22 @@ u8 web_canvas_2d_check_usability_of_image(void* source_wrapper, CanvasImageSourc
     return usability.value() == CanvasImageSourceUsability::Good ? usability_good : usability_bad;
 }
 
-void web_canvas_2d_image_source_size(void* source_wrapper, CanvasImageSourceKind kind, i32* out_width, i32* out_height)
+// The size of an image element's image, as drawing it uses it. The default object size is the size of the output bitmap
+// of the canvas it's drawn into.
+void web_canvas_2d_image_source_size(void* source_wrapper, CanvasImageSourceKind kind, i32 default_width, i32 default_height, i32* out_width, i32* out_height)
 {
-    auto image_provider_intrinsic_size = [](Layout::ImageProvider const& image_provider) -> Optional<Gfx::IntSize> {
-        auto intrinsic_width = image_provider.intrinsic_width();
-        auto intrinsic_height = image_provider.intrinsic_height();
-        if (!intrinsic_width.has_value() || !intrinsic_height.has_value())
-            return {};
-        return Gfx::IntSize { intrinsic_width->to_int(), intrinsic_height->to_int() };
-    };
-
-    auto size = image_source_from(source_wrapper, kind).visit([&](GC::Ref<HTMLImageElement> source) -> Gfx::IntSize {
-            if (auto intrinsic_size = image_provider_intrinsic_size(*source); intrinsic_size.has_value())
-                return *intrinsic_size;
-
-            // FIXME: This is very janky and not correct.
-            return { source->width(), source->height() }; }, [&](GC::Ref<SVG::SVGImageElement> source) -> Gfx::IntSize {
-            if (auto intrinsic_size = image_provider_intrinsic_size(*source); intrinsic_size.has_value())
-                return *intrinsic_size;
-
-            // FIXME: This is very janky and not correct.
-            auto maybe_width = source->width()->anim_val()->value();
-            auto maybe_height = source->height()->anim_val()->value();
-
-            auto width = maybe_width.is_exception() ? 0 : maybe_width.release_value();
-            auto height = maybe_height.is_exception() ? 0 : maybe_height.release_value();
-
-            return { width, height }; }, [](GC::Ref<HTMLCanvasElement> source) -> Gfx::IntSize { return { source->width(), source->height() }; }, [](GC::Ref<OffscreenCanvas> source) -> Gfx::IntSize { return source->bitmap_size_for_canvas(); }, [](GC::Ref<HTMLVideoElement> source) -> Gfx::IntSize { return { source->video_width(), source->video_height() }; }, [](GC::Ref<ImageBitmap>) -> Gfx::IntSize { VERIFY_NOT_REACHED(); });
+    auto size = image_source_from(source_wrapper, kind).visit([&](OneOf<GC::Ref<HTMLImageElement>, GC::Ref<SVG::SVGImageElement>> auto const& source) -> Gfx::IntSize {
+            // https://html.spec.whatwg.org/multipage/canvas.html#drawing-images
+            // If the image has no natural dimensions, then the concrete object size must be used instead, as determined
+            // using the CSS "Concrete Object Size Resolution" algorithm, with the specified size having neither a definite
+            // width nor height, nor any additional constraints, the object's natural properties being those of the image
+            // argument, and the default object size being the size of the output bitmap.
+            auto size = CSS::run_default_sizing_algorithm({}, {}, { source->intrinsic_width(), source->intrinsic_height(), source->intrinsic_aspect_ratio() }, { default_width, default_height });
+            return { size.width().to_int(), size.height().to_int() }; }, [](GC::Ref<HTMLCanvasElement> source) -> Gfx::IntSize {
+            // NB: A valid output bitmap of an ImageBitmapRenderingContext has the dimensions of its bitmap data.
+            if (auto const* bitmap_renderer = source->canvas_bitmap_renderer_context(); bitmap_renderer && !bitmap_renderer->is_blank())
+                return source->bitmap_size_for_canvas();
+            return { source->width(), source->height() }; }, [](GC::Ref<OffscreenCanvas> source) -> Gfx::IntSize { return source->bitmap_size_for_canvas(); }, [](GC::Ref<HTMLVideoElement> source) -> Gfx::IntSize { return { source->video_width(), source->video_height() }; }, [](GC::Ref<ImageBitmap>) -> Gfx::IntSize { VERIFY_NOT_REACHED(); });
     *out_width = size.width();
     *out_height = size.height();
 }

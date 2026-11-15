@@ -65,6 +65,7 @@ FLOATING_POINT_TYPES = {"float": "f32", "unrestricted float": "f32", "double": "
 # The types whose values are plain data, with the Rust type of their values. None of these Rust types is or holds a
 # cell, which holds_cells() relies on.
 PLAIN_DATA_TYPES = {
+    "ByteString": "ByteString",
     "CSSOMString": "Utf16String",
     "DOMString": "Utf16String",
     "USVString": "UsvString",
@@ -243,18 +244,23 @@ def is_unnamed_union_of_cpp_interfaces(idl_type: IDLType, context: GenerationCon
     )
 
 
-def idl_type_name(idl_type: IDLType, what: str) -> str:
+def idl_type_name(idl_type: IDLType, what: str, context: Optional[GenerationContext] = None) -> str:
     """The name the Rust bindings give the type: Path2DOrDOMString for (Path2D or DOMString),
-    UnrestrictedDoubleSequence for sequence<unrestricted double>."""
+    UnrestrictedDoubleSequence for sequence<unrestricted double>. Given the context, a member union that one typedef
+    names has the typedef's name: DocumentOrXMLHttpRequestBodyInit for (Document or XMLHttpRequestBodyInit)."""
     if isinstance(idl_type, IDLUnionType):
-        name = "Or".join(idl_type_name(member_type, what) for member_type in idl_type.member_types)
+        if context is not None:
+            names = union_typedef_names(idl_type, context)
+            if len(names) == 1:
+                return f"{names[0]}OrNull" if idl_type.nullable else names[0]
+        name = "Or".join(idl_type_name(member_type, what, context) for member_type in idl_type.member_types)
     elif isinstance(idl_type, IDLParameterizedType) and idl_type.name == "record":
         key_type, value_type = idl_type.parameters
-        name = f"{idl_type_name(key_type, what)}{idl_type_name(value_type, what)}Record"
+        name = f"{idl_type_name(key_type, what, context)}{idl_type_name(value_type, what, context)}Record"
     elif isinstance(idl_type, IDLParameterizedType):
         if idl_type.name != "sequence":
             raise UnsupportedByRustBindings(f"{what} has the type {idl_type}, which the Rust bindings have no name for")
-        name = f"{idl_type_name(idl_type.parameters[0], what)}Sequence"
+        name = f"{idl_type_name(idl_type.parameters[0], what, context)}Sequence"
     else:
         name = "".join(word[:1].upper() + word[1:] for word in idl_type.name.split(" "))
     return f"{name}OrNull" if idl_type.nullable else name
@@ -373,7 +379,7 @@ def rust_enumeration_variant(value: str, enumeration: Enumeration) -> str:
     way."""
     variant = string_to_cpp_enum_name(value)
     is_plain = value.isascii() and value.isprintable() and '"' not in value and "\\" not in value
-    if not is_plain or not re.fullmatch(r"[A-Z][A-Za-z0-9]*", variant) or variant == "Self":
+    if not is_plain or not re.fullmatch(r"(?:[A-Z]|_[0-9])[A-Za-z0-9]*", variant) or variant == "Self":
         raise UnsupportedByRustBindings(
             f"The value {value!r} of the enumeration {enumeration.name} has no name that the Rust bindings can give "
             "its variant"
@@ -390,7 +396,7 @@ def rust_union_path(idl_type: IDLUnionType, context: GenerationContext, what: st
     if len(names) > 1:
         raise UnsupportedByRustBindings(f"{what} has the union type {idl_type}, which the typedefs {names} all name")
     if not names:
-        type_name = idl_type_name(idl_type.without_nullable(), what)
+        type_name = idl_type_name(idl_type.without_nullable(), what, context)
         if type_name in SHARED_UNNAMED_UNIONS:
             return f"{SHARED_UNNAMED_UNIONS[type_name]}::{type_name}"
         idl_path = unnamed_union_idl_path(idl_type, context, what)
@@ -423,7 +429,7 @@ def rust_type(idl_type: IDLType, context: GenerationContext, what: str, is_resul
             return "WebIdlPromise"
         if name == "record":
             key_type, value_type = idl_type.parameters
-            if key_type.name not in ("DOMString", "USVString"):
+            if key_type.name not in ("ByteString", "DOMString", "USVString"):
                 raise UnsupportedByRustBindings(f"{what} has a record with keys of the type {key_type}")
             return f"Vec<({rust_type(key_type, context, what)}, {rust_type(value_type, context, what)})>"
         raise UnsupportedByRustBindings(f"{what} has the type {idl_type}, which the Rust bindings do not convert yet")
@@ -435,7 +441,7 @@ def rust_type(idl_type: IDLType, context: GenerationContext, what: str, is_resul
         return "Gc<Object>"
     if name in TYPED_ARRAY_NAMES:
         return "Gc<TypedArrayBase>"
-    if name == "ArrayBuffer" and is_result:
+    if name == "ArrayBuffer":
         return "Gc<ArrayBuffer>"
     callback_function = context.callback_function(idl_type)
     if callback_function is not None:
@@ -525,6 +531,17 @@ def is_sequence_of_cells(idl_type: IDLType, context: GenerationContext) -> bool:
     )
 
 
+def is_record_of_cells(idl_type: IDLType, context: GenerationContext) -> bool:
+    """Whether the type is a record whose values are or can hold cells, which the bindings gather in a MarkedVec for a
+    parameter."""
+    return (
+        isinstance(idl_type, IDLParameterizedType)
+        and idl_type.name == "record"
+        and not idl_type.nullable
+        and holds_cells(idl_type.parameters[1], context)
+    )
+
+
 def dictionary_holds_sequence_of_cells(dictionary: Dictionary, context: GenerationContext) -> bool:
     """Whether a member of the dictionary is a sequence of values that are or can hold cells, which the struct of the
     dictionary keeps alive in a MarkedVec, for as long as the reference to the VM that it was converted with lives."""
@@ -550,6 +567,10 @@ def rust_parameter_type(parameter: OperationParameter, context: GenerationContex
     if is_sequence_of_cells(parameter.type, context):
         assert isinstance(parameter.type, IDLParameterizedType)
         value_type = f"MarkedVec<'_, {rust_type(parameter.type.parameters[0], context, what)}>"
+    elif is_record_of_cells(parameter.type, context):
+        assert isinstance(parameter.type, IDLParameterizedType)
+        key_type, record_value_type = (rust_type(type, context, what) for type in parameter.type.parameters)
+        value_type = f"MarkedVec<'_, ({key_type}, {record_value_type})>"
     else:
         value_type = rust_type(parameter.type, context, what)
     if parameter.optional and parameter.default_value is None:

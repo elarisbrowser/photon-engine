@@ -80,20 +80,42 @@ EventLoop::EventLoop(Type type)
     }
     m_task_queue = GC::Heap::the().allocate<TaskQueue>(*this);
 
-    m_rendering_task_function = GC::create_function(GC::Heap::the(), [this] {
-        VERIFY(m_rendering_task_queued);
-        m_rendering_task_queued = false;
-        update_the_rendering();
+    m_rendering_task_function = GC::create_function(GC::Heap::the(), GC::captures(*this), [](EventLoop& self) {
+        VERIFY(self.m_rendering_task_queued);
+        self.m_rendering_task_queued = false;
+        self.update_the_rendering();
     });
 }
 
 EventLoop::~EventLoop() = default;
 
-void EventLoop::reset_rendering_scheduler_counters()
+String EventLoop::take_rendering_trace()
 {
-    m_rendering_scheduler_counters = {};
-    m_rendering_scheduler_counters_at_last_update = {};
-    m_last_rendering_update_end_time = 0;
+    StringBuilder builder;
+    for (auto const& line : m_rendering_trace.value_or({})) {
+        builder.append(line.text);
+        if (line.repeats > 1)
+            builder.appendff(" x{}", line.repeats);
+        builder.append('\n');
+    }
+    m_rendering_trace.clear();
+    return builder.to_string_without_validation();
+}
+
+void EventLoop::note_rendering_trace_event(StringView event)
+{
+    if (!m_rendering_trace.has_value())
+        return;
+    if (!m_rendering_trace->is_empty() && m_rendering_trace->last().text == event) {
+        ++m_rendering_trace->last().repeats;
+        return;
+    }
+    m_rendering_trace->append({ MUST(String::from_utf8(event)) });
+}
+
+void note_rendering_trace_event(StringView event)
+{
+    main_thread_event_loop().note_rendering_trace_event(event);
 }
 
 void EventLoop::visit_edges(Visitor& visitor)
@@ -120,8 +142,8 @@ void EventLoop::schedule()
 void EventLoop::schedule_for_queued_task()
 {
     if (!m_system_event_loop_timer) {
-        m_system_event_loop_timer = Platform::Timer::create_single_shot(GC::Heap::the(), AK::Duration::from_milliseconds(0), GC::create_function(GC::Heap::the(), [this] {
-            process();
+        m_system_event_loop_timer = Platform::Timer::create_single_shot(GC::Heap::the(), AK::Duration::from_milliseconds(0), GC::create_function(GC::Heap::the(), GC::captures(*this), [](EventLoop& self) {
+            self.process();
         }));
     }
 
@@ -131,9 +153,30 @@ void EventLoop::schedule_for_queued_task()
     }
 }
 
+void EventLoop::destroy_once_script_has_finished()
+{
+    m_destruction_requested = true;
+    schedule();
+}
+
+bool EventLoop::destroy_if_requested()
+{
+    // NB: A paused event loop has script waiting further up the stack, as a spinning one has.
+    if (!m_destruction_requested || m_spin_depth > 0 || execution_paused())
+        return false;
+    if (auto on_destroyed = move(m_on_destroyed))
+        on_destroyed();
+    return true;
+}
+
 EventLoop& main_thread_event_loop()
 {
     return *static_cast<HTML::Agent*>(Bindings::main_thread_vm().agent())->event_loop;
+}
+
+EventLoop& current_event_loop()
+{
+    return *surrounding_agent().event_loop;
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#spin-the-event-loop
@@ -165,12 +208,16 @@ void EventLoop::spin_until(GC::Ref<GC::Function<bool()>> goal_condition)
     //       NOTE: This is achieved by returning from the function.
 
     ++m_spin_depth;
-    ScopeGuard leave_spin = [this] { --m_spin_depth; };
-    Platform::EventLoopPlugin::the().spin_until(GC::create_function(GC::Heap::the(), [this, goal_condition] {
+    ScopeGuard leave_spin = [this] {
+        --m_spin_depth;
+        if (m_destruction_requested)
+            schedule();
+    };
+    Platform::EventLoopPlugin::the().spin_until(GC::create_function(GC::Heap::the(), GC::captures(*this, goal_condition), [](auto& self, auto& goal_condition) {
         if (goal_condition->function()())
             return true;
-        if (m_task_queue->has_runnable_tasks()) {
-            schedule();
+        if (self.m_task_queue->has_runnable_tasks()) {
+            self.schedule();
             // FIXME: Remove the platform event loop plugin so that this doesn't look out of place
             Core::EventLoop::current().wake();
         }
@@ -187,7 +234,7 @@ void EventLoop::process()
 {
     m_turn_requested_without_a_task = false;
 
-    if (execution_paused())
+    if (destroy_if_requested() || execution_paused())
         return;
 
     // OPTIMIZATION: A trip through the platform event loop costs more than a small task does, so run the tasks that are
@@ -205,6 +252,9 @@ void EventLoop::process()
         if (Core::ThreadEventQueue::current().has_pending_events() || MonotonicTime::now() >= turn_deadline)
             break;
     }
+
+    if (destroy_if_requested())
+        return;
 
     // If there are eligible tasks in the queue, schedule a new round of processing. :^)
     if (has_runnable_tasks || (!m_microtask_queue.is_empty() && !m_performing_a_microtask_checkpoint)) {
@@ -274,6 +324,8 @@ bool EventLoop::run_one_turn_of_the_processing_model()
 
         // 5. Set the event loop's currently running task to oldestTask.
         m_currently_running_task = oldest_task.ptr();
+        // NB: A task that spins the event loop runs other tasks in the middle of its own, so each restores what it found.
+        TemporaryChange timer_nesting_level_for_microtasks { m_timer_nesting_level_for_microtasks, oldest_task->timer_nesting_level() };
 
         // 6. Perform oldestTask's steps.
         oldest_task->execute();
@@ -368,8 +420,8 @@ bool EventLoop::run_one_turn_of_the_processing_model()
             //     anything but an idle callback starts an idle period right away (see did_request_idle_callback()).
             m_idle_callback_requested_outside_idle_period = false;
             if (!m_idle_period_timer) {
-                m_idle_period_timer = Platform::Timer::create_single_shot(GC::Heap::the(), AK::Duration::from_milliseconds(50), GC::create_function(GC::Heap::the(), [this] {
-                    schedule();
+                m_idle_period_timer = Platform::Timer::create_single_shot(GC::Heap::the(), AK::Duration::from_milliseconds(50), GC::create_function(GC::Heap::the(), GC::captures(*this), [](EventLoop& self) {
+                    self.schedule();
                 }));
             }
             m_idle_period_timer->restart();
@@ -398,9 +450,10 @@ void EventLoop::request_rendering_update()
 
     if (m_rendering_update_requested || m_rendering_task_queued) {
         ++m_rendering_scheduler_counters.coalesced_update_requests;
-        if (photon_frame_trace_enabled()) dbgln("[FrameTrace] rendering_update_request loop={} at_ms={:.3f} coalesced=true requested={} queued={} running={}", reinterpret_cast<FlatPtr>(this), HighResolutionTime::unsafe_shared_current_time(), m_rendering_update_requested, m_rendering_task_queued, m_running_rendering_task);
+        note_rendering_trace_event(m_running_rendering_task ? "request while rendering, coalesced"sv : "request, coalesced"sv);
         return;
     }
+    note_rendering_trace_event(m_running_rendering_task ? "request while rendering"sv : "request"sv);
 
     if (photon_frame_trace_enabled()) dbgln("[FrameTrace] rendering_update_request loop={} at_ms={:.3f} coalesced=false", reinterpret_cast<FlatPtr>(this), HighResolutionTime::unsafe_shared_current_time());
     m_rendering_update_requested = true;
@@ -412,8 +465,7 @@ bool EventLoop::rendering_opportunity(HighResolutionTime::DOMHighResTimeStamp fr
     ++m_rendering_scheduler_counters.opportunities_received;
     if (source == RenderingOpportunitySource::Watchdog)
         ++m_rendering_scheduler_counters.watchdog_opportunities;
-    auto source_name = source == RenderingOpportunitySource::Compositor ? "compositor" : source == RenderingOpportunitySource::LocalTimer ? "local_timer" : source == RenderingOpportunitySource::Watchdog ? "watchdog" : "manual";
-    if (photon_frame_trace_enabled()) dbgln("[FrameTrace] rendering_opportunity loop={} at_ms={:.3f} frame_ms={:.3f} source={} requested={} queued={} running={}", reinterpret_cast<FlatPtr>(this), HighResolutionTime::unsafe_shared_current_time(), frame_time, source_name, m_rendering_update_requested, m_rendering_task_queued, m_running_rendering_task);
+    note_rendering_trace_event(source == RenderingOpportunitySource::Watchdog ? "opportunity (watchdog)"sv : "opportunity"sv);
 
     // FIXME: 1. Wait until at least one navigable whose active document's relevant agent's event loop is eventLoop might have a rendering opportunity.
 
@@ -768,6 +820,8 @@ enum class LayoutHeldForTesting : bool {
 // observations the last doc's layout answers, and the animations it samples and transitions it starts, whose timing
 // script sees follow the update. Once the transaction is taken in, those are the ones its style began, and the ones
 // running on the compositor, which the update's frame publishes.
+// The Event Timing entries pending for any doc count too: The update sets their durations from the time it reaches them,
+// and queues those that lasted 16ms or more for observers to see.
 // AD-HOC: The render clock's lanes of the docs the update took in present nothing until its frame: a task beside the
 //         update would leave the pointer unhovered and the animations still for as long as it runs, where the lanes
 //         would hover or animate beside it. A test that holds the layout that flies runs the doc's tasks beside it.
@@ -776,8 +830,9 @@ static HeldTasks tasks_rendering_update_holds(Vector<GC::Root<DOM::Document>> co
 {
     if (any_of(docs, [](auto const& document) { return document->has_intersection_observation_targets(); }))
         return HeldTasks::All;
-    // The focus fixup of every doc whose focused area is not its viewport reads that area as the update leaves it.
-    if (any_of(docs.span().slice(0, docs.size() - 1), [](auto const& document) { return focus_fixup_rule_may_apply(*document); }))
+    // The focus fixup of every doc whose focused area is not its viewport reads that area as the update leaves it, and
+    // the Event Timing entries pending for a doc are reported as the update reaches them.
+    if (any_of(docs.span().slice(0, docs.size() - 1), [](auto const& document) { return focus_fixup_rule_may_apply(*document) || EventTiming::has_pending_event_timing_entries(*document); }))
         return HeldTasks::All;
     // The lanes of a doc the update took in present nothing until it seals their plan, which its tasks would hold up.
     auto lanes_wait = [&](DOM::Document const& document) {
@@ -787,7 +842,7 @@ static HeldTasks tasks_rendering_update_holds(Vector<GC::Root<DOM::Document>> co
     if (any_of(docs.span().slice(0, docs.size() - 1), [&](auto const& document) { return lanes_wait(*document); }))
         return HeldTasks::All;
     auto& document = *docs.last();
-    if (document.has_resize_observers() || focus_fixup_rule_may_apply(document))
+    if (document.has_resize_observers() || focus_fixup_rule_may_apply(document) || EventTiming::has_pending_event_timing_entries(document))
         return HeldTasks::OfLastDocument;
     if (lanes_wait(document))
         return HeldTasks::OfLastDocument;
@@ -960,19 +1015,14 @@ void EventLoop::queue_task_to_process_input_events()
     if (m_input_events_task_queued)
         return;
     m_input_events_task_queued = true;
-    queue_a_task(Task::Source::UserInteraction, this, nullptr, GC::create_function(GC::Heap::the(), [this] { process_input_events_task(); }));
-}
-
-void EventLoop::process_input_events_task()
-{
-    m_input_events_task_queued = false;
-    if (m_running_rendering_task || m_rendering_update_in_flight)
-        return;
-    // Input dispatch can run script and request another frame. Keep that work
-    // behind the reentrancy guard without starting a rendering-update lifecycle.
-    TemporaryChange running { m_running_rendering_task, true };
-    // NB: No rendering update comes with this task, and script may run for long before the next one: the lanes tick on.
-    take_clock_lanes_and_input_events_in({});
+    queue_a_task(Task::Source::UserInteraction, this, nullptr, GC::create_function(GC::Heap::the(), GC::captures(*this), [](EventLoop& self) {
+        self.m_input_events_task_queued = false;
+        if (self.m_running_rendering_task || self.m_rendering_update_in_flight)
+            return;
+        // NB: No rendering update comes with this task, and script may run for long before the next one: the lanes
+        //     tick on.
+        self.take_clock_lanes_and_input_events_in({});
+    }));
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#update-the-rendering
@@ -984,6 +1034,7 @@ void EventLoop::update_the_rendering()
         page->client().will_begin_rendering_update();
     auto update_start_time = HighResolutionTime::unsafe_shared_current_time();
     ++m_rendering_scheduler_counters.updates_run;
+    note_rendering_trace_event("update"sv);
     ++m_rendering_update_serial;
 
     // AD-HOC: The last rendering update may have ended as its style update flew. Its layout runs beside this
@@ -1403,7 +1454,7 @@ void EventLoop::update_the_rendering_after_style_and_layout(Vector<GC::Root<DOM:
         if (synced_pages.contains_slow(GC::Ref { document->page() }))
             continue;
         synced_pages.append(document->page());
-        document->page().sync_media_element_video_sink_ticking();
+        document->page().sync_media_element_video_sink_ticking(docs);
     }
 
     // FIXME: 20. For each doc of docs, record rendering time for doc given unsafeStyleAndLayoutStartTime.
@@ -1441,6 +1492,7 @@ void EventLoop::update_the_rendering_after_style_and_layout(Vector<GC::Root<DOM:
         if (!navigable || !navigable->paint_next_frame_if_needed(DOM::UpdateLayoutReason::HTMLEventLoopRenderingUpdate, lay_out_first))
             continue;
         ++m_rendering_scheduler_counters.paints;
+        note_rendering_trace_event("paint"sv);
         if (navigable->is_local_root())
             navigable->page().process_screenshot_requests();
     }
@@ -1507,6 +1559,15 @@ Layout::RustFFI::FfiFlightBlocker EventLoop::style_flight_blocker(DOM::Document&
     return Blocker::None;
 }
 
+// The sizes the windows took as the update flew become the sizes of their traversables now that it ended.
+static void take_viewport_sizes_held_for_rendering_update_in_flight()
+{
+    for (auto const& page : pages_of_local_roots()) {
+        if (page->has_local_traversable())
+            page->local_traversable()->take_viewport_size_held_for_rendering_update_in_flight();
+    }
+}
+
 void EventLoop::resume_rendering_update_in_flight()
 {
     auto update = m_rendering_update_in_flight.release_nonnull();
@@ -1522,6 +1583,7 @@ void EventLoop::resume_rendering_update_in_flight()
         for (auto const& page : pages_of_local_roots())
             page->client().did_finish_rendering_update();
     }
+    take_viewport_sizes_held_for_rendering_update_in_flight();
 }
 
 // The rest of the last rendering update, which ended as its style update flew, runs before anything of the next
@@ -1550,6 +1612,7 @@ bool EventLoop::finish_ended_rendering_update_as_its_layout_flew()
         update_the_rendering_after_style_and_layout(update->docs, update->frame_timestamp, update->serial, TakenLayout::AsItFlew, update.ptr());
     }
     update_whether_font_face_sets_are_pending_on_the_environment(update->docs, TakenLayout::AsItFlew);
+    take_viewport_sizes_held_for_rendering_update_in_flight();
     return true;
 }
 
@@ -1755,7 +1818,7 @@ void EventLoop::release_held_frames_for_testing()
 
 void run_when_event_loop_reaches_step_1(GC::Ref<GC::Function<void()>> steps)
 {
-    auto& event_loop = main_thread_event_loop();
+    auto& event_loop = current_event_loop();
     event_loop.run_upon_reaching_step_1(steps);
 }
 
@@ -1764,7 +1827,7 @@ TaskID queue_a_task(HTML::Task::Source source, GC::Ptr<EventLoop> event_loop, GC
 {
     // 1. If event loop was not given, set event loop to the implied event loop.
     if (!event_loop)
-        event_loop = main_thread_event_loop();
+        event_loop = current_event_loop();
 
     // FIXME: 2. If document was not given, set document to the implied document.
 
@@ -1804,7 +1867,7 @@ TaskID queue_global_task(HTML::Task::Source source, JS::Object& global_object, G
 void queue_a_microtask(GC::Ptr<DOM::Document const> document, GC::Ref<GC::Function<void()>> steps)
 {
     // 1. If event loop was not given, set event loop to the implied event loop.
-    auto& event_loop = HTML::main_thread_event_loop();
+    auto& event_loop = HTML::current_event_loop();
 
     // FIXME: 2. If document was not given, set document to the implied document.
 
@@ -1822,7 +1885,7 @@ void queue_a_microtask(GC::Ptr<DOM::Document const> document, GC::Ref<GC::Functi
 
 void perform_a_microtask_checkpoint()
 {
-    main_thread_event_loop().perform_a_microtask_checkpoint();
+    current_event_loop().perform_a_microtask_checkpoint();
 }
 
 // https://html.spec.whatwg.org/multipage/webappapis.html#perform-a-microtask-checkpoint
@@ -1849,12 +1912,19 @@ void EventLoop::perform_a_microtask_checkpoint()
     m_performing_a_microtask_checkpoint = true;
 
     // 3. While the event loop's microtask queue is not empty:
-    while (!m_microtask_queue.is_empty()) {
+    // AD-HOC: The script these would run was aborted, and nothing in the agent runs anymore.
+    while (!m_microtask_queue.is_empty() && !vm().interrupt_requested()) {
         // 1. Let oldestMicrotask be the result of dequeuing from the event loop's microtask queue.
         auto oldest_microtask = m_microtask_queue.dequeue();
 
         // 2. Set the event loop's currently running task to oldestMicrotask.
         m_currently_running_task = oldest_microtask;
+
+        // AD-HOC: The spec gives a microtask no timer nesting level, so a timer it schedules starts over at 0 — even
+        //         in the checkpoint that ends a deeply-nested timer callback. A page that re-arms a 0ms timer from a
+        //         promise reaction then never reaches the 4ms clamp, and spins. Instead, a microtask carries the
+        //         nesting level of the task whose checkpoint runs it, just as the timer callback itself would have.
+        oldest_microtask->set_timer_nesting_level(m_timer_nesting_level_for_microtasks);
 
         // 3. Run oldestMicrotask.
         oldest_microtask->execute();

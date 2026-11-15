@@ -19,12 +19,12 @@
 use crate::layout::node_data::NodeSlotId;
 use crate::layout::{LayoutNodeArena, RowsVersion};
 use crate::paint_stage::Presenting;
-use crate::painting::ffi::{FfiFlightBlocker, FfiPresentedRecording};
+use crate::painting::display_list_resources::NestedDisplayList;
+use crate::painting::ffi::FfiFlightBlocker;
 use crate::painting::hit_test::HitTestList;
 use crate::painting::paint_read::PaintSource;
 use crate::painting::paint_state::{PendingRecording, PendingRecordingTrace};
 use crate::painting::presentation::Presentation;
-use crate::painting::presentation::VectorImageResources;
 use crate::painting::published_frame::PublishedFrame;
 use crate::painting::record::publish::PresentedOutput;
 use crate::painting::record::recorder_state::RecorderState;
@@ -34,6 +34,7 @@ use crate::render_state::{LockstepProof, SampledFrame, TaskBoundary};
 use crate::stage_thread::InFlight;
 #[cfg(not(test))]
 use crate::stage_thread::{ParkedJob, StopWord};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 /// A display list recording: the frame it records, which it drops before it returns, the rows
@@ -91,13 +92,12 @@ impl VectorImageFrame {
         &self.pending.recording.resources.vector_image_render_requests
     }
 
-    /// Presents the frame, recorded with `recorder`, with `resources`, the SVG images the host rendered, whose display
-    /// lists are `display_list_ids`, one for each of the frame's requests, beside the event loop.
+    /// Presents the frame, recorded with `recorder`, with `display_lists`, those of the SVG images the host rendered, one
+    /// for each of the frame's requests, beside the event loop.
     pub(crate) fn present(
         self,
         recorder: RecorderState,
-        display_list_ids: &[u64],
-        resources: VectorImageResources,
+        display_lists: &[Arc<NestedDisplayList>],
         presenting: &mut Presenting,
     ) -> RecordingAnswer {
         let Self {
@@ -106,19 +106,10 @@ impl VectorImageFrame {
             rows_version,
             lane,
         } = self;
-        presentation
-            .presenter
-            .take_vector_image_resources(resources, display_list_ids);
         let publishes_recording = pending.publishes_recording;
-        let output = crate::painting::record::publish::publish_with_vector_images(
-            pending,
-            &recorder,
-            &mut presentation.presenter,
-            display_list_ids,
-        );
-        presentation.present(&FfiPresentedRecording::of_output(&output), presenting);
+        let output = present_with_vector_images(&mut presentation, pending, &recorder, presenting, display_lists);
         let recorded = Recorded::Presented {
-            output: PresentedOutput::of(output),
+            output,
             publishes_recording,
         };
         let answer = RecordingAnswer {
@@ -299,13 +290,13 @@ impl RecordingJob {
             (Some(presentation), Some(presenting), Some(vector_image_display_lists)) => {
                 let publishes_recording = pending.publishes_recording;
                 let output = match vector_image_display_lists {
-                    Some(display_list_ids) => {
-                        present_with_vector_images(presentation, pending, &recorder, presenting, &display_list_ids)
+                    Some(display_lists) => {
+                        present_with_vector_images(presentation, pending, &recorder, presenting, &display_lists)
                     }
                     None => present(presentation, pending, &recorder, presenting),
                 };
                 Recorded::Presented {
-                    output: PresentedOutput::of(output),
+                    output,
                     publishes_recording,
                 }
             }
@@ -327,6 +318,13 @@ enum RecordingHold {
     Idle,
     Armed,
     Holding,
+    // The Render thread waits inside its claim of a style update that flies, until the hold goes.
+    #[cfg_attr(test, allow(dead_code))]
+    HoldingClaim,
+    // The claim hold gave way to a job another thread waits for on the Render thread, which then leaves the style
+    // update unclaimed, for the host to take back.
+    #[cfg_attr(test, allow(dead_code))]
+    ClaimYielded,
     // A layout held is never handed to the Render thread until it goes, so that the thread runs the jobs of other
     // documents meanwhile, as one the collector finalizes asks of it.
     #[cfg(not(test))]
@@ -339,6 +337,9 @@ enum RecordingHold {
 
 static RECORDING_HOLD: Mutex<RecordingHold> = Mutex::new(RecordingHold::Idle);
 static RECORDING_HOLD_RELEASED: Condvar = Condvar::new();
+// Whether the claim hold keeps the Render thread waiting, which a thread about to wait for the Render thread reads
+// without taking the lock.
+static CLAIM_HOLD_BLOCKS_RENDER_THREAD: AtomicBool = AtomicBool::new(false);
 
 fn recording_hold() -> MutexGuard<'static, RecordingHold> {
     RECORDING_HOLD.lock().unwrap_or_else(PoisonError::into_inner)
@@ -346,7 +347,10 @@ fn recording_hold() -> MutexGuard<'static, RecordingHold> {
 
 /// Whether a test holds a recording that flies.
 pub(crate) fn recording_is_held_for_testing() -> bool {
-    matches!(*recording_hold(), RecordingHold::Holding)
+    matches!(
+        *recording_hold(),
+        RecordingHold::Holding | RecordingHold::HoldingClaim | RecordingHold::ClaimYielded
+    )
 }
 
 /// Whether the recording about to fly is the one the test hold is armed for.
@@ -396,7 +400,8 @@ pub(crate) fn take_style_flight_claim_hold_for_testing() -> bool {
     if !matches!(*hold, RecordingHold::ArmedForClaim) {
         return false;
     }
-    *hold = RecordingHold::Holding;
+    *hold = RecordingHold::HoldingClaim;
+    CLAIM_HOLD_BLOCKS_RENDER_THREAD.store(true, Ordering::Release);
     true
 }
 
@@ -404,6 +409,20 @@ pub(crate) fn wait_while_recording_is_held_for_testing() {
     let _released = RECORDING_HOLD_RELEASED
         .wait_while(recording_hold(), |hold| matches!(hold, RecordingHold::Holding))
         .unwrap_or_else(PoisonError::into_inner);
+}
+
+/// Waits while the claim hold keeps the Render thread from claiming a style update, and answers whether to claim it: A
+/// hold that gave way to another job leaves the update for the host to take back, as the test holding it expects.
+#[cfg(not(test))]
+pub(crate) fn wait_while_claim_is_held_for_testing() -> bool {
+    let mut hold = RECORDING_HOLD_RELEASED
+        .wait_while(recording_hold(), |hold| matches!(hold, RecordingHold::HoldingClaim))
+        .unwrap_or_else(PoisonError::into_inner);
+    if !matches!(*hold, RecordingHold::ClaimYielded) {
+        return true;
+    }
+    *hold = RecordingHold::Idle;
+    false
 }
 
 /// Holds the next recording that flies before it reads its frame, until
@@ -428,7 +447,24 @@ pub(crate) fn hold_next_style_flight_claim_for_testing() {
 /// Lets the recording held for the test go, or disarms the hold no recording has taken yet.
 pub(crate) fn release_held_recording_for_testing() {
     *recording_hold() = RecordingHold::Idle;
+    CLAIM_HOLD_BLOCKS_RENDER_THREAD.store(false, Ordering::Release);
     RECORDING_HOLD_RELEASED.notify_all();
+}
+
+/// Has the claim hold give way, as it keeps the Render thread from every job after the one it holds: A thread that waits
+/// for one of those, as the collector finalizing a document waits for its layout to be torn down, would wait forever.
+/// The Render thread then leaves the held style update unclaimed, which the host takes back as it would have.
+#[cfg(not(test))]
+pub(crate) fn yield_claim_hold_for_testing() {
+    if !CLAIM_HOLD_BLOCKS_RENDER_THREAD.load(Ordering::Acquire) {
+        return;
+    }
+    let mut hold = recording_hold();
+    if matches!(*hold, RecordingHold::HoldingClaim) {
+        *hold = RecordingHold::ClaimYielded;
+        RECORDING_HOLD_RELEASED.notify_all();
+    }
+    CLAIM_HOLD_BLOCKS_RENDER_THREAD.store(false, Ordering::Release);
 }
 
 /// Records `frame` of the document's `viewport` with `inputs` and `recorder`, which keeps the inputs of a recording that
@@ -449,7 +485,7 @@ pub(crate) fn record_frame(
         published_inputs,
     } = recorder;
     let source = PaintSource::new(&frame, absolute_rects);
-    let (recording, publishes_recording) = paint_order_tree.with_access(inputs.publishes_recording, |tree| {
+    let (mut recording, publishes_recording) = paint_order_tree.with_access(inputs.publishes_recording, |tree| {
         crate::painting::record::traversal::record_display_list(
             &source,
             scratch,
@@ -460,6 +496,12 @@ pub(crate) fn record_frame(
             published_hit_test_items.clone(),
             trace_recordings,
         )
+    });
+    let output = &mut recording.output;
+    output.surface_clear_color = inputs.surface_clear_color;
+    output.async_scrolling_metadata = inputs.async_scrolling_metadata.clone().map(|mut metadata| {
+        metadata.has_blocking_wheel_event_listeners |= output.has_blocking_wheel_event_listeners;
+        metadata
     });
     let trace = trace_recordings.then_some(PendingRecordingTrace {
         viewport,
@@ -487,28 +529,29 @@ pub(crate) fn present(
     pending: PendingRecording,
     recorder: &RecorderState,
     presenting: &mut Presenting,
-) -> RecordingOutput {
-    let output = crate::painting::record::publish::publish_to_presenter(pending, recorder, &mut presentation.presenter);
-    presentation.present(&FfiPresentedRecording::of_output(&output), presenting);
+) -> PresentedOutput {
+    let output = PresentedOutput::of(crate::painting::record::publish::publish_to_presenter(
+        pending, recorder,
+    ));
+    presentation.present(&output.output, presenting);
     output
 }
 
 /// Presents `pending`, which renders SVG images and was recorded with `recorder`, with `presentation`, beside the event
-/// loop, drawing them as the display lists `display_list_ids` names, which the presenter holds, and answers its output.
+/// loop, drawing them as `display_lists`, those the host rendered them as, and answers its output.
 pub(crate) fn present_with_vector_images(
     presentation: &mut Presentation,
     pending: PendingRecording,
     recorder: &RecorderState,
     presenting: &mut Presenting,
-    display_list_ids: &[u64],
-) -> RecordingOutput {
-    let output = crate::painting::record::publish::publish_with_vector_images(
+    display_lists: &[Arc<NestedDisplayList>],
+) -> PresentedOutput {
+    let output = PresentedOutput::of(crate::painting::record::publish::publish_with_vector_images(
         pending,
         recorder,
-        &mut presentation.presenter,
-        display_list_ids,
-    );
-    presentation.present(&FfiPresentedRecording::of_output(&output), presenting);
+        display_lists,
+    ));
+    presentation.present(&output.output, presenting);
     output
 }
 
@@ -696,6 +739,15 @@ impl RecordingSlot {
     /// The trace the pending recording left, for the host to read.
     pub(crate) fn take_pending_recording_trace(&mut self) -> Option<PendingRecordingTrace> {
         self.pending_recording_trace.take()
+    }
+
+    /// The recording the document published last, which the next recording copies from, while no recording is in
+    /// flight.
+    pub(crate) fn published_recording(&self) -> Option<Arc<RecordingOutput>> {
+        match &self.recorder {
+            Recorder::Here(recorder) => recorder.published_recording.clone(),
+            Recorder::InFlight(_) => None,
+        }
     }
 
     /// Whether a recording of the document is in flight.

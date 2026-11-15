@@ -16,7 +16,7 @@ use libjs_rust::api::{
 };
 
 use crate::bindings::async_iterable::{AsyncIterable, END_OF_ITERATION};
-use crate::bindings::conversions::{ArrayBufferView, BufferSource, CppInterface, FromJs};
+use crate::bindings::conversions::{ArrayBufferView, BufferSource, FromJs};
 use crate::bindings::interface::{Ref, Wrappable, allocate, with_temporary_execution_context_and_callbacks};
 use crate::bindings::promise::{
     WebIdlPromise, create_promise, create_rejected_promise, create_rejected_promise_from_exception,
@@ -24,6 +24,7 @@ use crate::bindings::promise::{
 };
 use crate::bindings::structured_data::{TransferDataReader, TransferDataWriter, Transferable};
 use crate::bindings::{CallContext, Exception, MustNotThrow, WebIdlResult};
+use crate::dom::abort_signal::AbortSignal;
 use crate::streams::algorithms::{CancelAlgorithm, PullAlgorithm, SizeAlgorithm, StartAlgorithm};
 use crate::streams::cpp::{CppPromiseAlgorithm, CppPromiseAlgorithmWithArgument};
 use crate::streams::cross_realm_transform::{
@@ -92,7 +93,7 @@ pub(crate) struct StreamPipeOptions {
     pub(crate) prevent_abort: bool,
     pub(crate) prevent_cancel: bool,
     pub(crate) prevent_close: bool,
-    pub(crate) signal: Option<CppInterface>,
+    pub(crate) signal: Option<Ref<AbortSignal>>,
 }
 
 /// The dictionary ReadableStreamIteratorOptions of Streams/ReadableStream.idl, whose members the bindings convert.
@@ -826,7 +827,7 @@ impl ReadableStream {
         prevent_close: bool,
         prevent_abort: bool,
         prevent_cancel: bool,
-        signal: Option<CppInterface>,
+        signal: Option<Ref<AbortSignal>>,
     ) -> Ref<Self> {
         let cx = &this.context(vm);
 
@@ -1340,14 +1341,18 @@ pub(crate) fn readable_stream_fulfill_read_into_request(
 ) {
     // 1. Assert: ! ReadableStreamHasBYOBReader(stream) is true.
     // 2. Let reader be stream.[[reader]].
+    // AD-HOC: Fulfilling a request looks up "then" on the result, so script can run in between two requests of one chunk.
+    //         A lock that it released took the rest of the requests along, and nobody is waiting for this one anymore.
     let Some(ReadableStreamReader::ReadableStreamBYOBReader(reader)) = stream.reader() else {
-        panic!("the stream has a ReadableStreamBYOBReader");
+        return;
     };
 
     // 3. Assert: reader.[[readIntoRequests]] is not empty.
     // 4. Let readIntoRequest be reader.[[readIntoRequests]][0].
     // 5. Remove readIntoRequest from reader.[[readIntoRequests]].
-    let read_into_request = reader.take_first_read_into_request(vm);
+    let Some(read_into_request) = reader.take_first_read_into_request(vm) else {
+        return;
+    };
 
     // 6. If done is true, perform readIntoRequest’s close steps, given chunk.
     if done {
@@ -1363,14 +1368,17 @@ pub(crate) fn readable_stream_fulfill_read_into_request(
 pub(crate) fn readable_stream_fulfill_read_request(vm: &Vm, stream: Ref<ReadableStream>, chunk: Value, done: bool) {
     // 1. Assert: ! ReadableStreamHasDefaultReader(stream) is true.
     // 2. Let reader be stream.[[reader]].
+    // AD-HOC: See readable_stream_fulfill_read_into_request().
     let Some(ReadableStreamReader::ReadableStreamDefaultReader(reader)) = stream.reader() else {
-        panic!("the stream has a ReadableStreamDefaultReader");
+        return;
     };
 
     // 3. Assert: reader.[[readRequests]] is not empty.
     // 4. Let readRequest be reader.[[readRequests]][0].
     // 5. Remove readRequest from reader.[[readRequests]].
-    let read_request = reader.take_first_read_request(vm);
+    let Some(read_request) = reader.take_first_read_request(vm) else {
+        return;
+    };
 
     // 6. If done is true, perform readRequest’s close steps.
     if done {
