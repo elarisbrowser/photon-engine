@@ -1222,6 +1222,8 @@ pub(crate) struct LayoutNodeArena {
     /// Every box must be recreated by the next layout tree build; set when the tree is torn down
     /// or a build finds a box it cannot place among rebuilt roots, cleared by the full pass.
     needs_full_layout_tree_update: bool,
+    partial_layout_microseconds: u64,
+    full_layout_microseconds: u64,
     /// See [`Self::forces_parallel_layout`].
     forces_parallel_layout: bool,
     /// How many layouts were committed, full and partial.
@@ -1338,6 +1340,14 @@ pub(crate) struct LayoutNodeArena {
 }
 
 impl LayoutNodeArena {
+    pub(crate) fn add_partial_layout_microseconds(&mut self, microseconds: u64) {
+        self.partial_layout_microseconds = self.partial_layout_microseconds.saturating_add(microseconds);
+    }
+
+    pub(crate) fn add_full_layout_microseconds(&mut self, microseconds: u64) {
+        self.full_layout_microseconds = self.full_layout_microseconds.saturating_add(microseconds);
+    }
+
     /// The bytes of the columns that name the style record each row is built from.
     pub(crate) fn style_column_heap_size(&self) -> usize {
         self.style_records.row_bytes()
@@ -1373,6 +1383,8 @@ impl LayoutNodeArena {
             pending_rebuilt_subtree_roots: Vec::new(),
             pending_layout_tree_update_escaped_rebuild_roots: false,
             needs_full_layout_tree_update: (false),
+            partial_layout_microseconds: 0,
+            full_layout_microseconds: 0,
             forces_parallel_layout: false,
             layout_commit_count: 0,
             committed_link_holders: ForkVec::default(),

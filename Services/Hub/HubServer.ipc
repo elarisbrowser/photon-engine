@@ -98,6 +98,13 @@ struct WebView::ProcessSnapshot {
     Optional<u64> owner_child_id;
     float cpu_percent;
     u64 memory_usage_bytes;
+    bool has_cpu_statistics;
+    bool has_memory_statistics;
+    Optional<u64> disk_read_bytes;
+    Optional<u64> disk_write_bytes;
+    bool has_network_statistics;
+    u64 network_download_bytes_per_second;
+    u64 network_upload_bytes_per_second;
     Optional<WebView::ProcessPageSnapshot> page;
     Vector<WebView::ProcessTabSnapshot> tabs;
     Vector<WebView::ProcessFrameSnapshot> frames;

@@ -5,6 +5,7 @@
  */
 
 #include <AK/HashTable.h>
+#include <AK/SaturatingMath.h>
 #include <LibRequests/RequestControlClient.h>
 #include <LibWebView/Application.h>
 #include <LibWebView/CanonicalNavigable.h>
@@ -39,7 +40,13 @@ void TabPerformanceMonitor::configure(Requests::RequestControlClient& requests)
         if (!s_monitor || !s_monitor->m_enabled)
             return;
         auto now = MonotonicTime::now();
+        s_monitor->m_process_network_snapshots.clear();
         for (auto const& entry : usage) {
+            if (interval_microseconds != 0) {
+                auto& process_usage = s_monitor->m_process_network_snapshots.ensure(entry.process_id);
+                process_usage.download_bytes_per_second = saturating_add(process_usage.download_bytes_per_second, saturating_mul(entry.download_bytes, 1'000'000ULL) / interval_microseconds);
+                process_usage.upload_bytes_per_second = saturating_add(process_usage.upload_bytes_per_second, saturating_mul(entry.upload_bytes, 1'000'000ULL) / interval_microseconds);
+            }
             Optional<u64> owner;
             WebContentClient::for_each_client([&](WebContentClient& client) {
                 if (client.pid() != entry.process_id)
@@ -59,10 +66,55 @@ void TabPerformanceMonitor::configure(Requests::RequestControlClient& requests)
     };
 }
 
+bool TabPerformanceMonitor::process_network_statistics_enabled()
+{
+    return s_monitor && s_monitor->m_enabled;
+}
+
+void TabPerformanceMonitor::set_memory_pressure(bool pressured)
+{
+    auto& monitor = the();
+    if (monitor.m_memory_pressure == pressured)
+        return;
+    monitor.m_memory_pressure = pressured;
+    monitor.sample();
+}
+
+Optional<ProcessNetworkUsage> TabPerformanceMonitor::process_network_usage(pid_t pid)
+{
+    if (!s_monitor || !s_monitor->m_enabled)
+        return {};
+    return s_monitor->m_process_network_snapshots.get(pid);
+}
+
 void TabPerformanceMonitor::forget_view(u64 view_id)
 {
-    if (s_monitor)
+    if (s_monitor) {
         s_monitor->m_tabs.remove(view_id);
+        s_monitor->m_explicitly_enabled_views.remove(view_id);
+        s_monitor->m_residency_enabled_views.remove(view_id);
+    }
+}
+
+void TabPerformanceMonitor::set_view_enabled(u64 view_id, bool enabled)
+{
+    if (!s_monitor)
+        return;
+    if (enabled)
+        s_monitor->m_explicitly_enabled_views.set(view_id);
+    else
+        s_monitor->m_explicitly_enabled_views.remove(view_id);
+    s_monitor->sample();
+}
+
+void TabPerformanceMonitor::set_view_residency_enabled(u64 view_id, bool enabled)
+{
+    if (!s_monitor)
+        return;
+    if (enabled)
+        s_monitor->m_residency_enabled_views.set(view_id);
+    else
+        s_monitor->m_residency_enabled_views.remove(view_id);
 }
 
 bool TabPerformanceMonitor::set_view_task_queue_diagnostics_enabled(u64, bool)

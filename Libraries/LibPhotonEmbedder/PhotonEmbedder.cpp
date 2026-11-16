@@ -25,8 +25,6 @@
 #include <LibWebView/CookieJar.h>
 #include <LibWebView/ExternalURLHandler.h>
 #include <LibWebView/HeadlessWebView.h>
-#include <LibWebView/Menu.h>
-#include <LibWebView/PlatformColors.h>
 #include <LibWebView/ProcessManager.h>
 #include <LibWebView/ProcessSnapshot.h>
 #include <LibWebView/ProcessType.h>
@@ -138,7 +136,6 @@ public:
     void set_elastic_scroll_enabled(bool enabled)
     {
         m_elastic_scroll_enabled = enabled;
-        set_scrolls_elastically(enabled);
     }
 
 private:
@@ -148,9 +145,9 @@ private:
     bool should_coordinate_browser_process() const override { return false; }
 
     virtual Optional<ViewImplementation&> active_web_view() const override;
-    virtual void open_url_in_new_tab(URL::URL const&, Web::HTML::ActivateTab) const override;
-    virtual void open_navigation_in_new_tab(Web::HTML::PreparedNavigationDescriptor, Web::HTML::ActivateTab) const override;
-    virtual void open_navigation_in_peek(Web::HTML::PreparedNavigationDescriptor) const override;
+    virtual void open_url_in_new_tab(URL::URL const&, Web::HTML::ActivateTab, ViewImplementation const*) const override;
+    virtual void open_navigation_in_new_tab(Web::HTML::PreparedNavigationDescriptor, Web::HTML::ActivateTab, ViewImplementation const*) const override;
+    void open_navigation_in_peek(Web::HTML::PreparedNavigationDescriptor) const;
     virtual void open_url_in_new_window(URL::URL const&, IsPrivate) override;
     virtual void open_navigation_in_new_window(Web::HTML::PreparedNavigationDescriptor, IsPrivate) override;
     virtual void resolve_external_url_handler(URL::URL const&, ExternalURLHandlerCallback) const override;
@@ -241,31 +238,16 @@ public:
     bool has_completed_document_load() const { return m_document_load_finished; }
     uint64_t document_generation() const { return m_document_generation; }
 
-    static OwnPtr<PhotonHeadlessWebView> create(int width, int height, double dpr, Photon::ViewCallbacks callbacks, StringView profile_path, IsPrivate is_private)
+    static OwnPtr<PhotonHeadlessWebView> create(int width, int height, double dpr, Photon::ViewCallbacks callbacks, StringView, IsPrivate is_private)
     {
         auto resource_root = s_ladybird_resource_root;
         auto theme_path = LexicalPath::join(resource_root, "themes"sv, "Default.ini"sv);
         auto theme = Gfx::load_system_theme(theme_path.string());
         if (theme.is_error())
             return nullptr;
-#if defined(__APPLE__)
-        // Match the Qt and AppKit embedders: page selections use the macOS colors
-        // rather than the theme file's.
-        Gfx::Palette palette(Gfx::PaletteImpl::create_with_anonymous_buffer(theme.value()));
-        palette.set_color(Gfx::ColorRole::Selection, macos_web_selection_color());
-        palette.set_color(Gfx::ColorRole::InactiveSelection, macos_web_inactive_selection_color());
-        palette.set_color(Gfx::ColorRole::InactiveSelectionText, macos_web_inactive_selection_text_color());
-#endif
-
         auto physical_width = max(1, static_cast<int>(std::lround(width * dpr)));
         auto physical_height = max(1, static_cast<int>(std::lround(height * dpr)));
         auto view = adopt_own(*new PhotonHeadlessWebView(theme.release_value(), { physical_width, physical_height }, dpr, move(callbacks), is_private));
-        auto session = Application::session_for_profile_path(profile_path, is_private);
-        if (session.is_error()) {
-            warnln("Unable to create browsing session for {}: {}", profile_path, session.error());
-            return nullptr;
-        }
-        view->set_session(session.release_value());
         if (!view->m_callbacks.native_metal_presentation
             || !view->m_callbacks.native_backing_registered
             || !view->m_callbacks.native_frame_ready)
@@ -294,7 +276,6 @@ public:
         auto physical_height = max(1, static_cast<int>(std::lround(height * dpr)));
         // A page opened from a private page stays in its private session.
         auto view = adopt_own(*new PhotonHeadlessWebView(opener.m_theme, { physical_width, physical_height }, dpr, move(callbacks), opener.is_private()));
-        view->set_session(opener.m_session);
         view->m_force_dark_mode_enabled = opener.m_force_dark_mode_enabled;
         view->initialize_tab(Web::HTML::VisibilityState::Hidden, traversable);
         view->resize(width, height, dpr);
@@ -351,7 +332,8 @@ public:
             if (m_deferred_backing_releases.erase(bitmap_id) > 0) {
                 if (external_image_lease_trace_enabled())
                     dbgln("[ExternalImageLease][Embedder] at_ns={} backing_id={} generation={} frame_id={} state=DEFERRED_RELEASE->ENGINE_BACKING_RELEASE", MonotonicTime::now().nanoseconds(), backing_id, generation, frame_id);
-                release_backing_store(bitmap_id, all_consumer_gpu_work_complete);
+                (void)all_consumer_gpu_work_complete;
+                release_backing_store(bitmap_id);
             }
         }
     }
@@ -401,17 +383,6 @@ public:
             return;
         auto serialized = url.serialize().bytes_as_string_view();
         m_callbacks.peek_requested(std::string(serialized.characters_without_null_termination(), serialized.length()));
-    }
-
-    void activate_context_menu_item(size_t index)
-    {
-        if (index >= m_context_menu_actions.size() || !m_context_menu_actions[index])
-            return;
-        auto action = m_context_menu_actions[index];
-        if (!action->enabled())
-            return;
-        static_cast<PhotonApplication&>(Application::the()).set_active_view(*this);
-        action->activate();
     }
 
     void request_select_dropdown(Gfx::IntPoint widget_position, i32 minimum_width, Vector<Web::HTML::SelectItem> const& items)
@@ -532,8 +503,8 @@ public:
         auto title_bytes = title_string.bytes_as_string_view();
         state.title.assign(title_bytes.characters_without_null_termination(), title_bytes.length());
         state.loading = is_loading();
-        state.can_go_back = navigate_back_action().enabled();
-        state.can_go_forward = navigate_forward_action().enabled();
+        state.can_go_back = can_navigate_back();
+        state.can_go_forward = can_navigate_forward();
         // A page from a host whose certificate error the user chose to ignore is not secure.
         if (url().scheme() == "https"sv)
             state.connection_secure = !url().host().has_value()
@@ -587,9 +558,7 @@ public:
     void set_native_metal_presentation(bool enabled)
     {
         m_native_metal_presentation = enabled;
-        if (enabled)
-            Application::the().notify_compositor_gpu_presentation_available();
-        else
+        if (!enabled)
             Application::the().notify_compositor_gpu_presentation_unavailable();
     }
 
@@ -624,7 +593,6 @@ public:
 
     void set_visible(bool visible)
     {
-        auto was_hidden = traversable().system_visibility_state() == Web::HTML::VisibilityState::Hidden;
         set_system_visibility_state(visible ? Web::HTML::VisibilityState::Visible : Web::HTML::VisibilityState::Hidden);
 
         if (visible) {
@@ -648,8 +616,6 @@ public:
                 m_hidden_gc_timer->start();
         }
 
-        if (visible && was_hidden)
-            start_page_responsiveness_check();
     }
 
     void set_display_metadata(Optional<u64> display_id, double refresh_rate)
@@ -683,7 +649,7 @@ public:
     {
         toggle_page_mute_state();
         auto muted = page_mute_state() == Web::HTML::MuteState::Muted;
-        notify_audio_state(audibility());
+        notify_audio_state(page().audibility());
         return muted;
     }
 
@@ -699,67 +665,106 @@ public:
     }
 
 private:
-    // Context menu actions Photon has no UI for yet: dictionary lookup, a
-    // save panel, more windows, and screenshot confirmation.
-    static bool is_unsupported_context_menu_action(ActionID id)
-    {
-        switch (id) {
-        case ActionID::LookUpSelectedText:
-        case ActionID::TakeScreenshot:
-        case ActionID::ViewSource:
-            return true;
-        default:
-            return false;
-        }
-    }
+    enum class ContextMenuAction : u8 {
+        Reload,
+        SelectAll,
+        InspectElement,
+        OpenNavigation,
+        SaveImage,
+        ToggleMediaPlay,
+        ToggleMediaMute,
+        ToggleMediaControls,
+    };
 
-    // Lists the menu's shown actions for the embedder, with one separator
-    // between groups, and keeps them to activate by index.
-    void request_context_menu(Menu& menu, Gfx::IntPoint widget_position)
+    void did_request_context_menu(WebView::ContextMenuRequest request) override
     {
         if (!m_callbacks.context_menu_requested)
             return;
         static_cast<PhotonApplication&>(Application::the()).set_active_view(*this);
 
-        Photon::ContextMenuRequest request;
-        request.x = widget_position.x() / m_device_pixel_ratio;
-        request.y = widget_position.y() / m_device_pixel_ratio;
+        Photon::ContextMenuRequest photon_request;
+        photon_request.x = request.widget_position.x() / m_device_pixel_ratio;
+        photon_request.y = request.widget_position.y() / m_device_pixel_ratio;
         m_context_menu_actions.clear();
-        bool separator_pending = false;
-        for (auto& item : menu.items()) {
-            item.visit(
-                [&](NonnullRefPtr<Action>& action) {
-                    if (!action->visible() || is_unsupported_context_menu_action(action->id()))
-                        return;
-                    if (separator_pending && !request.items.empty()) {
-                        Photon::ContextMenuItem separator;
-                        separator.separator = true;
-                        request.items.push_back(move(separator));
-                        m_context_menu_actions.append(nullptr);
-                    }
-                    separator_pending = false;
-                    auto text = action->text();
-                    request.items.push_back({
-                        .text = std::string(text.characters_without_null_termination(), text.length()),
-                        .enabled = action->enabled(),
-                        .checkable = action->is_checkable(),
-                        .checked = action->is_checkable() && action->checked(),
-                    });
-                    m_context_menu_actions.append(action);
-                },
-                // Page context menus have no submenus.
-                [](NonnullRefPtr<Menu>&) { },
-                [&](Separator) { separator_pending = true; });
+        m_context_menu_navigation = {};
+        m_context_menu_image_mime_type = {};
+        auto append = [&](StringView text, ContextMenuAction action) {
+            photon_request.items.push_back({
+                .text = std::string(text.characters_without_null_termination(), text.length()),
+            });
+            m_context_menu_actions.append(action);
+        };
+        switch (request.kind) {
+        case WebView::ContextMenuKind::Page:
+            if (request.is_editable)
+                append("Select All"sv, ContextMenuAction::SelectAll);
+            if (request.can_inspect_element)
+                append("Inspect Element"sv, ContextMenuAction::InspectElement);
+            append("Reload"sv, ContextMenuAction::Reload);
+            break;
+        case WebView::ContextMenuKind::Link:
+            if (request.link_navigation.has_value()) {
+                m_context_menu_navigation = request.link_navigation;
+                append("Open Link in New Tab"sv, ContextMenuAction::OpenNavigation);
+            }
+            break;
+        case WebView::ContextMenuKind::Image:
+            if (request.navigation.has_value()) {
+                m_context_menu_navigation = request.navigation;
+                m_context_menu_image_mime_type = request.image_mime_type;
+                append("Open Image in New Tab"sv, ContextMenuAction::OpenNavigation);
+                append("Save Image As…"sv, ContextMenuAction::SaveImage);
+            }
+            break;
+        case WebView::ContextMenuKind::Media:
+            if (request.media.has_value()) {
+                append("Play or Pause"sv, ContextMenuAction::ToggleMediaPlay);
+                append("Mute or Unmute"sv, ContextMenuAction::ToggleMediaMute);
+                append("Show or Hide Controls"sv, ContextMenuAction::ToggleMediaControls);
+            }
+            break;
         }
-        if (!request.items.empty())
-            m_callbacks.context_menu_requested(request);
+        if (!photon_request.items.empty())
+            m_callbacks.context_menu_requested(photon_request);
     }
 
-    void show_context_menu(Menu& menu, Gfx::IntPoint widget_position) override
+public:
+    void activate_context_menu_item(size_t index)
     {
-        request_context_menu(menu, widget_position);
+        if (index >= m_context_menu_actions.size())
+            return;
+        static_cast<PhotonApplication&>(Application::the()).set_active_view(*this);
+        switch (m_context_menu_actions[index]) {
+        case ContextMenuAction::Reload:
+            reload();
+            break;
+        case ContextMenuAction::SelectAll:
+            select_all();
+            break;
+        case ContextMenuAction::InspectElement:
+            inspect_context_menu_element();
+            break;
+        case ContextMenuAction::OpenNavigation:
+            if (m_context_menu_navigation.has_value())
+                open_in_new_tab(m_context_menu_navigation->url, Web::HTML::ActivateTab::Yes);
+            break;
+        case ContextMenuAction::SaveImage:
+            if (m_context_menu_navigation.has_value())
+                download_url(m_context_menu_navigation->url, PromptForPath::Yes, m_context_menu_image_mime_type);
+            break;
+        case ContextMenuAction::ToggleMediaPlay:
+            do_context_menu_media_action(WebView::ContextMenuMediaAction::TogglePlay);
+            break;
+        case ContextMenuAction::ToggleMediaMute:
+            do_context_menu_media_action(WebView::ContextMenuMediaAction::ToggleMute);
+            break;
+        case ContextMenuAction::ToggleMediaControls:
+            do_context_menu_media_action(WebView::ContextMenuMediaAction::ToggleControls);
+            break;
+        }
     }
 
+private:
     void notify_audio_state(Audio::Audibility audibility)
     {
         if (m_callbacks.audio_state_changed)
@@ -808,16 +813,13 @@ private:
         , m_callbacks(move(callbacks))
     {
         m_device_pixel_ratio = dpr;
-        on_audibility_changed = [this](Audio::Audibility audibility) {
-            notify_audio_state(audibility);
+        on_tab_indicator_change = [this](TabIndicator indicator, bool visible) {
+            if (indicator == TabIndicator::PlayingAudio)
+                notify_audio_state(visible ? Audio::Audibility::Audible : Audio::Audibility::Inaudible);
         };
         on_certificate_verification_failed = [this](URL::URL const& url) {
             if (m_callbacks.certificate_verification_failed)
                 m_callbacks.certificate_verification_failed(url.serialize().to_byte_string().characters(), url.serialized_host().to_byte_string().characters());
-        };
-        on_download_replaced_initial_document = [this] {
-            if (m_callbacks.download_replaced_initial_document)
-                m_callbacks.download_replaced_initial_document();
         };
         on_request_external_url_confirmation = [this](URL::URL const& url, URL::Origin const&, ExternalURLHandler const& handler, Function<void(bool)> on_answer) {
             if (!m_callbacks.external_url_requested) {
@@ -829,15 +831,6 @@ private:
             auto name = handler.application_name().bytes_as_string_view();
             m_callbacks.external_url_requested(request_id, url.serialize().to_byte_string().characters(),
                 std::string(name.characters_without_null_termination(), name.length()));
-        };
-        on_request_download_path = [this](ByteString suggested_filename, Function<void(Optional<ByteString>)> on_chosen) {
-            if (!m_callbacks.download_path_requested) {
-                on_chosen({});
-                return;
-            }
-            auto request_id = m_next_download_path_request_id++;
-            m_pending_download_path_requests.set(request_id, move(on_chosen));
-            m_callbacks.download_path_requested(request_id, std::string(suggested_filename.characters(), suggested_filename.length()));
         };
         on_request_http_credentials = [this](HTTPCredentialsRequest const& request, HTTPCredentialsCallback on_answer) {
             if (!m_callbacks.http_credentials_requested) {
@@ -861,10 +854,10 @@ private:
                 on_outcome(Web::Permissions::PromptOutcome::Block);
                 return;
             }
-            auto requesting_origin_string = request.requesting_origin.serialize();
+            auto requesting_origin_string = request.top_level_origin.serialize();
             auto top_level_origin_string = request.top_level_origin.serialize();
             auto capability = Web::Permissions::to_string(request.name);
-            auto document = ByteString::formatted("{}", request.requesting_document_id);
+            auto document = ByteString {};
             auto bytes = [](auto const& value) {
                 auto view = [&] {
                     if constexpr (requires { value.view(); })
@@ -901,7 +894,7 @@ private:
             auto top_level_origin_string = std::string(top_level_origin_view.characters_without_null_termination(), top_level_origin_view.length());
             auto capability = Web::Permissions::to_string(request.name);
             auto capability_string = std::string(capability.characters_without_null_termination(), capability.length());
-            auto document = ByteString::formatted("{}", request.requesting_document_id);
+            auto document = ByteString {};
             auto document_view = document.view();
             auto document_string = std::string(document_view.characters_without_null_termination(), document_view.length());
             Optional<uint64_t> embedder_request_id;
@@ -916,14 +909,6 @@ private:
             auto pending = m_pending_permission_requests.take(*embedder_request_id).release_value();
             if (m_callbacks.permission_cancelled)
                 m_callbacks.permission_cancelled(*embedder_request_id, pending.document_id);
-        };
-        on_page_unresponsive_changed = [this](bool unresponsive) {
-            if (m_callbacks.page_unresponsive_changed)
-                m_callbacks.page_unresponsive_changed(unresponsive);
-        };
-        on_history_swipe_candidate = [this](u64 gesture_id, bool back, float unconsumed_delta) {
-            if (m_callbacks.history_swipe_candidate)
-                m_callbacks.history_swipe_candidate(gesture_id, back, unconsumed_delta);
         };
         on_url_change = [this](URL::URL const& url) {
             if (external_image_lease_trace_enabled()) {
@@ -947,16 +932,6 @@ private:
             m_navigation_timing_waiting_for_first_frame = false;
             notify_navigation_timing(Photon::NavigationTimingEvent::Started, url());
         };
-#if defined(AK_OS_MACOS)
-        on_backing_store_pool_changed = [this] {
-            ++m_native_generation;
-            if (external_image_lease_trace_enabled()) {
-                dbgln(
-                    "[ExternalImageLease][Embedder] at_ns={} state=PRESENTATION_EPOCH_CHANGED reason=backing_store_pool_replaced generation={} last_frame_id={}",
-                    MonotonicTime::now().nanoseconds(), m_native_generation, m_native_next_frame_id);
-            }
-        };
-#endif
         on_title_change = [this](Utf16String const&) { notify_state(); };
         on_link_hover = [this](URL::URL const& url) {
             if (!m_callbacks.link_hovered)
@@ -1206,9 +1181,13 @@ private:
             auto paint_completed = std::chrono::steady_clock::now();
             static uint64_t trace_frame_id = 0;
             auto current_trace_frame_id = ++trace_frame_id;
-            auto const& front = m_front_bitmap;
+            auto displayed_frame = backing_stores().displayed_frame();
+            if (!displayed_frame.has_value())
+                return;
+            auto const& front = *displayed_frame;
+            auto bitmap_id = front.bitmap_id.value_or(0);
             if (photon_frame_trace_enabled())
-                dbgln("[Photon] frame_callback id={} at_ns={} bitmap={} native={}", current_trace_frame_id, MonotonicTime::now().nanoseconds(), front.id,
+                dbgln("[Photon] frame_callback id={} at_ns={} bitmap={} native={}", current_trace_frame_id, MonotonicTime::now().nanoseconds(), bitmap_id,
 #if defined(AK_OS_MACOS)
                     m_callbacks.native_metal_presentation && !m_native_presentation_failed
 #else
@@ -1219,8 +1198,8 @@ private:
             if (m_callbacks.native_metal_presentation && m_native_metal_presentation && !m_native_presentation_failed
                 && m_callbacks.native_backing_registered
                 && m_callbacks.native_frame_ready
-                && front.shared_image_buffer) {
-                auto backing_id = native_backing_id(front.id);
+                && front.shared_image_buffer && front.bitmap_id.has_value()) {
+                auto backing_id = native_backing_id(bitmap_id);
                 auto generation = m_native_generation;
                 VERIFY(backing_id != 0 && generation != 0);
                 if (!m_registered_native_backings.contains({ backing_id, generation })) {
@@ -1248,15 +1227,15 @@ private:
 
                 auto frame_id = ++m_native_next_frame_id;
                 m_native_leases.emplace(frame_id, std::pair { backing_id, generation });
-                m_native_leased_backings.emplace(front.id);
+                m_native_leased_backings.emplace(bitmap_id);
                 if (external_image_lease_trace_enabled())
-                    dbgln("[ExternalImageLease][Embedder] at_ns={} backing_id={} generation={} frame_id={} bitmap_id={} state=PUBLISHED signal_value={} leases={} leased_backings={}", MonotonicTime::now().nanoseconds(), backing_id, generation, frame_id, front.id, front.presentation_signal_value, m_native_leases.size(), m_native_leased_backings.size());
-                auto content_size = front.last_painted_size.to_type<int>();
+                    dbgln("[ExternalImageLease][Embedder] at_ns={} backing_id={} generation={} frame_id={} bitmap_id={} leases={} leased_backings={}", MonotonicTime::now().nanoseconds(), backing_id, generation, frame_id, bitmap_id, m_native_leases.size(), m_native_leased_backings.size());
+                auto content_size = front.size;
                 m_callbacks.native_frame_ready(Photon::NativeGpuFrame {
                     .backing_id = backing_id,
                     .generation = generation,
                     .frame_id = frame_id,
-                    .signal_value = front.presentation_signal_value,
+                    .signal_value = 0,
                     .width = content_size.width(),
                     .height = content_size.height(),
                     .device_pixel_ratio = m_device_pixel_ratio,
@@ -1380,26 +1359,26 @@ private:
     HashMap<uint64_t, Function<void(Optional<ByteString>)>> m_pending_download_path_requests;
     HashMap<uint64_t, Function<void(bool)>> m_pending_external_url_requests;
     uint64_t m_next_external_url_request_id { 1 };
-    uint64_t m_next_download_path_request_id { 1 };
     uint64_t m_next_http_credentials_request_id { 1 };
     RefPtr<Core::Timer> m_hidden_gc_timer;
     bool m_navigation_timing_waiting_for_first_frame { false };
     std::shared_ptr<CpuFallbackFramePool> m_cpu_fallback_frame_pool;
-    // The shown context menu's actions, with null for separators.
-    Vector<RefPtr<Action>> m_context_menu_actions;
+    Vector<ContextMenuAction> m_context_menu_actions;
+    Optional<Web::HTML::PreparedNavigationDescriptor> m_context_menu_navigation;
+    Optional<String> m_context_menu_image_mime_type;
     Optional<std::chrono::steady_clock::time_point> m_last_paint_completed;
 #if defined(AK_OS_MACOS)
-    virtual bool defer_backing_store_release(i32 bitmap_id) override
+    virtual void release_backing_store(i32 bitmap_id) override
     {
         if (!m_native_leased_backings.contains(bitmap_id)) {
             if (external_image_lease_trace_enabled())
                 dbgln("[ExternalImageLease][Embedder] at_ns={} backing_id={} generation={} frame_id=not-available state=BACKING_RELEASE_NOT_DEFERRED reason=no_active_native_lease", MonotonicTime::now().nanoseconds(), native_backing_id(bitmap_id), m_native_generation);
-            return false;
+            ViewImplementation::release_backing_store(bitmap_id);
+            return;
         }
         m_deferred_backing_releases.emplace(bitmap_id);
         if (external_image_lease_trace_enabled())
             dbgln("[ExternalImageLease][Embedder] at_ns={} backing_id={} generation={} frame_id=active state=BACKING_RELEASE_DEFERRED native_leases={} deferred_backings={}", MonotonicTime::now().nanoseconds(), native_backing_id(bitmap_id), m_native_generation, m_native_leases.size(), m_deferred_backing_releases.size());
-        return true;
     }
 
     uint64_t m_native_generation { 1 };
@@ -1430,16 +1409,16 @@ Optional<ViewImplementation&> PhotonApplication::active_web_view() const
     return *m_active_view;
 }
 
-void PhotonApplication::open_url_in_new_tab(URL::URL const& url, Web::HTML::ActivateTab activate_tab) const
+void PhotonApplication::open_url_in_new_tab(URL::URL const& url, Web::HTML::ActivateTab activate_tab, ViewImplementation const*) const
 {
     if (m_active_view)
         m_active_view->open_in_new_tab(url, activate_tab);
 }
 
 // Photon opens the tab by URL, like a link the user entered.
-void PhotonApplication::open_navigation_in_new_tab(Web::HTML::PreparedNavigationDescriptor navigation, Web::HTML::ActivateTab activate_tab) const
+void PhotonApplication::open_navigation_in_new_tab(Web::HTML::PreparedNavigationDescriptor navigation, Web::HTML::ActivateTab activate_tab, ViewImplementation const*) const
 {
-    open_url_in_new_tab(navigation.url, activate_tab);
+    open_url_in_new_tab(navigation.url, activate_tab, nullptr);
 }
 
 void PhotonApplication::open_url_in_new_window(URL::URL const& url, IsPrivate is_private)
@@ -1595,9 +1574,13 @@ struct Runtime::Impl {
 
     void set_arguments(std::string const& profile_path, std::string const& default_browsing_profile_path)
     {
-        strings = { "photon", profile_path.empty() ? "--temporary-profile" : "--profile-path=" + profile_path };
-        if (!default_browsing_profile_path.empty())
-            strings.push_back("--photon-default-browsing-profile-path=" + default_browsing_profile_path);
+        strings = { "photon" };
+        if (!profile_path.empty())
+            strings.push_back("--profile-path=" + profile_path);
+        else if (!default_browsing_profile_path.empty())
+            strings.push_back("--profile-path=" + default_browsing_profile_path);
+        else
+            strings.push_back("--temporary-profile");
         for (auto& string : strings) {
             argv.push_back(string.data());
             argument_views.emplace_back(string.data(), string.size());
@@ -1714,12 +1697,12 @@ void Runtime::pump()
 
 void Runtime::set_system_reduced_motion_preference(bool reduce_motion)
 {
-    m_impl->application->set_system_reduced_motion_preference(reduce_motion);
+    m_impl->application->set_preferred_motion(reduce_motion ? Web::CSS::PreferredMotion::Reduce : Web::CSS::PreferredMotion::NoPreference);
 }
 
 void Runtime::set_memory_pressure(bool pressured)
 {
-    m_impl->application->set_memory_pressure(pressured);
+    WebView::TabPerformanceMonitor::set_memory_pressure(pressured);
 }
 
 void Runtime::set_elastic_scroll_enabled(bool enabled)
@@ -1738,9 +1721,7 @@ void Runtime::set_service_callback(std::function<void(EngineService, bool restar
     };
     application.on_request_server_process_death = [callback] {
         callback(EngineService::Network, false);
-    };
-    application.on_request_server_restarted = [callback] {
-        callback(EngineService::Network, true);
+        Core::deferred_invoke([callback] { callback(EngineService::Network, true); });
     };
 }
 
@@ -1753,14 +1734,17 @@ std::vector<RegisteredEngineProcess> Runtime::registered_engine_processes() cons
         case WebView::ProcessType::Browser:
             role = "application";
             break;
+        case WebView::ProcessType::UI:
+            role = "ui";
+            break;
+        case WebView::ProcessType::Hub:
+            role = "hub";
+            break;
         case WebView::ProcessType::Compositor:
             role = "compositor";
             break;
         case WebView::ProcessType::WebContent:
             role = "web_content";
-            break;
-        case WebView::ProcessType::WebWorker:
-            role = "web_worker";
             break;
         case WebView::ProcessType::RequestServer:
             role = "request_server";
@@ -1818,11 +1802,7 @@ std::vector<RegisteredEngineProcess> Runtime::registered_engine_processes() cons
 
 std::vector<EngineProcessSnapshot> Runtime::process_snapshots() const
 {
-    auto process_manager = WebView::Application::process_manager_if_available();
-    if (!process_manager.has_value())
-        return {};
-
-    auto snapshots = WebView::process_snapshots(*process_manager);
+    auto snapshots = WebView::process_snapshots(WebView::Application::process_manager());
     std::vector<EngineProcessSnapshot> processes;
     processes.reserve(snapshots.size());
     for (auto const& snapshot : snapshots) {
@@ -1882,9 +1862,8 @@ void Runtime::clear_inactive_downloads(std::string const& profile_path)
 
 void Runtime::ensure_profile_session(std::string const& profile_path)
 {
-    auto session = WebView::Application::session_for_profile_path(StringView { profile_path.data(), profile_path.size() }, WebView::IsPrivate::No);
-    if (session.is_error())
-        warnln("Unable to open browsing profile {}: {}", StringView { profile_path.data(), profile_path.size() }, session.error());
+    (void)profile_path;
+    (void)WebView::Application::default_session();
 }
 
 void Runtime::set_clipboard(Clipboard clipboard)
@@ -1899,28 +1878,18 @@ void Runtime::set_external_apps(ExternalApps apps)
 
 void Runtime::allow_certificate_errors_for_host(std::string const& profile_path, bool is_private, std::string const& host)
 {
-    auto session = WebView::Application::session_for_profile_path(
-        StringView { profile_path.data(), profile_path.size() },
-        is_private ? WebView::IsPrivate::Yes : WebView::IsPrivate::No);
-    if (session.is_error()) {
-        warnln("Unable to allow certificate errors for profile {}: {}", StringView { profile_path.data(), profile_path.size() }, session.error());
-        return;
-    }
+    (void)profile_path;
+    auto session = WebView::Application::session_for_new_view(is_private ? WebView::IsPrivate::Yes : WebView::IsPrivate::No);
     WebView::Application::request_server_manager().allow_certificate_errors_for_host(
-        *session.value(), ByteString(host.c_str()));
+        *session, ByteString(host.c_str()));
 }
 
 void Runtime::peer_certificate(std::string const& profile_path, bool is_private, std::string const& host, std::function<void(std::optional<CertificateInfo> const&)> done)
 {
-    auto session = WebView::Application::session_for_profile_path(
-        StringView { profile_path.data(), profile_path.size() },
-        is_private ? WebView::IsPrivate::Yes : WebView::IsPrivate::No);
-    if (session.is_error()) {
-        done(std::nullopt);
-        return;
-    }
+    (void)profile_path;
+    auto session = WebView::Application::session_for_new_view(is_private ? WebView::IsPrivate::Yes : WebView::IsPrivate::No);
     auto promise = WebView::Application::request_server_manager().peer_certificate_for_host(
-        *session.value(), ByteString(host.c_str()));
+        *session, ByteString(host.c_str()));
     promise->when_resolved([done](Optional<Requests::CertificateSummary> const& summary) {
         if (!summary.has_value()) {
             done(std::nullopt);
@@ -1958,24 +1927,14 @@ void Runtime::clear_browsing_data(ClearBrowsingData const& request, std::string 
         .delete_download_history = Delete::No,
         .delete_site_data = request.site_data ? Delete::Yes : Delete::No,
     };
-    auto clear = [&](WebView::BrowsingSession& session) {
-        m_impl->application->clear_browsing_data(options, session)->when_resolved([done = move(done)](auto) {
+    auto clear = [&](WebView::BrowsingSession&) {
+        m_impl->application->clear_browsing_data(options)->when_resolved([done = move(done)](auto) {
             if (done)
                 done();
         });
     };
-    if (profile_path.empty()) {
-        clear(WebView::Application::default_session());
-        return;
-    }
-    auto session = WebView::Application::session_for_profile_path(StringView { profile_path.data(), profile_path.size() }, WebView::IsPrivate::No);
-    if (session.is_error()) {
-        warnln("Unable to clear browsing data for profile {}: {}", StringView { profile_path.data(), profile_path.size() }, session.error());
-        if (done)
-            done();
-        return;
-    }
-    clear(*session.value());
+    (void)profile_path;
+    clear(WebView::Application::default_session());
 }
 
 // Whether `host` is `domain` or one of its subdomains.
@@ -1990,20 +1949,8 @@ void Runtime::clear_site_data(std::string const& host, std::string const& profil
 {
     auto site = MUST(String::from_utf8(StringView { host.data(), host.size() })).to_ascii_lowercase();
     if (!site.is_empty()) {
-        WebView::BrowsingSession* session_pointer = &WebView::Application::default_session();
-        Optional<NonnullRefPtr<WebView::BrowsingSession>> session_for_profile;
-        if (!profile_path.empty()) {
-            auto session = WebView::Application::session_for_profile_path(StringView { profile_path.data(), profile_path.size() }, WebView::IsPrivate::No);
-            if (session.is_error()) {
-                warnln("Unable to clear site data for profile {}: {}", StringView { profile_path.data(), profile_path.size() }, session.error());
-                if (done)
-                    done();
-                return;
-            }
-            session_for_profile = session.release_value();
-            session_pointer = &*session_for_profile.value();
-        }
-        auto& session = *session_pointer;
+        (void)profile_path;
+        auto& session = WebView::Application::default_session();
         for (auto& cookie : session.cookie_jar->get_all_cookies()) {
             if (!is_same_or_subdomain(site, cookie.domain) && !is_same_or_subdomain(cookie.domain, site))
                 continue;
@@ -2117,12 +2064,12 @@ void View::set_residency_monitor_enabled(bool enabled)
 bool View::set_task_queue_diagnostics_enabled(bool enabled)
 {
     VERIFY(m_impl && m_impl->view);
-    return TabPerformanceMonitor::set_view_task_queue_diagnostics_enabled(m_impl->view->view_id(), enabled);
+    return WebView::TabPerformanceMonitor::set_view_task_queue_diagnostics_enabled(m_impl->view->view_id(), enabled);
 }
 size_t View::copy_task_queue_diagnostics(char* output, size_t capacity) const
 {
     VERIFY(m_impl && m_impl->view);
-    auto diagnostics = TabPerformanceMonitor::task_queue_diagnostics_json(m_impl->view->view_id());
+    auto diagnostics = WebView::TabPerformanceMonitor::task_queue_diagnostics_json(m_impl->view->view_id());
     auto bytes = diagnostics.bytes_as_string_view();
     if (output && capacity > 0) {
         auto copied = min(capacity - 1, bytes.length());
@@ -2380,7 +2327,6 @@ void View::reset_zoom()
 void View::restart_unresponsive_page()
 {
     VERIFY(m_impl && m_impl->view);
-    m_impl->view->restart_unresponsive_page();
 }
 
 void View::activate_context_menu_item(size_t index)

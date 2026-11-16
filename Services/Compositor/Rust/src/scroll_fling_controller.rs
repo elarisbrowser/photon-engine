@@ -143,9 +143,12 @@ impl ScrollFlingController {
             scroll_gesture_phase: phase,
             click_count: 0,
             async_scroll_performed_default_action: false,
+            history_swipe_back_enabled: false,
+            history_swipe_forward_enabled: false,
             // The IDs of UI input events start at 1. Thus, ID 0 does not match a UI event.
             id: 0,
             scrollbar_dragged_by_compositor: None,
+            history_swipe_gesture_id: 0,
             pointer_data: PointerInputData { properties: None },
             wheel_gesture_mark: active.wheel_gesture_mark.clone(),
         }

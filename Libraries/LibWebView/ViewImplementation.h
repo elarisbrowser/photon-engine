@@ -122,6 +122,13 @@ struct PermissionPromptRequest {
 
 using PermissionPromptCallback = Function<void(Web::Permissions::PromptOutcome)>;
 
+struct HTTPCredentialsRequest {
+    URL::URL url;
+    String realm;
+};
+
+using HTTPCredentialsCallback = Function<void(Optional<String> username, Optional<String> password)>;
+
 // One permission as the site information panel shows it for the site a view shows.
 struct SitePermissionRow {
     Web::Permissions::PermissionName name;
@@ -162,6 +169,7 @@ public:
     void set_site_permission(URL::Origin const&, Web::Permissions::PermissionName, Optional<PermissionDecision>);
     void reset_site_permissions(URL::Origin const&);
     void did_request_permission(Badge<WebContentPage>, Web::Permissions::PermissionName);
+    void did_request_http_credentials(Badge<WebContentPage>, WebContentPage&, u64 request_id, URL::URL, String realm);
 
     MicrophoneAuthorization microphone_authorization() const;
     // Calls back with whether the system lets the browser use the microphone, once the system has asked the user if it
@@ -619,6 +627,7 @@ public:
     Function<void()> on_close;
     Function<void(URL::URL const&)> on_link_hover;
     Function<void()> on_link_unhover;
+    Function<void(URL::URL const&)> on_certificate_verification_failed;
     Function<void(Utf16String const&)> on_title_change;
     Function<void(URL::URL const&)> on_url_change;
     Function<void()> on_load_start;
@@ -689,6 +698,7 @@ public:
     Function<void(WebContentPage& requesting_page, u64 request_id, Web::HTML::CrossProcessId document_id)> on_start_geolocation_position_watch;
     Function<void(WebContentPage& requesting_page, u64 request_id)> on_stop_geolocation_position_watch;
     Function<void(PermissionPromptRequest const&, PermissionPromptCallback)> on_request_permission;
+    Function<void(HTTPCredentialsRequest const&, HTTPCredentialsCallback)> on_request_http_credentials;
     Function<void(PermissionPromptRequest const&)> on_cancel_permission_prompt;
     Function<void(TabIndicator, bool visible)> on_tab_indicator_change;
     Function<void(Web::HTML::FileFilter const& accepted_file_types, Web::HTML::AllowMultipleFiles)> on_request_file_picker;

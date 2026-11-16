@@ -123,16 +123,6 @@ ErrorOr<int> ladybird_main(Main::Arguments arguments)
     if (!disable_sandbox)
         TRY(Compositor::apply_sandbox(mach_server_name, cache_path, resource_root));
 
-    // Compile the GPU programs recent sessions used before pages need them, one per turn of the event loop so that a
-    // frame waits for one compile at most rather than for every program its first paint uses.
-    RefPtr<Core::Timer> precompile_timer;
-    if (skia_backend_context) {
-        precompile_timer = Core::Timer::create_repeating(AK::Duration::from_milliseconds(0), [context = skia_backend_context, &precompile_timer] {
-            if (!context->precompile_next_shader())
-                precompile_timer->stop();
-        });
-        precompile_timer->start();
-    }
     Optional<Gfx::GpuDeviceIdentity> gpu_device_identity;
 #ifdef USE_VULKAN_DMABUF_IMAGES
     // Hardware decoding only starts once the GPU it decodes on is named, which is only done when its frames can be imported.

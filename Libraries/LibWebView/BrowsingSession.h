@@ -42,19 +42,13 @@ public:
     OwnPtr<BlobURLStore> blob_url_store;
     OwnPtr<HSTSStore> hsts_store;
     OwnPtr<PermissionManager> permission_manager;
-    OwnPtr<BookmarkStore> owned_bookmark_store;
     OwnPtr<DownloadStore> owned_download_store;
-
-    BookmarkStore& bookmark_store() const;
-    void share_bookmark_store_with(BrowsingSession&);
 
     // Persistent identity and cache root for this browsing context. Private sessions leave these empty.
     ByteString profile_identity;
     ByteString cache_path;
 
 private:
-    BookmarkStore* m_shared_bookmark_store { nullptr };
-
     explicit BrowsingSession(IsPrivate);
 
     u64 m_id { 0 };

@@ -9,8 +9,7 @@ set(photon_engine_resources
     "Base/res/ladybird/ladybird.css|ladybird"
     "Base/res/ladybird/utils.js|ladybird"
     "Base/res/ladybird/templates/error.html|ladybird/templates"
-    "WebCompat/cnn.com.json|ladybird/site-compatibility"
-    "WebCompat/nytimes.com.json|ladybird/site-compatibility"
+    "Base/res/ladybird/WebCompat.json|ladybird"
 )
 
 set(photon_engine_resource_outputs)

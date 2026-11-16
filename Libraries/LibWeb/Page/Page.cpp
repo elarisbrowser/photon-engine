@@ -108,6 +108,14 @@ bool Page::has_compositor_host() const
     return m_client->compositor_host();
 }
 
+bool Page::set_viewport_size_from_device_pixels_if_local(DevicePixelSize size, InvalidateDisplayList invalidate_display_list)
+{
+    if (!has_local_traversable())
+        return false;
+    local_traversable()->set_viewport_size({ CSSPixels { size.width().value() }, CSSPixels { size.height().value() } }, invalidate_display_list);
+    return true;
+}
+
 void Page::retire_page_compositor_context(OwnPtr<Compositor::CompositorContextHandle> context)
 {
     m_retired_page_compositor_context = move(context);

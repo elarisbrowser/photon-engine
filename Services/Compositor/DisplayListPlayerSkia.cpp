@@ -225,10 +225,10 @@ void DisplayListPlayerSkia::flush(Gfx::PaintingSurface& surface)
     surface.flush();
 }
 
-void DisplayListPlayerSkia::flush_async(Gfx::PaintingSurface& surface, Function<void()>&& callback, uint64_t presentation_signal_value)
+void DisplayListPlayerSkia::flush_async(Gfx::PaintingSurface& surface, Function<void()>&& callback)
 {
     if (auto context = surface.skia_backend_context())
-        context->flush_and_submit_async(surface, move(callback), presentation_signal_value);
+        context->flush_and_submit_async(surface, move(callback));
     else
         callback();
 }

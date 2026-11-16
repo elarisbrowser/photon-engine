@@ -157,7 +157,7 @@ impl AudioParamTimeline {
         let version = u64::from(generation) << 32;
         let previous_value = self
             .current_value
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
                 Some(version | u64::from(current_value.map_or(value as u32, f32::to_bits)))
             })
             .unwrap();

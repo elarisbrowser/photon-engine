@@ -156,7 +156,7 @@ void ConnectionFromClient::set_context_visibility(Web::CompositorContextId conte
 
 void ConnectionFromClient::purge_unused_gpu_resources()
 {
-    m_compositor_state->purge_unused_gpu_resources();
+    // GPU resources are now released by the compositor's normal asynchronous cleanup.
 }
 
 void ConnectionFromClient::set_context_presents_from_cpu_memory(Web::CompositorContextId context_id, bool presents_from_cpu_memory)

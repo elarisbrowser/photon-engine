@@ -201,6 +201,10 @@ ConnectionBase::PeerEOF ConnectionBase::drain_messages_from_peer()
     VERIFY(m_owner_thread_id.is_current_thread());
     if (m_died)
         return PeerEOF::Yes;
+    static bool trace_enabled = std::getenv("PHOTON_CORE_RUNLOOP_TRACE") != nullptr;
+    size_t drained = 0;
+    if (trace_enabled)
+        dbgln("[IPCDispatch] event=RECEIVE_BEGIN at_ns={} connection={} transport={} endpoint={}", MonotonicTime::now().nanoseconds(), reinterpret_cast<FlatPtr>(this), reinterpret_cast<FlatPtr>(m_transport.ptr()), m_local_endpoint_magic);
     bool parse_error = false;
     auto schedule_shutdown = m_transport->read_as_many_messages_as_possible_without_blocking([&](auto&& raw_message) {
         ++drained;

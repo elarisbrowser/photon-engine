@@ -4578,6 +4578,18 @@ void ViewImplementation::reset_site_permissions(URL::Origin const& origin)
     session().permission_manager->reset_origin(origin);
 }
 
+void ViewImplementation::did_request_http_credentials(Badge<WebContentPage>, WebContentPage& requesting_page, u64 request_id, URL::URL url, String realm)
+{
+    NonnullRefPtr<WebContentPage> page = requesting_page;
+    if (!on_request_http_credentials) {
+        page->async_http_credentials_provided(request_id, {}, {});
+        return;
+    }
+    on_request_http_credentials(HTTPCredentialsRequest { move(url), move(realm) }, [page, request_id](Optional<String> username, Optional<String> password) {
+        page->async_http_credentials_provided(request_id, move(username), move(password));
+    });
+}
+
 void ViewImplementation::did_request_permission(Badge<WebContentPage>, Web::Permissions::PermissionName name)
 {
     if (!m_permissions_requested_by_page.contains_slow(name))
@@ -5288,16 +5300,16 @@ void ViewImplementation::download_url(URL::URL const& url, PromptForPath prompt_
 
     if (prompt_for_path == PromptForPath::No) {
         if (auto download_path = Application::the().default_path_for_downloaded_file(suggested_filename); !download_path.is_error())
-            Application::the().file_downloader().download_file(is_private(), url, download_path.release_value(), FileDownloader::MayReplaceDestination::No);
+            Application::the().file_downloader().download_file(is_private(), session().profile_identity, url, download_path.release_value(), FileDownloader::MayReplaceDestination::No);
         return;
     }
 
-    Application::the().path_for_downloaded_file(suggested_filename)->when_resolved([is_private = is_private(), url](auto const& download_path) {
+    Application::the().path_for_downloaded_file(suggested_filename)->when_resolved([is_private = is_private(), profile_identity = session().profile_identity, url](auto const& download_path) {
         // NB: A file at a path the user chose was there when the user chose to replace it, as saving asks before replacing.
         auto may_replace_destination = FileSystem::exists(download_path.string())
             ? FileDownloader::MayReplaceDestination::Yes
             : FileDownloader::MayReplaceDestination::No;
-        Application::the().file_downloader().download_file(is_private, url, download_path, may_replace_destination);
+        Application::the().file_downloader().download_file(is_private, move(profile_identity), url, download_path, may_replace_destination);
     });
 }
 

@@ -43,6 +43,7 @@ private:
     virtual void take_frame_snapshot(Web::CompositorContextId, u64 request_id, Optional<Gfx::IntSize> maximum_size) override;
     virtual void set_client_gpu_presentation_capability(bool supported, u64 adapter_luid) override;
     virtual void set_scrollbar_track_press_jumps(bool jumps) override;
+    virtual void set_scrolls_elastically(bool) override { }
 
     bool is_bound_to(Web::CompositorContextId) const;
 

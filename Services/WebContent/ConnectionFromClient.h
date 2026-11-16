@@ -265,6 +265,7 @@ private:
     virtual void set_geolocation_emulated_position(Web::PageId page_id, WebView::GeolocationPositionData, Optional<u16> error_code) override;
     virtual void geolocation_position_response(Web::PageId page_id, u64 request_id, WebView::GeolocationPositionData, Optional<u16> error_code) override;
     virtual void permission_request_completed(Web::PageId page_id, u64 request_id, Web::Permissions::EffectiveState state) override;
+    virtual void http_credentials_provided(Web::PageId page_id, u64 request_id, Optional<String> username, Optional<String> password) override;
     virtual void notification_shown(Web::PageId page_id, u64 notification_id) override;
     virtual void notification_show_failed(Web::PageId page_id, u64 notification_id) override;
     virtual void notification_clicked(Web::PageId page_id, u64 notification_id) override;

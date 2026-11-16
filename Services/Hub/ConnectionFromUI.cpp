@@ -215,7 +215,7 @@ void ConnectionFromUI::download_updated(WebView::FileDownloader::Download const&
     async_download_updated(state_of_download(download));
 }
 
-void ConnectionFromUI::download_removed(u64 id, WebView::IsPrivate is_private)
+void ConnectionFromUI::download_removed(u64 id, WebView::IsPrivate is_private, StringView)
 {
     async_download_removed(id, is_private);
 }

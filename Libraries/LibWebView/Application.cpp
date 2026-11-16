@@ -1815,6 +1815,8 @@ static void notify_devtools_of_storage_change(StorageJar& jar, StorageChange con
 ErrorOr<void> Application::launch_services()
 {
     m_default_session = BrowsingSession::create(IsPrivate::No);
+    m_default_session->profile_identity = Profile::routing_identifier(profile().paths().identity);
+    m_default_session->cache_path = profile().paths().cache;
     StorageAreaRegistry::the().on_change_for_devtools = [this](StorageJar& jar, WebView::StorageChange const& change) {
         // Only an attached DevTools has anyone to tell, and the lookup below isn't free on a page's write path.
         if (m_devtools)
@@ -1911,7 +1913,7 @@ ErrorOr<void> Application::launch_services()
 
     m_default_session->blob_url_store = make<BlobURLStore>();
 
-    m_file_downloader.adopt_download_store({}, *m_download_store);
+    m_file_downloader.adopt_download_store({}, m_default_session->profile_identity, *m_download_store);
 
 #if !defined(AK_OS_WINDOWS)
     // A run stopped by SIGINT or SIGTERM ends like a quit, rather than like a crash: It saves the session, leaves its

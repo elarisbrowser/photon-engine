@@ -56,17 +56,21 @@ TEST_CASE(permission_response_requires_matching_request_and_resolves_once)
 {
     auto realm = Web::Bindings::create_a_principal_javascript_realm();
     auto& page = Web::Bindings::principal_host_defined_page(*realm);
-    Optional<Web::Permissions::EffectiveState> decision;
-    auto callback = GC::create_function(realm->heap(), [&](Web::Permissions::EffectiveState state) { decision = state; });
+    struct SharedDecision : RefCounted<SharedDecision> {
+        GC_HOLDS_NO_CELL_EDGES;
+        Optional<Web::Permissions::EffectiveState> value;
+    };
+    auto decision = make_ref_counted<SharedDecision>();
+    auto callback = GC::create_function(realm->heap(), GC::captures(decision), [](SharedDecision& decision, Web::Permissions::EffectiveState state) { decision.value = state; });
 
     page.request_permission(Web::HTML::CrossProcessId { 1 }, "microphone"_utf16, callback);
 
     page.permission_request_completed(1, Web::Permissions::EffectiveState::Granted);
-    EXPECT(!decision.has_value());
+    EXPECT(!decision->value.has_value());
 
     page.permission_request_completed(0, Web::Permissions::EffectiveState::Denied);
-    EXPECT(decision == Web::Permissions::EffectiveState::Denied);
+    EXPECT(decision->value == Web::Permissions::EffectiveState::Denied);
 
     page.permission_request_completed(0, Web::Permissions::EffectiveState::Granted);
-    EXPECT(decision == Web::Permissions::EffectiveState::Denied);
+    EXPECT(decision->value == Web::Permissions::EffectiveState::Denied);
 }

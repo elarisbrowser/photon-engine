@@ -46,15 +46,9 @@ static Optional<URL::URL>& proxy_autoconfig_url_storage()
     return proxy_autoconfig_url;
 }
 
-String network_error_description(Requests::NetworkError network_error)
+static String network_error_description(Requests::NetworkError network_error)
 {
     return MUST(String::formatted("Request finished with error: {}", network_error_to_string(network_error)));
-}
-
-bool is_certificate_error_description(StringView description)
-{
-    // NB: Fetch prefixes the description it reports for a failed load.
-    return description.ends_with(network_error_description(Requests::NetworkError::SSLVerificationFailed));
 }
 
 void ResourceLoader::set_proxy_autoconfig_url(URL::URL url)

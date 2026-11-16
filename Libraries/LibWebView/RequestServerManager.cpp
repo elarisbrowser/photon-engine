@@ -394,19 +394,18 @@ Vector<ByteString> RequestServerManager::dormant_site_cache_paths()
 {
     Vector<ByteString> paths;
     HashTable<ByteString> visited_directories;
-    Application::for_each_profile_session([&](BrowsingSession& session) {
-        if (session.cache_path.is_empty())
-            return;
+    auto const& session = Application::default_session();
+    if (!session.cache_path.is_empty()) {
         auto directory = sites_directory(session.cache_path);
-        if (visited_directories.set(directory) != HashSetResult::InsertedNewEntry)
-            return;
-        Core::DirIterator iterator(directory, Core::DirIterator::SkipParentAndBaseDir);
-        while (iterator.has_next()) {
-            auto path = iterator.next_full_path();
-            if (!is_live_cache_path(path))
-                paths.append(move(path));
+        if (visited_directories.set(directory) == HashSetResult::InsertedNewEntry) {
+            Core::DirIterator iterator(directory, Core::DirIterator::SkipParentAndBaseDir);
+            while (iterator.has_next()) {
+                auto path = iterator.next_full_path();
+                if (!is_live_cache_path(path))
+                    paths.append(move(path));
+            }
         }
-    });
+    }
     return paths;
 }
 

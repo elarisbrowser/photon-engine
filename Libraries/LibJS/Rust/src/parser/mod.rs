@@ -88,7 +88,7 @@ pub(crate) fn release_idle_reparse_contexts() {
         // NB: The count stops at its largest value, for a compile job that holds the context for very many collections.
         let idle_collections = source
             .reparse_context_idle_collections
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                 Some(count.saturating_add(1))
             })
             .expect("the update always gives a value")

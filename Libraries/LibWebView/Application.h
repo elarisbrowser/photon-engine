@@ -288,6 +288,7 @@ public:
     void notify_compositor_presented_bitmap_ready_to_paint(Web::CompositorContextId, i32 bitmap_id);
 
     Function<void()> on_compositor_process_death;
+    Function<void()> on_request_server_process_death;
 
     virtual Optional<ViewImplementation&> active_web_view() const { return {}; }
     virtual Optional<ViewImplementation&> activate_tab_with_url(URL::URL const&, URL::ExcludeFragment) const { return {}; }

@@ -95,7 +95,7 @@ if (USE_VULKAN_DMABUF_IMAGES)
 endif()
 
 if (APPLE)
-    target_sources(compositorservice PRIVATE CoreAnimationWindowServer.mm MainDispatchQueue.mm VideoFrameSkia.mm)
+    target_sources(compositorservice PRIVATE CoreAnimationWindowServer.mm MainDispatchQueue.mm MetalContext.mm VideoFrameSkia.mm)
     target_link_libraries(compositorservice PUBLIC "-framework AVFoundation" "-framework CoreGraphics" "-framework CoreMedia" "-framework CoreVideo" "-framework QuartzCore")
 endif()
 

@@ -53,7 +53,7 @@ private:
     // ^WebView::FileDownloaderObserver
     virtual void download_added(WebView::FileDownloader::Download const&) override;
     virtual void download_updated(WebView::FileDownloader::Download const&) override;
-    virtual void download_removed(u64 id, WebView::IsPrivate) override;
+    virtual void download_removed(u64 id, WebView::IsPrivate, StringView) override;
 
     // ^HubServerEndpoint
     virtual Messages::HubServer::InitializeResponse initialize() override;

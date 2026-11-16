@@ -280,7 +280,7 @@ pub(crate) fn paint_canvas_foreground<O: Observer>(recorder: &mut PaintRecorder<
         if image_facts.content == crate::painting::image_content::ImageContent::None {
             return;
         }
-        let (content_rect, corner_radii) = replaced_content_clip_geometry(recorder, paintable);
+        let (content_rect, _, corner_radii) = replaced_content_clip_geometry(recorder, paintable);
         let corner_clip =
             corner_radii.map(|corner_radii| PendingInlineClip::intersecting_rounded_rect(content_rect, corner_radii));
         recorder.record_with_inline_clips(corner_clip.as_slice(), |recorder| {

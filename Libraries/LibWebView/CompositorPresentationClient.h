@@ -46,7 +46,6 @@ private:
     virtual void did_present_frame_in_remote_layer(Web::CompositorContextId, Gfx::IntRect content_rect, Gfx::IntRect damage_rect, double device_pixel_ratio) override;
     virtual void did_consume_input_event(Web::CompositorContextId, u64 event_id) override;
     virtual void did_not_dispatch_input_event(Web::CompositorContextId, u64 event_id) override;
-    virtual void did_detect_history_swipe_candidate(Web::CompositorContextId, u64 gesture_id, bool back, float unconsumed_delta) override;
     virtual void did_dispatch_input_event(Web::CompositorContextId, u64 event_id, bool performed_default_action) override;
     virtual void did_take_frame_snapshot(u64 request_id, Optional<Gfx::ShareableBitmap>) override;
     virtual void did_hold_synchronized_resize_frame(u64 remote_layer_id, u64 token) override;

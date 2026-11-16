@@ -44,7 +44,7 @@ void CompositorPresentationClient::did_allocate_backing_stores(Web::CompositorCo
 
     // The compositor reserves the first published buffer for the UI to install as its front buffer.
     if (!bitmap_ids.is_empty())
-        async_presented_bitmap_ready_to_paint(context_id, bitmap_ids[0], true);
+        async_presented_bitmap_ready_to_paint(context_id, bitmap_ids[0]);
 }
 
 void CompositorPresentationClient::did_present_frame(Web::CompositorContextId context_id, Gfx::IntRect content_rect, Gfx::IntRect damage_rect, i32 bitmap_id, double device_pixel_ratio)
@@ -59,7 +59,7 @@ void CompositorPresentationClient::did_present_frame(Web::CompositorContextId co
         }
     }
 
-    async_presented_bitmap_ready_to_paint(context_id, bitmap_id, true);
+    async_presented_bitmap_ready_to_paint(context_id, bitmap_id);
 }
 
 static WebContentPage* page_for_compositor_context_id(Web::CompositorContextId context_id)
@@ -133,12 +133,6 @@ void CompositorPresentationClient::did_not_dispatch_input_event(Web::CompositorC
 {
     if (auto* page = page_for_compositor_context_id(context_id))
         page->did_not_dispatch_input_event_through_compositor(event_id);
-}
-
-void CompositorPresentationClient::did_detect_history_swipe_candidate(Web::CompositorContextId context_id, u64 gesture_id, bool back, float unconsumed_delta)
-{
-    if (auto* page = page_for_compositor_context_id(context_id))
-        page->did_detect_history_swipe_candidate(gesture_id, back, unconsumed_delta);
 }
 
 void CompositorPresentationClient::did_dispatch_input_event(Web::CompositorContextId context_id, u64 event_id, bool performed_default_action)

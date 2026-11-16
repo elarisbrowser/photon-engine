@@ -1359,6 +1359,17 @@ void PageClient::page_did_request_permission(u64 request_id, Web::HTML::CrossPro
     client().async_did_request_permission(m_id, request_id, requesting_document_id, name);
 }
 
+bool PageClient::page_did_request_http_credentials(u64 request_id, URL::URL const& url, String const& realm)
+{
+    client().async_did_request_http_credentials(m_id, request_id, url, realm);
+    return true;
+}
+
+void PageClient::page_did_fail_certificate_verification(URL::URL const& url)
+{
+    client().async_did_fail_certificate_verification(m_id, url);
+}
+
 void PageClient::page_did_request_show_notification(u64 notification_id, Web::HTML::CrossProcessId document_id, Web::NotificationsAPI::NotificationData const& data, RefPtr<Gfx::Bitmap const> icon)
 {
     Optional<Gfx::ShareableBitmap> shareable_icon;

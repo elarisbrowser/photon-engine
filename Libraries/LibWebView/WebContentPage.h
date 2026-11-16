@@ -290,6 +290,8 @@ private:
     virtual void did_start_geolocation_position_watch(u64 request_id, Web::HTML::CrossProcessId document_id) override;
     virtual void did_stop_geolocation_position_watch(u64 request_id) override;
     virtual void did_request_permission(u64 request_id, Web::HTML::CrossProcessId document_id, Utf16String name) override;
+    virtual void did_request_http_credentials(u64 request_id, URL::URL url, String realm) override;
+    virtual void did_fail_certificate_verification(URL::URL url) override;
     virtual void did_request_show_notification(u64 notification_id, Web::HTML::CrossProcessId document_id, Web::NotificationsAPI::NotificationData data, Optional<Gfx::ShareableBitmap> icon) override;
     virtual void did_request_close_notification(u64 notification_id) override;
     virtual void did_abandon_notification(u64 notification_id) override;

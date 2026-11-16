@@ -857,7 +857,7 @@ impl ForkBudget {
 
     fn take_jobs(&self, count: usize) -> bool {
         self.jobs_left
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::Relaxed,
                 std::sync::atomic::Ordering::Relaxed,
                 |left| left.checked_sub(count),
@@ -867,7 +867,7 @@ impl ForkBudget {
 
     fn take_job(&self) -> bool {
         self.jobs_left
-            .fetch_update(
+            .try_update(
                 std::sync::atomic::Ordering::Relaxed,
                 std::sync::atomic::Ordering::Relaxed,
                 |left| left.checked_sub(1),
