@@ -615,7 +615,6 @@ public:
             if (!m_hidden_gc_timer->is_active())
                 m_hidden_gc_timer->start();
         }
-
     }
 
     void set_display_metadata(Optional<u64> display_id, double refresh_rate)
